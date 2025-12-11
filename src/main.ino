@@ -260,6 +260,45 @@ char currentTimeString[32] = "";
 #define ETH_PHY_POWER_PIN 5
 #define ETH_PHY_TYPE ETH_PHY_LAN8720
 #define ETH_CLK_MODE ETH_CLOCK_GPIO17_OUT
+
+// =================== CONFIGURACIÓN DE ENTRADAS DIGITALES ===================
+// Pines de entradas digitales (input-only pins)
+const int DI1_PIN = 36;  // GPIO36 - Entrada digital 1
+const int DI2_PIN = 39;  // GPIO39 - Entrada digital 2
+
+// Estructura para configuración de entradas digitales en EEPROM
+struct DigitalInputConfig {
+  bool di1_enabled;        // DI1 habilitada/deshabilitada
+  uint8_t di1_relay;       // Relé asignado a DI1 (1 o 2)
+  float di1_duration;      // Duración de activación DI1 (segundos)
+  
+  bool di2_enabled;        // DI2 habilitada/deshabilitada
+  uint8_t di2_relay;       // Relé asignado a DI2 (1 o 2)
+  float di2_duration;      // Duración de activación DI2 (segundos)
+  
+  uint8_t di1_mode;        // Modo de activación (0=flanco, 1=nivel - futuro)
+  uint8_t di2_mode;        // Modo de activación (0=flanco, 1=nivel - futuro)
+  
+  uint32_t validMarker;    // Marcador de validación (0xDIGI7A1)
+};
+
+// Estructura para estado en tiempo real de entradas digitales
+struct DigitalInputState {
+  bool lastState;          // Último estado leído (LOW/HIGH)
+  bool currentState;       // Estado actual
+  bool relayActivated;     // Relé activado por esta entrada
+  unsigned long activationTime; // Momento de activación
+  bool waitingForLow;      // Esperando que el pulso baje
+};
+
+// Definiciones para EEPROM
+#define DIGITAL_INPUT_CONFIG_MARKER 0xD1617A1
+#define EEPROM_DIGITAL_INPUT_OFFSET 9700
+
+// Variables globales para entradas digitales
+DigitalInputConfig digitalInputConfig;
+DigitalInputState di1State = {false, false, false, 0, false};
+DigitalInputState di2State = {false, false, false, 0, false};
  
 // =================== SERVIDOR WEB Y CONECTIVIDAD ===================
 WebServer server(80);
@@ -287,6 +326,16 @@ bool isTurnstileModeEnabled();
 uint8_t getRelayForKeyboard(int keyboardId);
 void handleTurnstileValidation(const String& code, const String& type, int keyboardId);
 void processMqttResponse(const JsonDocument& doc);
+
+// Declaraciones de funciones de entradas digitales
+void loadDigitalInputConfig();
+void saveDigitalInputConfig();
+void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled, uint8_t relay, float duration);
+void publishDigitalInputEvent(int inputNumber, int relay, float duration);
+void handleDigitalInputs();
+void handleDigitalInputsStatus();
+void handleDigitalInputsConfig();
+void handleSaveDigitalInput();
 void checkPendingRequestTimeout();
 void handleTurnstileConfig();
 void handleTurnstileReset();
@@ -2343,6 +2392,114 @@ void processRemoteValidationResponse(const JsonDocument& doc) {
   }
 }
 
+// =================== FUNCIONES DE ENTRADAS DIGITALES ===================
+
+// Cargar configuración de entradas digitales desde EEPROM
+void loadDigitalInputConfig() {
+  EEPROM.get(EEPROM_DIGITAL_INPUT_OFFSET, digitalInputConfig);
+  
+  if (digitalInputConfig.validMarker != DIGITAL_INPUT_CONFIG_MARKER) {
+    Serial.println("⚙️ [DI] Configuración de entradas digitales no válida, usando valores por defecto");
+    
+    // Valores por defecto
+    digitalInputConfig.di1_enabled = false;
+    digitalInputConfig.di1_relay = 1;
+    digitalInputConfig.di1_duration = 2.0;
+    
+    digitalInputConfig.di2_enabled = false;
+    digitalInputConfig.di2_relay = 2;
+    digitalInputConfig.di2_duration = 2.0;
+    
+    digitalInputConfig.di1_mode = 0;  // Flanco
+    digitalInputConfig.di2_mode = 0;  // Flanco
+    
+    digitalInputConfig.validMarker = DIGITAL_INPUT_CONFIG_MARKER;
+    
+    saveDigitalInputConfig();
+  }
+  
+  Serial.println("📥 [DI] Configuración de entradas digitales cargada:");
+  Serial.printf("   DI1 (GPIO%d): %s, Relé %d, %.1fs\n", 
+                DI1_PIN,
+                digitalInputConfig.di1_enabled ? "HABILITADA" : "DESHABILITADA",
+                digitalInputConfig.di1_relay,
+                digitalInputConfig.di1_duration);
+  Serial.printf("   DI2 (GPIO%d): %s, Relé %d, %.1fs\n", 
+                DI2_PIN,
+                digitalInputConfig.di2_enabled ? "HABILITADA" : "DESHABILITADA",
+                digitalInputConfig.di2_relay,
+                digitalInputConfig.di2_duration);
+}
+
+// Guardar configuración de entradas digitales en EEPROM
+void saveDigitalInputConfig() {
+  digitalInputConfig.validMarker = DIGITAL_INPUT_CONFIG_MARKER;
+  EEPROM.put(EEPROM_DIGITAL_INPUT_OFFSET, digitalInputConfig);
+  EEPROM.commit();
+  Serial.println("💾 [DI] Configuración de entradas digitales guardada en EEPROM");
+}
+
+// Procesar entrada digital (detectar flancos y activar relé)
+void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled, uint8_t relay, float duration) {
+  if (!enabled) return;
+  
+  // Leer estado actual del pin
+  int pin = (inputNumber == 1) ? DI1_PIN : DI2_PIN;
+  state.currentState = digitalRead(pin);
+  
+  // Detectar flanco de subida (LOW → HIGH)
+  if (!state.lastState && state.currentState && !state.waitingForLow) {
+    Serial.printf("📍 [DI%d] Flanco de subida detectado → Activando Relé %d por %.1fs\n", 
+                  inputNumber, relay, duration);
+    
+    // Activar relé con la duración especificada
+    controlReleWithDuration(duration, relay);
+    
+    // Actualizar estado
+    state.relayActivated = true;
+    state.activationTime = millis();
+    state.waitingForLow = true;
+    
+    // Publicar evento MQTT
+    publishDigitalInputEvent(inputNumber, relay, duration);
+  }
+  
+  // Detectar flanco de bajada (HIGH → LOW)
+  if (state.lastState && !state.currentState) {
+    Serial.printf("📍 [DI%d] Flanco de bajada detectado → Sistema listo para nuevo pulso\n", inputNumber);
+    state.waitingForLow = false;
+    state.relayActivated = false;
+  }
+  
+  // Actualizar último estado para la próxima lectura
+  state.lastState = state.currentState;
+}
+
+// Publicar evento de entrada digital vía MQTT
+void publishDigitalInputEvent(int inputNumber, int relay, float duration) {
+  if (!mqttClient.connected()) return;
+  
+  DynamicJsonDocument doc(256);
+  doc["timestamp"] = getTimestamp();
+  doc["event"] = "digital_input_trigger";
+  doc["input"] = inputNumber;
+  doc["gpio"] = (inputNumber == 1) ? DI1_PIN : DI2_PIN;
+  doc["relay"] = relay;
+  doc["duration"] = duration;
+  doc["message_id"] = String(messageId++);
+  
+  String output;
+  serializeJson(doc, output);
+  String topic = "swatidhome/" + fixedSerialNumber + "/digital_input";
+  
+  bool published = mqttClient.publish(topic.c_str(), output.c_str());
+  if (!published) {
+    Serial.printf("❌ [DI%d] Error publicando evento MQTT\n", inputNumber);
+  } else {
+    Serial.printf("✅ [DI%d] Evento publicado a MQTT\n", inputNumber);
+  }
+}
+
 // =================== HANDLERS DE CONFIGURACIÓN DEL MODO TORNO ===================
 void handleTurnstileConfig() {
   if (!server.authenticate(admin_user, admin_password)) {
@@ -3697,6 +3854,276 @@ void handleSecurityEnableKeyboards() {
     "<a href='/'><button>Volver al inicio</button></a></div></body></html>");
 }
 
+// =================== HANDLERS DE ENTRADAS DIGITALES ===================
+
+// Handler para la página principal de entradas digitales
+void handleDigitalInputs() {
+  if (!server.authenticate(admin_user, admin_password)) {
+    return server.requestAuthentication();
+  }
+  
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Entradas Digitales - SWAT ID</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1000px; margin: 20px auto; padding: 20px; background: #f5f5f5; }
+    h1 { color: #2196f3; text-align: center; border-bottom: 3px solid #2196f3; padding-bottom: 15px; }
+    h3 { color: #333; margin-top: 25px; }
+    .status-panel { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .input-config { background: #f5f5f5; padding: 20px; margin: 15px 0; border-radius: 8px; border: 2px solid #ddd; }
+    .input-config.enabled { border-color: #4CAF50; background: #f1f8f4; }
+    .status-indicator { display: inline-block; width: 14px; height: 14px; border-radius: 50%; margin-right: 8px; }
+    .status-low { background: #ccc; }
+    .status-high { background: #4CAF50; box-shadow: 0 0 6px #4CAF50; }
+    .info-panel { background: #e3f2fd; padding: 15px; margin: 15px 0; border-radius: 8px; border-left: 4px solid #2196f3; }
+    label { display: block; margin: 10px 0 5px 0; font-weight: bold; }
+    input[type="number"], select { width: 100%; padding: 10px; margin: 5px 0 15px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+    button { background: #4CAF50; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin: 10px 5px; }
+    button:hover { background: #45a049; }
+    .btn-back { background: #2196f3; }
+    .btn-back:hover { background: #0b7dda; }
+    .form-group { margin: 15px 0; }
+    .checkbox-label { display: inline-block; margin-left: 10px; }
+  </style>
+</head>
+<body>
+  <h1>⚡ Entradas Digitales</h1>
+  
+  <div class="status-panel">
+    <h3>📊 Estado en Tiempo Real</h3>
+    <p>
+      <span class="status-indicator status-low" id="di1-status"></span>
+      <strong>DI1 (GPIO36):</strong> <span id="di1-value">LOW</span>
+      <span id="di1-waiting" style="color: #ff9800; margin-left: 10px;"></span>
+    </p>
+    <p>
+      <span class="status-indicator status-low" id="di2-status"></span>
+      <strong>DI2 (GPIO39):</strong> <span id="di2-value">LOW</span>
+      <span id="di2-waiting" style="color: #ff9800; margin-left: 10px;"></span>
+    </p>
+  </div>
+  
+  <div class="input-config" id="di1-config">
+    <h3>🔌 Entrada Digital 1 (DI1 - GPIO36)</h3>
+    <form action="/save_digital_input" method="POST">
+      <input type="hidden" name="input" value="1">
+      
+      <div class="form-group">
+        <label>
+          <input type="checkbox" name="di1_enabled" id="di1_enabled" value="1">
+          <span class="checkbox-label">Habilitada</span>
+        </label>
+      </div>
+      
+      <div class="form-group">
+        <label>Relé a activar:</label>
+        <select name="di1_relay" id="di1_relay">
+          <option value="1">Relé 1</option>
+          <option value="2">Relé 2</option>
+        </select>
+      </div>
+      
+      <div class="form-group">
+        <label>Duración (segundos):</label>
+        <input type="number" name="di1_duration" id="di1_duration" 
+               min="0.5" max="60" step="0.5" value="2.0">
+      </div>
+      
+      <button type="submit">💾 Guardar Configuración DI1</button>
+    </form>
+  </div>
+  
+  <div class="input-config" id="di2-config">
+    <h3>🔌 Entrada Digital 2 (DI2 - GPIO39)</h3>
+    <form action="/save_digital_input" method="POST">
+      <input type="hidden" name="input" value="2">
+      
+      <div class="form-group">
+        <label>
+          <input type="checkbox" name="di2_enabled" id="di2_enabled" value="1">
+          <span class="checkbox-label">Habilitada</span>
+        </label>
+      </div>
+      
+      <div class="form-group">
+        <label>Relé a activar:</label>
+        <select name="di2_relay" id="di2_relay">
+          <option value="1">Relé 1</option>
+          <option value="2">Relé 2</option>
+        </select>
+      </div>
+      
+      <div class="form-group">
+        <label>Duración (segundos):</label>
+        <input type="number" name="di2_duration" id="di2_duration" 
+               min="0.5" max="60" step="0.5" value="2.0">
+      </div>
+      
+      <button type="submit">💾 Guardar Configuración DI2</button>
+    </form>
+  </div>
+  
+  <div class="info-panel">
+    <h3>ℹ️ Información</h3>
+    <ul>
+      <li><strong>DI1</strong> y <strong>DI2</strong> son entradas digitales de 3.3V</li>
+      <li>Detección por <strong>flanco de subida</strong> (0V → 3.3V)</li>
+      <li>El relé se activa durante el <strong>tiempo configurado</strong></li>
+      <li><strong>No se reactiva</strong> hasta que el pulso baje y vuelva a subir</li>
+      <li>No interfiere con teclados Wiegand ni otras funcionalidades</li>
+      <li>⚠️ <strong>Importante:</strong> Solo usar 3.3V, NO conectar 5V</li>
+      <li>Se recomienda usar resistencia pull-up de 10kΩ a 3.3V</li>
+    </ul>
+  </div>
+  
+  <div style="text-align: center; margin: 30px 0;">
+    <a href="/"><button class="btn-back">🏠 Volver al Inicio</button></a>
+  </div>
+  
+  <script>
+    // Auto-refresh del estado cada 500ms
+    setInterval(function() {
+      fetch('/api/digital_inputs_status')
+        .then(response => response.json())
+        .then(data => {
+          // Actualizar DI1
+          document.getElementById('di1-value').textContent = data.di1_state ? 'HIGH' : 'LOW';
+          document.getElementById('di1-status').className = 
+            'status-indicator ' + (data.di1_state ? 'status-high' : 'status-low');
+          document.getElementById('di1-waiting').textContent = 
+            data.di1_waiting ? '(esperando pulso LOW)' : '';
+          
+          // Actualizar DI2
+          document.getElementById('di2-value').textContent = data.di2_state ? 'HIGH' : 'LOW';
+          document.getElementById('di2-status').className = 
+            'status-indicator ' + (data.di2_state ? 'status-high' : 'status-low');
+          document.getElementById('di2-waiting').textContent = 
+            data.di2_waiting ? '(esperando pulso LOW)' : '';
+          
+          // Actualizar clases de configuración
+          document.getElementById('di1-config').className = 
+            'input-config' + (data.di1_enabled ? ' enabled' : '');
+          document.getElementById('di2-config').className = 
+            'input-config' + (data.di2_enabled ? ' enabled' : '');
+        })
+        .catch(error => console.error('Error:', error));
+    }, 500);
+    
+    // Cargar configuración actual
+    fetch('/api/digital_inputs_config')
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('di1_enabled').checked = data.di1_enabled;
+        document.getElementById('di1_relay').value = data.di1_relay;
+        document.getElementById('di1_duration').value = data.di1_duration;
+        
+        document.getElementById('di2_enabled').checked = data.di2_enabled;
+        document.getElementById('di2_relay').value = data.di2_relay;
+        document.getElementById('di2_duration').value = data.di2_duration;
+      })
+      .catch(error => console.error('Error:', error));
+  </script>
+</body>
+</html>
+  )rawliteral";
+  
+  server.send(200, "text/html", html);
+}
+
+// API: Obtener estado actual de las entradas digitales
+void handleDigitalInputsStatus() {
+  if (!server.authenticate(admin_user, admin_password)) {
+    return server.requestAuthentication();
+  }
+  
+  DynamicJsonDocument doc(256);
+  doc["di1_state"] = di1State.currentState;
+  doc["di2_state"] = di2State.currentState;
+  doc["di1_enabled"] = digitalInputConfig.di1_enabled;
+  doc["di2_enabled"] = digitalInputConfig.di2_enabled;
+  doc["di1_waiting"] = di1State.waitingForLow;
+  doc["di2_waiting"] = di2State.waitingForLow;
+  
+  String output;
+  serializeJson(doc, output);
+  server.send(200, "application/json", output);
+}
+
+// API: Obtener configuración actual
+void handleDigitalInputsConfig() {
+  if (!server.authenticate(admin_user, admin_password)) {
+    return server.requestAuthentication();
+  }
+  
+  DynamicJsonDocument doc(256);
+  doc["di1_enabled"] = digitalInputConfig.di1_enabled;
+  doc["di1_relay"] = digitalInputConfig.di1_relay;
+  doc["di1_duration"] = digitalInputConfig.di1_duration;
+  doc["di2_enabled"] = digitalInputConfig.di2_enabled;
+  doc["di2_relay"] = digitalInputConfig.di2_relay;
+  doc["di2_duration"] = digitalInputConfig.di2_duration;
+  
+  String output;
+  serializeJson(doc, output);
+  server.send(200, "application/json", output);
+}
+
+// Handler para guardar configuración de entrada digital
+void handleSaveDigitalInput() {
+  if (!server.authenticate(admin_user, admin_password)) {
+    return server.requestAuthentication();
+  }
+  
+  int inputNumber = server.arg("input").toInt();
+  
+  if (inputNumber == 1) {
+    digitalInputConfig.di1_enabled = server.hasArg("di1_enabled");
+    digitalInputConfig.di1_relay = server.arg("di1_relay").toInt();
+    digitalInputConfig.di1_duration = server.arg("di1_duration").toFloat();
+    
+    // Validar valores
+    if (digitalInputConfig.di1_relay < 1 || digitalInputConfig.di1_relay > 2) {
+      digitalInputConfig.di1_relay = 1;
+    }
+    if (digitalInputConfig.di1_duration < 0.5 || digitalInputConfig.di1_duration > 60) {
+      digitalInputConfig.di1_duration = 2.0;
+    }
+    
+    Serial.printf("⚙️ [DI1] Configuración actualizada: %s, Relé %d, %.1fs\n",
+                  digitalInputConfig.di1_enabled ? "HABILITADA" : "DESHABILITADA",
+                  digitalInputConfig.di1_relay,
+                  digitalInputConfig.di1_duration);
+    
+  } else if (inputNumber == 2) {
+    digitalInputConfig.di2_enabled = server.hasArg("di2_enabled");
+    digitalInputConfig.di2_relay = server.arg("di2_relay").toInt();
+    digitalInputConfig.di2_duration = server.arg("di2_duration").toFloat();
+    
+    // Validar valores
+    if (digitalInputConfig.di2_relay < 1 || digitalInputConfig.di2_relay > 2) {
+      digitalInputConfig.di2_relay = 2;
+    }
+    if (digitalInputConfig.di2_duration < 0.5 || digitalInputConfig.di2_duration > 60) {
+      digitalInputConfig.di2_duration = 2.0;
+    }
+    
+    Serial.printf("⚙️ [DI2] Configuración actualizada: %s, Relé %d, %.1fs\n",
+                  digitalInputConfig.di2_enabled ? "HABILITADA" : "DESHABILITADA",
+                  digitalInputConfig.di2_relay,
+                  digitalInputConfig.di2_duration);
+  }
+  
+  saveDigitalInputConfig();
+  
+  // Redirigir de vuelta a la página de entradas digitales
+  server.sendHeader("Location", "/digital_inputs");
+  server.send(303);
+}
+
 // =================== GESTIÓN DE CÓDIGOS ALMACENADOS ===================
 void loadStoredCodes() {
   Serial.println("🔄 Cargando códigos desde EEPROM...");
@@ -4507,6 +4934,12 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
   server.on("/security/block-access", HTTP_GET, handleSecurityBlockAccess);
   server.on("/security/unblock-access", HTTP_GET, handleSecurityUnblockAccess);
   
+  // =================== RUTAS ENTRADAS DIGITALES ===================
+  server.on("/digital_inputs", HTTP_GET, handleDigitalInputs);
+  server.on("/api/digital_inputs_status", HTTP_GET, handleDigitalInputsStatus);
+  server.on("/api/digital_inputs_config", HTTP_GET, handleDigitalInputsConfig);
+  server.on("/save_digital_input", HTTP_POST, handleSaveDigitalInput);
+  
   // =================== RUTAS OTA ===================
   server.on("/ota", HTTP_GET, handleOTAPage);
   server.on("/ota/upload", HTTP_POST, []() {
@@ -4731,15 +5164,16 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
      html += "</div>";
    }
 
-   // Acciones rápidas
-   html += "<h2><i class='fas fa-bolt icon'></i>Acciones</h2><div class='actions'>";
-  html += "<a href='/rele?relay=1'><button><i class='fas fa-door-open icon'></i>Relé 1 ON</button></a>";
-  html += "<a href='/rele?relay=2'><button><i class='fas fa-door-open icon'></i>Relé 2 ON</button></a>";
-  html += "<a href='/codes'><button class='btn-info'><i class='fas fa-database icon'></i>Gestión de Códigos</button></a>";
-  html += "<a href='/remote-codes'><button class='btn-info'><i class='fas fa-cloud icon'></i>Códigos Remotos</button></a>";
-  html += "<a href='/reboot'><button class='btn-warning'><i class='fas fa-sync-alt icon'></i>Reiniciar</button></a>";
-  html += "<a href='/reset'><button class='btn-danger'><i class='fas fa-exclamation-triangle icon'></i>Resetear</button></a>";
-   html += "</div>";
+  // Acciones rápidas
+  html += "<h2><i class='fas fa-bolt icon'></i>Acciones</h2><div class='actions'>";
+ html += "<a href='/rele?relay=1'><button><i class='fas fa-door-open icon'></i>Relé 1 ON</button></a>";
+ html += "<a href='/rele?relay=2'><button><i class='fas fa-door-open icon'></i>Relé 2 ON</button></a>";
+ html += "<a href='/codes'><button class='btn-info'><i class='fas fa-database icon'></i>Gestión de Códigos</button></a>";
+ html += "<a href='/remote-codes'><button class='btn-info'><i class='fas fa-cloud icon'></i>Códigos Remotos</button></a>";
+ html += "<a href='/digital_inputs'><button class='btn-info'><i class='fas fa-plug icon'></i>Entradas Digitales</button></a>";
+ html += "<a href='/reboot'><button class='btn-warning'><i class='fas fa-sync-alt icon'></i>Reiniciar</button></a>";
+ html += "<a href='/reset'><button class='btn-danger'><i class='fas fa-exclamation-triangle icon'></i>Resetear</button></a>";
+  html += "</div>";
  
    // Último acceso con información de teclado
    html += "<h2><i class='fas fa-history icon'></i>Último acceso</h2><table><tr><th>Tipo</th><th>Código</th><th>Hora</th><th>Teclado</th></tr>";
@@ -5626,6 +6060,29 @@ void handleCodes() {
    digitalWrite(RELE2_PIN, LOW);
    Serial.println("⚡ Relés inicializados (OFF)");
    
+   // =================== CONFIGURAR ENTRADAS DIGITALES ===================
+   pinMode(DI1_PIN, INPUT);  // GPIO36 no tiene pull-up interna
+   pinMode(DI2_PIN, INPUT);  // GPIO39 no tiene pull-up interna
+   
+   // Inicializar estados con lectura actual
+   di1State.lastState = digitalRead(DI1_PIN);
+   di1State.currentState = di1State.lastState;
+   di1State.relayActivated = false;
+   di1State.waitingForLow = false;
+   
+   di2State.lastState = digitalRead(DI2_PIN);
+   di2State.currentState = di2State.lastState;
+   di2State.relayActivated = false;
+   di2State.waitingForLow = false;
+   
+   Serial.printf("🔌 Entradas digitales configuradas: DI1=GPIO%d, DI2=GPIO%d\n", DI1_PIN, DI2_PIN);
+   Serial.printf("   Estado inicial: DI1=%s, DI2=%s\n",
+                 di1State.lastState ? "HIGH" : "LOW",
+                 di2State.lastState ? "HIGH" : "LOW");
+   
+   // Cargar configuración de entradas digitales
+   loadDigitalInputConfig();
+   
    // Configurar teclado Wiegand 1
    pinMode(WIEGAND1_D0, INPUT_PULLUP);
    pinMode(WIEGAND1_D1, INPUT_PULLUP);
@@ -5737,6 +6194,12 @@ void handleCodes() {
   processWiegand1Data();
   processWiegand2Data();
   processRS485Keypad();
+  
+  // ========== PROCESAMIENTO DE ENTRADAS DIGITALES ==========
+  processDigitalInput(1, di1State, digitalInputConfig.di1_enabled, 
+                     digitalInputConfig.di1_relay, digitalInputConfig.di1_duration);
+  processDigitalInput(2, di2State, digitalInputConfig.di2_enabled,
+                     digitalInputConfig.di2_relay, digitalInputConfig.di2_duration);
   
   // ========== VERIFICACIÓN DE TIMEOUT DEL MODO TORNO ==========
   checkPendingRequestTimeout();
