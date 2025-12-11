@@ -1,0 +1,35 @@
+# PlatformIO
+.pio/
+.vscode/
+.clang_complete
+.gcc-flags.json
+
+# Build artifacts
+*.bin
+*.elf
+*.map
+
+# Keep firmware releases
+!firmware/*.bin
+!firmware/*.sha256
+
+# IDE
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+

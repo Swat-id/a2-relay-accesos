@@ -1,0 +1,75 @@
+{
+  "version": "v2.5.4",
+  "firmware_version": {
+    "major": 2,
+    "minor": 5,
+    "patch": 4
+  },
+  "device": "SWATID-A2",
+  "model": "SWATID-A2 Controller - 2 x Wiegand",
+  "file_name": "SWATID-A2_v2.5.4.bin",
+  "file_size": 1190816,
+  "sha256": "30f394dfa533685d5d3bd94425ed1879191c77a420b1c68f5ba6c7fc78922e4f",
+  "build_date": "2025-10-13",
+  "release_date": "2025-10-13",
+  "release_type": "stable",
+  "mandatory": false,
+  "changelog": [
+    "✅ Gestión completa de códigos remotos vía MQTT (añadir, eliminar, limpiar)",
+    "✅ Visualización mejorada de horarios con días en texto legible (Lun-Vie, Sáb-Dom, etc.)",
+    "✅ Comando para obtener todos los códigos almacenados (locales y remotos)",
+    "✅ Ampliación de límites: 100 códigos locales + 100 códigos remotos",
+    "✅ EEPROM aumentada a 10KB para mayor capacidad",
+    "✅ Optimización de memoria: 17.9% HEAP usado (ahorro de 21.9KB)",
+    "✅ Campo days_string en franjas horarias para mejor legibilidad",
+    "✅ Información de capacidad en respuestas de dispositivo",
+    "✅ Protocolo MQTT completamente documentado"
+  ],
+  "breaking_changes": [
+    "⚠️ stored_codes ahora es un array en lugar de objeto con contadores",
+    "ℹ️ Recomendado actualizar backend para usar local_codes_info y remote_codes_info"
+  ],
+  "compatibility": {
+    "min_backend_version": "1.0.0",
+    "recommended_backend_version": "2.0.0",
+    "hardware": ["KC868-A2", "SWATID-A2"],
+    "previous_versions": ["v2.5.0", "v2.5.1", "v2.5.2", "v2.5.3"]
+  },
+  "features": {
+    "mqtt_protocol": "Complete",
+    "ota_updates": "Supported",
+    "remote_codes": 100,
+    "local_codes": 100,
+    "dual_wiegand": true,
+    "time_slots": 4,
+    "turnstile_mode": true
+  },
+  "technical_details": {
+    "platform": "ESP32",
+    "framework": "Arduino",
+    "heap_usage": "17.9%",
+    "flash_usage": "90.4%",
+    "eeprom_size": 10240,
+    "compilation_date": "Oct 13 2025"
+  },
+  "download": {
+    "method": "web_upload",
+    "url": null,
+    "notes": "Este firmware está diseñado para actualización manual vía interfaz web"
+  },
+  "testing": {
+    "tested_date": "2025-10-13",
+    "tested_by": "SWATID Development Team",
+    "status": "Stable",
+    "test_coverage": [
+      "MQTT commands (all types)",
+      "Remote code management",
+      "Local code management",
+      "Time slots validation",
+      "Turnstile mode",
+      "OTA updates",
+      "Memory optimization"
+    ]
+  }
+}
+

@@ -1,0 +1,50 @@
+{
+  "firmware": {
+    "version": "v2.5.2",
+    "build_date": "2025-01-09",
+    "build_time": "16:00:00",
+    "file_name": "SWATID-A2_v2.5.2_TEST.bin",
+    "file_size": 1182137,
+    "sha256": "7983f888f7077a378470da8180511795346e26a43b5b5b4e962af07847eb697b",
+    "device_model": "SWATID-A2",
+    "description": "Controlador de acceso dual Wiegand - Versión de prueba para actualización OTA",
+    "type": "TEST_VERSION",
+    "purpose": "Prueba de funcionalidad de actualización OTA",
+    "features": [
+      "Sincronización de tiempo mejorada con interfaz web",
+      "Gestión de memoria optimizada con punteros",
+      "Soporte para códigos locales y remotos",
+      "Modo torno configurable",
+      "Interfaz web responsive",
+      "Sincronización automática con navegador",
+      "Validación de tiempo en tiempo real",
+      "Sistema OTA corregido y funcional"
+    ],
+    "changelog": {
+      "v2.5.2": [
+        "Versión de prueba para verificar actualización OTA",
+        "Únicamente cambio de versión visible en navegador",
+        "Misma funcionalidad que v2.5.1",
+        "Ideal para probar el sistema de actualización remota"
+      ]
+    },
+    "compatibility": {
+      "hardware": "ESP32-D0WD-V3",
+      "flash_size": "4MB",
+      "ram_size": "320KB",
+      "ethernet": "LAN8720",
+      "wiegand_ports": 2
+    },
+    "installation": {
+      "method": "OTA o cable",
+      "min_version": "v2.5.1",
+      "backup_recommended": false,
+      "test_purpose": true
+    },
+    "testing_notes": {
+      "purpose": "Verificar que la actualización OTA funciona correctamente",
+      "expected_behavior": "La versión mostrada en el navegador debe cambiar de v2.5.1 a v2.5.2",
+      "rollback_available": "Sí, se puede volver a v2.5.1 si es necesario"
+    }
+  }
+}

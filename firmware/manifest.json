@@ -1,0 +1,119 @@
+{
+  "firmware": {
+    "version": "v2.5.4",
+    "build_date": "2025-10-13",
+    "build_time": "11:34:00",
+    "file_name": "SWATID-A2_v2.5.4.bin",
+    "file_size": 1190816,
+    "sha256": "30f394dfa533685d5d3bd94425ed1879191c77a420b1c68f5ba6c7fc78922e4f",
+    "device_model": "SWATID-A2 Controller - 2 x Wiegand",
+    "release_type": "stable",
+    "release_status": "validated",
+    "description": "Firmware estable con gestión completa de códigos remotos, ampliación de memoria y sistema OTA validado",
+    "features": [
+      "Gestión completa de códigos remotos vía MQTT (añadir, eliminar, limpiar)",
+      "Visualización de horarios con texto legible (Lun-Vie, Sáb-Dom, etc.)",
+      "Comando MQTT para obtener todos los códigos almacenados",
+      "Capacidad ampliada: 100 códigos locales + 100 códigos remotos",
+      "EEPROM 10KB para mayor capacidad de almacenamiento",
+      "Optimización de memoria: 17.9% RAM usado (ahorro de 27%)",
+      "Campo days_string en franjas horarias para mejor legibilidad",
+      "Información de capacidad incluida en respuestas",
+      "Sistema OTA robusto con validación y rollback",
+      "Protocolo MQTT completamente documentado (v2.1)",
+      "Sincronización de tiempo mejorada con interfaz web",
+      "Gestión de memoria optimizada con punteros",
+      "Modo torno configurable con validación local/remota",
+      "Interfaz web responsive y profesional",
+      "Soporte dual Wiegand con configuración flexible"
+    ],
+    "changelog": {
+      "v2.5.4": [
+        "✅ Versión consolidada estable validada en producción",
+        "✅ Actualización OTA vía web verificada exitosamente",
+        "✅ Todas las funcionalidades de v2.5.0-v2.5.3 integradas",
+        "✅ Sin problemas detectados durante validación",
+        "✅ Preservación completa de datos y configuración",
+        "✅ Documentación técnica completa actualizada"
+      ],
+      "v2.5.3": [
+        "Gestión completa de códigos remotos vía MQTT",
+        "Visualización mejorada de horarios con días legibles",
+        "Comando para obtener códigos locales y remotos almacenados",
+        "Ampliación de límites: 100+100 códigos",
+        "Protocolo MQTT documentado versión 2.1"
+      ],
+      "v2.5.2": [
+        "Corrección OTA upload con XMLHttpRequest",
+        "Mejoras en manejo de errores de actualización"
+      ],
+      "v2.5.1": [
+        "Mejorada la interfaz de sincronización de tiempo",
+        "Optimizada la gestión de memoria con punteros",
+        "Corregida funcionalidad OTA con mejor manejo de errores"
+      ],
+      "v2.5.0": [
+        "Versión base con funcionalidades core",
+        "Sistema OTA implementado",
+        "Protocolo MQTT básico"
+      ]
+    },
+    "compatibility": {
+      "hardware": "ESP32-D0WD-V3",
+      "flash_size": "4MB",
+      "flash_usage": "90.4%",
+      "ram_size": "320KB",
+      "ram_usage": "15.3%",
+      "heap_free": "277.5KB",
+      "eeprom_size": "10KB",
+      "ethernet": "LAN8720",
+      "wiegand_ports": 2,
+      "supported_devices": ["KC868-A2", "SWATID-A2"],
+      "backend_min_version": "1.0.0",
+      "backend_recommended": "2.0.0"
+    },
+    "installation": {
+      "method": "OTA web o cable (PlatformIO)",
+      "min_version": "v2.0.0",
+      "backup_recommended": true,
+      "estimated_time": "1-2 minutos",
+      "requires_reboot": true,
+      "preserves_data": true,
+      "rollback_available": true
+    },
+    "validation": {
+      "date": "2025-10-13",
+      "status": "passed",
+      "method": "web_ota",
+      "duration_minutes": 2,
+      "test_coverage": [
+        "Actualización OTA vía web",
+        "Preservación de códigos locales",
+        "Preservación de códigos remotos",
+        "Preservación de configuración de red",
+        "Preservación de configuración MQTT",
+        "Verificación de nuevas funcionalidades",
+        "Estabilidad del sistema post-actualización"
+      ],
+      "notes": "Actualización exitosa. Todos los datos preservados. Sin errores detectados.",
+      "approved_for_production": true
+    },
+    "performance": {
+      "boot_time_seconds": 2.8,
+      "eeprom_load_ms": 80,
+      "eeprom_save_ms": 90,
+      "code_search_ms": 5,
+      "mqtt_response_ms": 50,
+      "update_time_minutes": 2
+    },
+    "documentation": {
+      "readme": "README_v2.5.4.md",
+      "instructions": "INSTRUCCIONES_PRUEBA_OTA_v2.5.4.md",
+      "validation": "VALIDACION_OTA_v2.5.4.md",
+      "mqtt_protocol": "/docs/messaging/mqtt-protocol.md",
+      "memory_analysis": "/docs/mejoras/ampliacion-limites-memoria-v2.5.3.md",
+      "ui_improvements": "/docs/mejoras/mejora-visualizacion-horarios-v2.5.3.md",
+      "mqtt_commands": "/docs/mejoras/comando-obtener-codigos-v2.5.3.md"
+    }
+  }
+}

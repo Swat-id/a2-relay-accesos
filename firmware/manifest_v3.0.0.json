@@ -1,0 +1,40 @@
+{
+  "version": "3.0.0",
+  "release_date": "2025-12-11",
+  "firmware": {
+    "file": "SWATID-A2_v3.0.0.bin",
+    "size": 1185949,
+    "sha256": "51c136fd184ac9b09eb95f299d6eed4b8858b2950928270cd01d371488caa469",
+    "url": "https://your-server.com/firmware/SWATID-A2_v3.0.0.bin"
+  },
+  "changelog": {
+    "major": [
+      "Corrección crítica del procesamiento de mensajes de validación remota",
+      "Eliminación de código duplicado en procesamiento de tópico /granted",
+      "Validación correcta de message_id entre solicitud y respuesta"
+    ],
+    "improvements": [
+      "Logging detallado del procesamiento de validación remota",
+      "Mejor manejo de errores en MQTT",
+      "Simplificación de la lógica de procesamiento de mensajes"
+    ],
+    "fixes": [
+      "Los relés ahora se abren correctamente cuando el backend aprueba un acceso",
+      "Corregido error 7 en mensajes válidos de validación remota",
+      "Corregida la extracción de campos relay_number y duration del mensaje"
+    ]
+  },
+  "compatibility": {
+    "min_backend_version": "2.0.0",
+    "hardware": ["KC868-A2"],
+    "esp32_framework": "arduino-esp32@2.0.6"
+  },
+  "requirements": {
+    "flash_size_mb": 4,
+    "min_free_heap_kb": 50
+  },
+  "critical": true,
+  "force_update": false,
+  "notes": "Esta versión corrige un bug crítico que impedía el funcionamiento de la validación remota. Se recomienda actualizar todos los dispositivos."
+}
+
