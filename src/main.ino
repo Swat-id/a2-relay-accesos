@@ -271,15 +271,15 @@ struct DigitalInputConfig {
   bool di1_enabled;        // DI1 habilitada/deshabilitada
   uint8_t di1_relay;       // Relé asignado a DI1 (1 o 2)
   float di1_duration;      // Duración de activación DI1 (segundos)
+  bool di1_inverse;        // Modo inverso DI1 (false=normal HIGH activa, true=inverso HIGH desactiva)
   
   bool di2_enabled;        // DI2 habilitada/deshabilitada
   uint8_t di2_relay;       // Relé asignado a DI2 (1 o 2)
   float di2_duration;      // Duración de activación DI2 (segundos)
+  bool di2_inverse;        // Modo inverso DI2 (false=normal HIGH activa, true=inverso HIGH desactiva)
   
-  uint8_t di1_mode;        // Modo de activación (0=flanco, 1=nivel - futuro)
-  uint8_t di2_mode;        // Modo de activación (0=flanco, 1=nivel - futuro)
-  
-  uint32_t validMarker;    // Marcador de validación (0xDIGI7A1)
+  uint8_t reserved[2];     // Reservado para futuras extensiones
+  uint32_t validMarker;    // Marcador de validación (0xD1617A1)
 };
 
 // Estructura para estado en tiempo real de entradas digitales
@@ -330,7 +330,7 @@ void processMqttResponse(const JsonDocument& doc);
 // Declaraciones de funciones de entradas digitales
 void loadDigitalInputConfig();
 void saveDigitalInputConfig();
-void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled, uint8_t relay, float duration);
+void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled, uint8_t relay, float duration, bool inverse);
 void publishDigitalInputEvent(int inputNumber, int relay, float duration);
 void handleDigitalInputs();
 void handleDigitalInputsStatus();
@@ -2405,30 +2405,32 @@ void loadDigitalInputConfig() {
     digitalInputConfig.di1_enabled = false;
     digitalInputConfig.di1_relay = 1;
     digitalInputConfig.di1_duration = 2.0;
+    digitalInputConfig.di1_inverse = false;  // Modo normal por defecto
     
     digitalInputConfig.di2_enabled = false;
     digitalInputConfig.di2_relay = 2;
     digitalInputConfig.di2_duration = 2.0;
+    digitalInputConfig.di2_inverse = false;  // Modo normal por defecto
     
-    digitalInputConfig.di1_mode = 0;  // Flanco
-    digitalInputConfig.di2_mode = 0;  // Flanco
-    
+    memset(digitalInputConfig.reserved, 0, sizeof(digitalInputConfig.reserved));
     digitalInputConfig.validMarker = DIGITAL_INPUT_CONFIG_MARKER;
     
     saveDigitalInputConfig();
   }
   
   Serial.println("📥 [DI] Configuración de entradas digitales cargada:");
-  Serial.printf("   DI1 (GPIO%d): %s, Relé %d, %.1fs\n", 
+  Serial.printf("   DI1 (GPIO%d): %s, Relé %d, %.1fs, Modo %s\n", 
                 DI1_PIN,
                 digitalInputConfig.di1_enabled ? "HABILITADA" : "DESHABILITADA",
                 digitalInputConfig.di1_relay,
-                digitalInputConfig.di1_duration);
-  Serial.printf("   DI2 (GPIO%d): %s, Relé %d, %.1fs\n", 
+                digitalInputConfig.di1_duration,
+                digitalInputConfig.di1_inverse ? "INVERSO" : "NORMAL");
+  Serial.printf("   DI2 (GPIO%d): %s, Relé %d, %.1fs, Modo %s\n", 
                 DI2_PIN,
                 digitalInputConfig.di2_enabled ? "HABILITADA" : "DESHABILITADA",
                 digitalInputConfig.di2_relay,
-                digitalInputConfig.di2_duration);
+                digitalInputConfig.di2_duration,
+                digitalInputConfig.di2_inverse ? "INVERSO" : "NORMAL");
 }
 
 // Guardar configuración de entradas digitales en EEPROM
@@ -2439,36 +2441,82 @@ void saveDigitalInputConfig() {
   Serial.println("💾 [DI] Configuración de entradas digitales guardada en EEPROM");
 }
 
-// Procesar entrada digital (detectar flancos y activar relé)
-void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled, uint8_t relay, float duration) {
-  if (!enabled) return;
+// Procesar entrada digital con modo Normal o Inverso
+void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled, uint8_t relay, float duration, bool inverse) {
+  if (!enabled) {
+    // Si está deshabilitada y el relé estaba activo por esta entrada en modo inverso, desactivarlo
+    if (state.relayActivated && inverse) {
+      int relayPin = (relay == 1) ? RELE1_PIN : RELE2_PIN;
+      digitalWrite(relayPin, LOW);
+      state.relayActivated = false;
+      Serial.printf("🔴 [DI%d] Entrada deshabilitada → Relé %d desactivado\n", inputNumber, relay);
+    }
+    return;
+  }
   
   // Leer estado actual del pin
   int pin = (inputNumber == 1) ? DI1_PIN : DI2_PIN;
   state.currentState = digitalRead(pin);
   
-  // Detectar flanco de subida (LOW → HIGH)
-  if (!state.lastState && state.currentState && !state.waitingForLow) {
-    Serial.printf("📍 [DI%d] Flanco de subida detectado → Activando Relé %d por %.1fs\n", 
-                  inputNumber, relay, duration);
+  // MODO NORMAL: HIGH activa el relé por duración configurada
+  if (!inverse) {
+    // Detectar flanco de subida (LOW → HIGH)
+    if (!state.lastState && state.currentState && !state.waitingForLow) {
+      Serial.printf("📍 [DI%d] Modo NORMAL - HIGH detectado → Activando Relé %d por %.1fs\n", 
+                    inputNumber, relay, duration);
+      
+      // Activar relé con la duración especificada
+      controlReleWithDuration(duration, relay);
+      
+      // Actualizar estado
+      state.relayActivated = true;
+      state.activationTime = millis();
+      state.waitingForLow = true;
+      
+      // Publicar evento MQTT
+      publishDigitalInputEvent(inputNumber, relay, duration);
+    }
     
-    // Activar relé con la duración especificada
-    controlReleWithDuration(duration, relay);
-    
-    // Actualizar estado
-    state.relayActivated = true;
-    state.activationTime = millis();
-    state.waitingForLow = true;
-    
-    // Publicar evento MQTT
-    publishDigitalInputEvent(inputNumber, relay, duration);
+    // Detectar flanco de bajada (HIGH → LOW)
+    if (state.lastState && !state.currentState) {
+      Serial.printf("📍 [DI%d] Modo NORMAL - LOW detectado → Sistema listo para nuevo pulso\n", inputNumber);
+      state.waitingForLow = false;
+    }
   }
-  
-  // Detectar flanco de bajada (HIGH → LOW)
-  if (state.lastState && !state.currentState) {
-    Serial.printf("📍 [DI%d] Flanco de bajada detectado → Sistema listo para nuevo pulso\n", inputNumber);
-    state.waitingForLow = false;
-    state.relayActivated = false;
+  // MODO INVERSO: Relé siempre activo, HIGH lo desactiva
+  else {
+    int relayPin = (relay == 1) ? RELE1_PIN : RELE2_PIN;
+    
+    // Estado LOW → Relé debe estar activo
+    if (!state.currentState) {
+      if (!state.relayActivated) {
+        Serial.printf("🔵 [DI%d] Modo INVERSO - LOW detectado → Activando Relé %d (permanente)\n", 
+                      inputNumber, relay);
+        digitalWrite(relayPin, HIGH);
+        state.relayActivated = true;
+        state.waitingForLow = false;
+        
+        // Publicar evento MQTT solo en cambios de estado
+        if (state.lastState != state.currentState) {
+          publishDigitalInputEvent(inputNumber, relay, -1);  // -1 indica modo permanente
+        }
+      }
+    }
+    // Estado HIGH → Relé debe estar desactivado
+    else {
+      if (state.relayActivated || !state.waitingForLow) {
+        Serial.printf("🔴 [DI%d] Modo INVERSO - HIGH detectado → Desactivando Relé %d\n", 
+                      inputNumber, relay);
+        digitalWrite(relayPin, LOW);
+        state.relayActivated = false;
+        state.waitingForLow = true;
+        
+        // Publicar evento MQTT solo en cambios de estado
+        if (state.lastState != state.currentState) {
+          publishDigitalInputEvent(inputNumber, relay, 0);  // 0 indica desactivación
+        }
+      }
+    }
   }
   
   // Actualizar último estado para la próxima lectura
@@ -3931,6 +3979,19 @@ void handleDigitalInputs() {
         <label>Duración (segundos):</label>
         <input type="number" name="di1_duration" id="di1_duration" 
                min="0.5" max="60" step="0.5" value="2.0">
+        <small style="color: #666;">Solo aplica en modo Normal</small>
+      </div>
+      
+      <div class="form-group">
+        <label>Modo de Funcionamiento:</label>
+        <select name="di1_inverse" id="di1_inverse">
+          <option value="0">🔵 Normal - HIGH activa relé (temporizado)</option>
+          <option value="1">🔴 Inverso - Relé siempre activo, HIGH lo desactiva</option>
+        </select>
+        <small style="color: #666; display: block; margin-top: 5px;">
+          Normal: Pulso activa el relé por el tiempo configurado<br>
+          Inverso: Relé siempre activo, pulso lo desactiva (seguridad)
+        </small>
       </div>
       
       <button type="submit">💾 Guardar Configuración DI1</button>
@@ -3961,6 +4022,19 @@ void handleDigitalInputs() {
         <label>Duración (segundos):</label>
         <input type="number" name="di2_duration" id="di2_duration" 
                min="0.5" max="60" step="0.5" value="2.0">
+        <small style="color: #666;">Solo aplica en modo Normal</small>
+      </div>
+      
+      <div class="form-group">
+        <label>Modo de Funcionamiento:</label>
+        <select name="di2_inverse" id="di2_inverse">
+          <option value="0">🔵 Normal - HIGH activa relé (temporizado)</option>
+          <option value="1">🔴 Inverso - Relé siempre activo, HIGH lo desactiva</option>
+        </select>
+        <small style="color: #666; display: block; margin-top: 5px;">
+          Normal: Pulso activa el relé por el tiempo configurado<br>
+          Inverso: Relé siempre activo, pulso lo desactiva (seguridad)
+        </small>
       </div>
       
       <button type="submit">💾 Guardar Configuración DI2</button>
@@ -3971,12 +4045,27 @@ void handleDigitalInputs() {
     <h3>ℹ️ Información</h3>
     <ul>
       <li><strong>DI1</strong> y <strong>DI2</strong> son entradas digitales de 3.3V</li>
-      <li>Detección por <strong>flanco de subida</strong> (0V → 3.3V)</li>
-      <li>El relé se activa durante el <strong>tiempo configurado</strong></li>
-      <li><strong>No se reactiva</strong> hasta que el pulso baje y vuelva a subir</li>
+      <li>Sin pulsar (pulsador abierto): entrada en <strong>LOW (0V)</strong></li>
+      <li>Pulsado (pulsador cerrado): entrada en <strong>HIGH (3.3V)</strong></li>
+      <li><strong>Modo Normal (🔵):</strong> HIGH activa el relé por el tiempo configurado</li>
+      <li><strong>Modo Inverso (🔴):</strong> Relé siempre activo, HIGH lo desactiva (sistema de seguridad)</li>
       <li>No interfiere con teclados Wiegand ni otras funcionalidades</li>
       <li>⚠️ <strong>Importante:</strong> Solo usar 3.3V, NO conectar 5V</li>
       <li>Se recomienda usar resistencia pull-up de 10kΩ a 3.3V</li>
+    </ul>
+    
+    <h4>🔵 Modo Normal - Casos de Uso:</h4>
+    <ul>
+      <li>Botón de apertura temporal (portero automático)</li>
+      <li>Sensor de presencia (activar luz X segundos)</li>
+      <li>Detector de movimiento (alarma temporal)</li>
+    </ul>
+    
+    <h4>🔴 Modo Inverso - Casos de Uso:</h4>
+    <ul>
+      <li>Botón de emergencia (relé normalmente cerrado)</li>
+      <li>Sistema fail-safe (relé activo, pulso desactiva)</li>
+      <li>Control de seguridad (relé enclavado, pulso libera)</li>
     </ul>
   </div>
   
@@ -4020,10 +4109,12 @@ void handleDigitalInputs() {
         document.getElementById('di1_enabled').checked = data.di1_enabled;
         document.getElementById('di1_relay').value = data.di1_relay;
         document.getElementById('di1_duration').value = data.di1_duration;
+        document.getElementById('di1_inverse').value = data.di1_inverse ? '1' : '0';
         
         document.getElementById('di2_enabled').checked = data.di2_enabled;
         document.getElementById('di2_relay').value = data.di2_relay;
         document.getElementById('di2_duration').value = data.di2_duration;
+        document.getElementById('di2_inverse').value = data.di2_inverse ? '1' : '0';
       })
       .catch(error => console.error('Error:', error));
   </script>
@@ -4063,9 +4154,11 @@ void handleDigitalInputsConfig() {
   doc["di1_enabled"] = digitalInputConfig.di1_enabled;
   doc["di1_relay"] = digitalInputConfig.di1_relay;
   doc["di1_duration"] = digitalInputConfig.di1_duration;
+  doc["di1_inverse"] = digitalInputConfig.di1_inverse;
   doc["di2_enabled"] = digitalInputConfig.di2_enabled;
   doc["di2_relay"] = digitalInputConfig.di2_relay;
   doc["di2_duration"] = digitalInputConfig.di2_duration;
+  doc["di2_inverse"] = digitalInputConfig.di2_inverse;
   
   String output;
   serializeJson(doc, output);
@@ -4084,6 +4177,7 @@ void handleSaveDigitalInput() {
     digitalInputConfig.di1_enabled = server.hasArg("di1_enabled");
     digitalInputConfig.di1_relay = server.arg("di1_relay").toInt();
     digitalInputConfig.di1_duration = server.arg("di1_duration").toFloat();
+    digitalInputConfig.di1_inverse = (server.arg("di1_inverse").toInt() == 1);
     
     // Validar valores
     if (digitalInputConfig.di1_relay < 1 || digitalInputConfig.di1_relay > 2) {
@@ -4093,15 +4187,17 @@ void handleSaveDigitalInput() {
       digitalInputConfig.di1_duration = 2.0;
     }
     
-    Serial.printf("⚙️ [DI1] Configuración actualizada: %s, Relé %d, %.1fs\n",
+    Serial.printf("⚙️ [DI1] Configuración actualizada: %s, Relé %d, %.1fs, Modo %s\n",
                   digitalInputConfig.di1_enabled ? "HABILITADA" : "DESHABILITADA",
                   digitalInputConfig.di1_relay,
-                  digitalInputConfig.di1_duration);
+                  digitalInputConfig.di1_duration,
+                  digitalInputConfig.di1_inverse ? "INVERSO" : "NORMAL");
     
   } else if (inputNumber == 2) {
     digitalInputConfig.di2_enabled = server.hasArg("di2_enabled");
     digitalInputConfig.di2_relay = server.arg("di2_relay").toInt();
     digitalInputConfig.di2_duration = server.arg("di2_duration").toFloat();
+    digitalInputConfig.di2_inverse = (server.arg("di2_inverse").toInt() == 1);
     
     // Validar valores
     if (digitalInputConfig.di2_relay < 1 || digitalInputConfig.di2_relay > 2) {
@@ -4111,10 +4207,11 @@ void handleSaveDigitalInput() {
       digitalInputConfig.di2_duration = 2.0;
     }
     
-    Serial.printf("⚙️ [DI2] Configuración actualizada: %s, Relé %d, %.1fs\n",
+    Serial.printf("⚙️ [DI2] Configuración actualizada: %s, Relé %d, %.1fs, Modo %s\n",
                   digitalInputConfig.di2_enabled ? "HABILITADA" : "DESHABILITADA",
                   digitalInputConfig.di2_relay,
-                  digitalInputConfig.di2_duration);
+                  digitalInputConfig.di2_duration,
+                  digitalInputConfig.di2_inverse ? "INVERSO" : "NORMAL");
   }
   
   saveDigitalInputConfig();
@@ -6197,9 +6294,11 @@ void handleCodes() {
   
   // ========== PROCESAMIENTO DE ENTRADAS DIGITALES ==========
   processDigitalInput(1, di1State, digitalInputConfig.di1_enabled, 
-                     digitalInputConfig.di1_relay, digitalInputConfig.di1_duration);
+                     digitalInputConfig.di1_relay, digitalInputConfig.di1_duration, 
+                     digitalInputConfig.di1_inverse);
   processDigitalInput(2, di2State, digitalInputConfig.di2_enabled,
-                     digitalInputConfig.di2_relay, digitalInputConfig.di2_duration);
+                     digitalInputConfig.di2_relay, digitalInputConfig.di2_duration,
+                     digitalInputConfig.di2_inverse);
   
   // ========== VERIFICACIÓN DE TIMEOUT DEL MODO TORNO ==========
   checkPendingRequestTimeout();
