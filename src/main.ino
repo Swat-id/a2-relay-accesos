@@ -43,6 +43,17 @@
 #include <HTTPClient.h>
 #include <esp_ota_ops.h>
 
+// =================== BLE (Solo si está habilitado) ===================
+#ifdef ENABLE_BLE
+#include <NimBLEDevice.h>
+#include "mbedtls/sha256.h"     // v4.1: Para Challenge-Response seguro
+#include "mbedtls/md.h"         // v4.1: Para HMAC-SHA256 (usado en HKDF manual)
+#include "esp_random.h"         // v4.1: Para generación de nonces y tokens
+#define BLE_ENABLED true
+#else
+#define BLE_ENABLED false
+#endif
+
 // =================== MACROS PARA OPTIMIZACIÓN ===================
 #define DEBUG_LEVEL 0  // 0=Sin debug, 1=Minimal, 2=Normal, 3=Verbose
 #if DEBUG_LEVEL == 0
@@ -73,14 +84,21 @@
  bool releActive[3] = {false, false, false};
  
 // =================== INFORMACIÓN DEL FIRMWARE ===================
-#define FIRMWARE_VERSION_MAJOR 2
-#define FIRMWARE_VERSION_MINOR 5
-#define FIRMWARE_VERSION_PATCH 4
+#ifdef ENABLE_BLE
+#define FIRMWARE_VERSION_MAJOR 4
+#define FIRMWARE_VERSION_MINOR 1
+#define FIRMWARE_VERSION_PATCH 0
+const char* firmwareVersion = "v4.1.0";
+const char* firmwareFullVersion = "v4.1.0-BLE";
+#else
+#define FIRMWARE_VERSION_MAJOR 3
+#define FIRMWARE_VERSION_MINOR 0
+#define FIRMWARE_VERSION_PATCH 2
+const char* firmwareVersion = "v3.0.2";
+const char* firmwareFullVersion = "v3.0.2-EEPROM";
+#endif
 #define FIRMWARE_VERSION_BUILD __DATE__ " " __TIME__
-
-const char* firmwareVersion = "v2.5.4";
 const char* firmwareBuild = FIRMWARE_VERSION_BUILD;
-const char* firmwareFullVersion = "v2.5.4-" FIRMWARE_VERSION_BUILD;
  
  // =================== IDENTIFICACIÓN DEL DISPOSITIVO ===================
  String fixedSerialNumber;  // SERIAL FIJO PARA MQTT - NO MODIFICABLE
@@ -103,7 +121,7 @@ unsigned long lastFailedAttempt = 0;          // Último intento fallido
 const unsigned long failedAttemptTimeout = 300000;  // Reset contador tras 5 minutos
  
 // =================== ALMACENAMIENTO DE CÓDIGOS ===================
-#define MAX_CODES 100   // Ampliado a 100 códigos locales
+#define MAX_CODES 50    // Ajustado para caber en 4KB EEPROM
 
 // =================== ESTRUCTURAS DEL MODO TORNO ===================
 struct TurnstileConfig {
@@ -113,7 +131,7 @@ struct TurnstileConfig {
   uint8_t reserved[5];    // Reservado para futuras extensiones
 };
 
-#define EEPROM_REMOTE_CODES_OFFSET 3200  // Offset en EEPROM para códigos remotos (reubicado para acomodar 100 códigos locales)
+#define EEPROM_REMOTE_CODES_OFFSET 1800  // Offset en EEPROM para códigos remotos (ajustado para 4KB)
 
 // Estructura de configuración
 struct Config {
@@ -137,7 +155,7 @@ struct Config {
  
  #define EEPROM_CODES_OFFSET 512
 #define TURNSTILE_TIMEOUT 5000   // 5 segundos timeout para respuestas MQTT
-#define TURNSTILE_CONFIG_MARKER 0xTORNO  // Marcador para configuración válida
+#define TURNSTILE_CONFIG_MARKER 0x544F524E  // "TORN" en ASCII - Marcador para modo torno
  
 // Estructuras de almacenamiento de códigos
 struct CodeEntry {
@@ -179,7 +197,7 @@ struct RemoteCodeEntry {
 };
 
 // Estructura para almacenamiento de códigos remotos
-#define MAX_REMOTE_CODES 100   // Ampliado a 100 códigos remotos (ajustado para balance memoria/capacidad)
+#define MAX_REMOTE_CODES 40    // Ajustado para caber en 4KB EEPROM
 struct StoredRemoteCodes {
   uint32_t validMarker;
   uint32_t version;
@@ -267,20 +285,23 @@ const int DI1_PIN = 36;  // GPIO36 - Entrada digital 1
 const int DI2_PIN = 39;  // GPIO39 - Entrada digital 2
 
 // Estructura para configuración de entradas digitales en EEPROM
+// IMPORTANTE: Estructura empaquetada para evitar problemas de alineamiento
+#pragma pack(push, 1)
 struct DigitalInputConfig {
-  bool di1_enabled;        // DI1 habilitada/deshabilitada
+  uint32_t validMarker;    // Marcador de validación: 0xD1D1D1D1
+  uint8_t di1_enabled;     // DI1 habilitada/deshabilitada (0=no, 1=sí)
   uint8_t di1_relay;       // Relé asignado a DI1 (1 o 2)
-  float di1_duration;      // Duración de activación DI1 (segundos)
-  bool di1_inverse;        // Modo inverso DI1 (false=normal HIGH activa, true=inverso HIGH desactiva)
-  
-  bool di2_enabled;        // DI2 habilitada/deshabilitada
+  uint8_t di1_inverse;     // Modo inverso DI1 (0=normal, 1=inverso)
+  uint8_t di1_reserved;    // Reservado
+  uint32_t di1_duration_ms; // Duración en milisegundos (evita float)
+  uint8_t di2_enabled;     // DI2 habilitada/deshabilitada (0=no, 1=sí)
   uint8_t di2_relay;       // Relé asignado a DI2 (1 o 2)
-  float di2_duration;      // Duración de activación DI2 (segundos)
-  bool di2_inverse;        // Modo inverso DI2 (false=normal HIGH activa, true=inverso HIGH desactiva)
-  
-  uint8_t reserved[2];     // Reservado para futuras extensiones
-  uint32_t validMarker;    // Marcador de validación (0xD1617A1)
+  uint8_t di2_inverse;     // Modo inverso DI2 (0=normal, 1=inverso)
+  uint8_t di2_reserved;    // Reservado
+  uint32_t di2_duration_ms; // Duración en milisegundos (evita float)
+  uint32_t checksum;       // Checksum para verificar integridad
 };
+#pragma pack(pop)
 
 // Estructura para estado en tiempo real de entradas digitales
 struct DigitalInputState {
@@ -291,14 +312,149 @@ struct DigitalInputState {
   bool waitingForLow;      // Esperando que el pulso baje
 };
 
-// Definiciones para EEPROM
-#define DIGITAL_INPUT_CONFIG_MARKER 0xD1617A1
-#define EEPROM_DIGITAL_INPUT_OFFSET 9700
+// Definiciones para EEPROM de entradas digitales
+#define DIGITAL_INPUT_CONFIG_MARKER 0xD1D1D1D1  // Marcador más distintivo
+// DI Config justo después de Config (que termina ~200 bytes)
+#define EEPROM_DIGITAL_INPUT_OFFSET 256
+
+// =================== CONFIGURACIÓN BLE (v4.0) ===================
+#ifdef ENABLE_BLE
+#define BLE_AUTH_CONFIG_MARKER 0xB1E4C0DE  // Marcador para config BLE (hex válido)
+#define EEPROM_BLE_AUTH_OFFSET 3400        // Offset en EEPROM para BLE config
+#define BLE_KEY_SIZE 64                    // Tamaño de clave en bytes
+#define BLE_MAX_USERS 5                    // Máximo usuarios vinculados
+
+// =================== SEGURIDAD MQTT v4.1 ===================
+// Clave maestra del dispositivo para derivación segura de claves de usuario
+#define DEVICE_KEY_CONFIG_MARKER 0xDE41CE41  // Marcador para config de claves
+#define EEPROM_DEVICE_KEY_OFFSET 3200        // Offset en EEPROM para clave maestra
+#define DEVICE_MASTER_KEY_SIZE 32            // 32 bytes = 256 bits para HKDF
+
+// Estructura para clave maestra del dispositivo
+#pragma pack(push, 1)
+struct DeviceKeyConfig {
+  uint32_t validMarker;                      // Marcador: 0xDEV1CE41
+  uint8_t master_key[DEVICE_MASTER_KEY_SIZE]; // Clave maestra (32 bytes)
+  uint8_t key_version;                       // Versión de la clave (para rotación)
+  uint32_t generation_time;                  // Timestamp de generación
+  uint32_t checksum;                         // Checksum para integridad
+};
+#pragma pack(pop)
+
+DeviceKeyConfig deviceKeyConfig;
+
+// Permisos BLE
+#define BLE_PERM_RELAY_CONTROL  0x01  // Control de relés
+#define BLE_PERM_MODE_CHANGE    0x02  // Cambio de modo
+#define BLE_PERM_ADD_CODES      0x04  // Añadir códigos
+#define BLE_PERM_NETWORK_CONFIG 0x08  // Configuración de red
+#define BLE_PERM_ADMIN          0xFF  // Todos los permisos
+
+// Estructura para autenticación BLE
+#pragma pack(push, 1)
+struct BLEAuthConfig {
+  uint32_t validMarker;                    // Marcador: 0xBLE4C0DE
+  uint8_t superadmin_key[BLE_KEY_SIZE];    // Clave del superadmin (64 bytes)
+  uint8_t user_keys[BLE_MAX_USERS][BLE_KEY_SIZE]; // Claves de usuarios (5 x 64 bytes)
+  uint8_t user_enabled[BLE_MAX_USERS];     // Estado de cada usuario (0=deshabilitado)
+  uint8_t user_permissions[BLE_MAX_USERS]; // Permisos por usuario
+  char user_names[BLE_MAX_USERS][16];      // Nombres de usuarios
+  uint8_t superadmin_registered;           // 1 si hay superadmin registrado
+  uint32_t checksum;                       // Checksum para integridad
+};
+#pragma pack(pop)
+
+BLEAuthConfig bleAuthConfig;
+bool bleAuthenticated = false;
+uint8_t bleCurrentPermissions = 0;
+String bleConnectedUser = "";
+unsigned long bleConnectionTime = 0;        // Momento de conexión BLE
+#define BLE_AUTH_TIMEOUT_MS 30000           // 30 segundos para autenticarse
+
+// =================== SEGURIDAD BLE v4.1 - Challenge-Response ===================
+// Sistema de autenticación seguro que evita transmitir la clave en claro
+uint8_t bleSessionNonce[16];                // Challenge generado por el dispositivo (16 bytes)
+uint8_t bleSessionToken[8];                 // Token de sesión para operaciones (8 bytes)
+bool bleSessionValid = false;               // Si hay sesión activa con token válido
+unsigned long bleSessionTime = 0;           // Tiempo de última actividad de sesión
+bool bleChallengeReady = false;             // Si hay un challenge pendiente de respuesta
+#define BLE_SESSION_TIMEOUT_MS 300000       // 5 minutos de inactividad máxima
+#define BLE_CHALLENGE_TIMEOUT_MS 30000      // 30 segundos para responder al challenge
+
+// UUIDs para servicios BLE
+#define SERVICE_UUID        "0000FF00-0000-1000-8000-00805F9B34FB"
+#define CHAR_AUTH_UUID      "0000FF01-0000-1000-8000-00805F9B34FB"
+#define CHAR_RELAY_UUID     "0000FF02-0000-1000-8000-00805F9B34FB"
+#define CHAR_MODE_UUID      "0000FF03-0000-1000-8000-00805F9B34FB"
+#define CHAR_ADDCODE_UUID   "0000FF04-0000-1000-8000-00805F9B34FB"
+#define CHAR_NETWORK_UUID   "0000FF05-0000-1000-8000-00805F9B34FB"
+#define CHAR_RELAYTIME_UUID "0000FF06-0000-1000-8000-00805F9B34FB"
+#define CHAR_STATUS_UUID    "0000FF07-0000-1000-8000-00805F9B34FB"
+#define CHAR_DEVINFO_UUID   "0000FF08-0000-1000-8000-00805F9B34FB"
+#define CHAR_FULLINFO_UUID  "0000FF09-0000-1000-8000-00805F9B34FB"
+#define CHAR_CODES_UUID     "0000FF0A-0000-1000-8000-00805F9B34FB"
+#define CHAR_CHALLENGE_UUID "0000FF0B-0000-1000-8000-00805F9B34FB"  // Challenge para auth seguro
+
+// Tipo de dispositivo para provisión automática BLE
+#define DEVICE_TYPE         "SWATID-A2"
+#define PROTOCOL_VERSION    1
+
+// Punteros BLE
+NimBLEServer* pServer = nullptr;
+NimBLECharacteristic* pAuthChar = nullptr;
+NimBLECharacteristic* pRelayChar = nullptr;
+NimBLECharacteristic* pModeChar = nullptr;
+NimBLECharacteristic* pAddCodeChar = nullptr;
+NimBLECharacteristic* pNetworkChar = nullptr;
+NimBLECharacteristic* pRelayTimeChar = nullptr;
+NimBLECharacteristic* pStatusChar = nullptr;
+NimBLECharacteristic* pDevInfoChar = nullptr;
+NimBLECharacteristic* pFullInfoChar = nullptr;
+NimBLECharacteristic* pCodesChar = nullptr;
+NimBLECharacteristic* pChallengeChar = nullptr;  // v4.1: Challenge para auth seguro
+bool bleDeviceConnected = false;
+
+// Forward declarations de funciones BLE (evita que PlatformIO genere prototipos fuera del #ifdef)
+uint32_t calculateBLEChecksum(const BLEAuthConfig& cfg);
+uint32_t calculateDeviceKeyChecksum(const DeviceKeyConfig& cfg);
+void loadBLEAuthConfig();
+void saveBLEAuthConfig();
+void loadDeviceKeyConfig();           // v4.1: Clave maestra para HKDF
+bool deriveUserKey(const char* userId, uint8_t* outputKey);  // v4.1: HKDF
+void sendBLEChunked(NimBLECharacteristic* pChar, const String& data);
+void sendBLEWithEOT(NimBLECharacteristic* pChar, const String& data);
+void initBLE();
+void updateBLEStatus();
+void updateFF09Value();
+void updateFF0AValue(int page = 0);
+void handleBLEPage();
+void handleBLEClearAll();
+void handleBLEClearSuperadmin();
+void handleBLEClearUser();
+void handleBLEStatus();
+
+#endif // ENABLE_BLE
+
+// Función para calcular checksum de la configuración DI
+uint32_t calculateDIChecksum(const DigitalInputConfig& cfg) {
+  uint32_t sum = 0;
+  sum += cfg.di1_enabled;
+  sum += cfg.di1_relay << 8;
+  sum += cfg.di1_inverse << 16;
+  sum += cfg.di1_duration_ms;
+  sum += cfg.di2_enabled;
+  sum += cfg.di2_relay << 8;
+  sum += cfg.di2_inverse << 16;
+  sum += cfg.di2_duration_ms;
+  return sum ^ 0x55AA55AA;  // XOR con patrón distintivo
+}
 
 // Variables globales para entradas digitales
 DigitalInputConfig digitalInputConfig;
 DigitalInputState di1State = {false, false, false, 0, false};
 DigitalInputState di2State = {false, false, false, 0, false};
+
+// Todas las configuraciones usan EEPROM para almacenamiento persistente
  
 // =================== SERVIDOR WEB Y CONECTIVIDAD ===================
 WebServer server(80);
@@ -330,8 +486,8 @@ void processMqttResponse(const JsonDocument& doc);
 // Declaraciones de funciones de entradas digitales
 void loadDigitalInputConfig();
 void saveDigitalInputConfig();
-void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled, uint8_t relay, float duration, bool inverse);
-void publishDigitalInputEvent(int inputNumber, int relay, float duration);
+void processDigitalInput(int inputNumber, DigitalInputState &state, uint8_t enabled, uint8_t relay, uint32_t duration_ms, uint8_t inverse);
+void publishDigitalInputEvent(int inputNumber, int relay, uint32_t duration_ms);
 void handleDigitalInputs();
 void handleDigitalInputsStatus();
 void handleDigitalInputsConfig();
@@ -493,31 +649,40 @@ void updateOTAConfiguration(const JsonDocument& doc);
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void processCommand(const JsonDocument& doc);
  
- // =================== CALLBACK EVENTOS ETHERNET ===================
- void WiFiEvent(arduino_event_id_t event) {
-   switch (event) {
-     case ARDUINO_EVENT_ETH_START:
-       Serial.println("🌐 ETH Iniciado");
-       ETH.setHostname(deviceName);
-       break;
-     case ARDUINO_EVENT_ETH_CONNECTED:
-       Serial.println("🌐 ETH Conectado");
-       break;
-     case ARDUINO_EVENT_ETH_GOT_IP:
-       ip = ETH.localIP();
-       Serial.print("🌐 ETH Dirección IP: ");
-       Serial.println(ip);
-       ethConnected = true;
-       configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-       connectToMqtt();
-       break;
-     case ARDUINO_EVENT_ETH_DISCONNECTED:
-       Serial.println("🌐 ETH Desconectado");
-       ethConnected = false;
-       break;
-     case ARDUINO_EVENT_ETH_STOP:
-       Serial.println("🌐 ETH Detenido");
-       ethConnected = false;
+// Flag para conexión MQTT pendiente (no bloquear en callback)
+bool mqttConnectionPending = false;
+
+// =================== CALLBACK EVENTOS ETHERNET ===================
+// IMPORTANTE: No hacer operaciones bloqueantes aquí
+void WiFiEvent(arduino_event_id_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_ETH_START:
+      Serial.println("🌐 ETH Iniciado");
+      ETH.setHostname(deviceName);
+      break;
+    case ARDUINO_EVENT_ETH_CONNECTED:
+      Serial.println("🌐 ETH Conectado");
+      break;
+    case ARDUINO_EVENT_ETH_GOT_IP:
+      ip = ETH.localIP();
+      Serial.print("🌐 ETH Dirección IP: ");
+      Serial.println(ip);
+      ethConnected = true;
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+      // NO llamar a connectToMqtt() aquí - puede bloquear
+      // En su lugar, marcar para conectar en el loop()
+      mqttConnectionPending = true;
+      Serial.println("🌐 MQTT conexión programada para loop()");
+      break;
+    case ARDUINO_EVENT_ETH_DISCONNECTED:
+      Serial.println("🌐 ETH Desconectado");
+      ethConnected = false;
+      mqttConnectionPending = false;
+      break;
+    case ARDUINO_EVENT_ETH_STOP:
+      Serial.println("🌐 ETH Detenido");
+      ethConnected = false;
+      mqttConnectionPending = false;
        break;
      default:
        break;
@@ -575,51 +740,68 @@ String getTimeString() {
   return String(timeStringBuff);
 }
  
- // =================== CONECTIVIDAD MQTT CORREGIDA ===================
- void connectToMqtt() {
-   mqttClient.setServer(mqtt_broker, mqtt_port);
-   mqttClient.setCallback(mqttCallback);
-   mqttClient.setBufferSize(2048);  // Incrementar buffer para mensajes grandes
-   
-   Serial.print("📡 Conectando a MQTT...");
-   
-   String clientId = "ESP32Client-";
-   clientId += String(random(0xffff), HEX);
-   
-   if (mqttClient.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
-     Serial.println(" ✅ Conectado al broker MQTT");
-     
-     // Suscribirse usando SERIAL FIJO
-     String commandTopic = "swatidhome/command/" + fixedSerialNumber + "/#";
-     bool subscribed = mqttClient.subscribe(commandTopic.c_str());
-     
-     if (subscribed) {
-       Serial.printf("📡 Suscrito correctamente a: %s\n", commandTopic.c_str());
-     } else {
-       Serial.printf("❌ Error al suscribirse a: %s\n", commandTopic.c_str());
-     }
-     
-     // Dar tiempo para que se establezca la suscripción
-     delay(500);
-     
-     publishError(3, "Dispositivo iniciado - Dual Wiegand " + String(firmwareVersion));
-     
-   } else {
-     Serial.print(" ❌ Error al conectar a MQTT, rc=");
-     Serial.println(mqttClient.state());
-     
-     // Códigos de error MQTT:
-     // -4: MQTT_CONNECTION_TIMEOUT
-     // -3: MQTT_CONNECTION_LOST  
-     // -2: MQTT_CONNECT_FAILED
-     // -1: MQTT_DISCONNECTED
-     //  1: MQTT_CONNECT_BAD_PROTOCOL
-     //  2: MQTT_CONNECT_BAD_CLIENT_ID
-     //  3: MQTT_CONNECT_UNAVAILABLE
-     //  4: MQTT_CONNECT_BAD_CREDENTIALS
-     //  5: MQTT_CONNECT_UNAUTHORIZED
-   }
- }
+// =================== CONECTIVIDAD MQTT ROBUSTA ===================
+// Timeout de conexión MQTT (en segundos)
+#define MQTT_CONNECT_TIMEOUT_SEC 5
+
+void connectToMqtt() {
+  // Verificar que tenemos conexión Ethernet
+  if (!ethConnected) {
+    Serial.println("📡 MQTT: Sin conexión Ethernet, saltando");
+    return;
+  }
+  
+  mqttClient.setServer(mqtt_broker, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(2048);
+  mqttClient.setSocketTimeout(MQTT_CONNECT_TIMEOUT_SEC);  // Timeout corto
+  
+  Serial.printf("📡 Conectando a MQTT (timeout: %ds)...", MQTT_CONNECT_TIMEOUT_SEC);
+  
+  String clientId = "ESP32Client-";
+  clientId += String(random(0xffff), HEX);
+  
+  unsigned long startTime = millis();
+  bool connected = mqttClient.connect(clientId.c_str(), mqtt_username, mqtt_password);
+  unsigned long elapsed = millis() - startTime;
+  
+  if (connected) {
+    Serial.printf(" ✅ Conectado en %lums\n", elapsed);
+    
+    // Suscribirse usando SERIAL FIJO
+    String commandTopic = "swatidhome/command/" + fixedSerialNumber + "/#";
+    bool subscribed = mqttClient.subscribe(commandTopic.c_str());
+    
+    if (subscribed) {
+      Serial.printf("📡 Suscrito a: %s\n", commandTopic.c_str());
+    } else {
+      Serial.printf("❌ Error suscripción: %s\n", commandTopic.c_str());
+    }
+    
+    // Pequeña pausa (no bloqueante significativamente)
+    delay(100);
+    
+    publishError(3, "Dispositivo iniciado - Dual Wiegand " + String(firmwareVersion));
+    
+  } else {
+    int rc = mqttClient.state();
+    Serial.printf(" ❌ Error rc=%d (%lums)\n", rc, elapsed);
+    
+    // Log del código de error
+    switch(rc) {
+      case -4: Serial.println("   -> MQTT_CONNECTION_TIMEOUT"); break;
+      case -3: Serial.println("   -> MQTT_CONNECTION_LOST"); break;
+      case -2: Serial.println("   -> MQTT_CONNECT_FAILED"); break;
+      case -1: Serial.println("   -> MQTT_DISCONNECTED"); break;
+      case 1:  Serial.println("   -> MQTT_CONNECT_BAD_PROTOCOL"); break;
+      case 2:  Serial.println("   -> MQTT_CONNECT_BAD_CLIENT_ID"); break;
+      case 3:  Serial.println("   -> MQTT_CONNECT_UNAVAILABLE"); break;
+      case 4:  Serial.println("   -> MQTT_CONNECT_BAD_CREDENTIALS"); break;
+      case 5:  Serial.println("   -> MQTT_CONNECT_UNAUTHORIZED"); break;
+      default: Serial.printf("   -> Código desconocido: %d\n", rc); break;
+    }
+  }
+}
  
  // =================== CALLBACK MQTT ===================
  void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -963,12 +1145,486 @@ String getTimeString() {
           Serial.println("✅ [MQTT] Todos los códigos remotos eliminados");
           publishResponse(0, receivedMessageId, "all remote codes cleared");
           
+        // ===== GESTIÓN DE CÓDIGOS LOCALES =====
+        } else if (action == "add_local_code") {
+          // Añadir código local
+          if (!doc["message_info"].containsKey("code_type") || 
+              !doc["message_info"].containsKey("code_value") ||
+              !doc["message_info"].containsKey("relay")) {
+            Serial.println("❌ Faltan parámetros para add_local_code");
+            publishResponse(1, receivedMessageId, "missing parameters (code_type, code_value, relay required)");
+            break;
+          }
+          
+          String codeType = doc["message_info"]["code_type"].as<String>();
+          String codeValue = doc["message_info"]["code_value"].as<String>();
+          int keyboardId = doc["message_info"].containsKey("keyboard_id") ? 
+                          doc["message_info"]["keyboard_id"].as<int>() : 0;
+          int relay = doc["message_info"]["relay"].as<int>();
+          
+          // Validaciones
+          bool isValidType = (codeType == "PIN" || codeType == "TAG");
+          bool isValidCode = codeValue.length() > 0 && codeValue.length() <= 16;
+          bool isValidKeyboard = (keyboardId >= 0 && keyboardId <= 2);
+          bool isValidRelay = (relay >= 1 && relay <= 2);
+          
+          if (!isValidType) {
+            publishResponse(1, receivedMessageId, "invalid code_type (must be PIN or TAG)");
+          } else if (!isValidCode) {
+            publishResponse(1, receivedMessageId, "invalid code_value (1-16 characters)");
+          } else if (!isValidKeyboard) {
+            publishResponse(1, receivedMessageId, "invalid keyboard_id (0=both, 1, 2)");
+          } else if (!isValidRelay) {
+            publishResponse(1, receivedMessageId, "invalid relay (1 or 2)");
+          } else {
+            bool added = addCode(codeType.c_str(), codeValue.c_str(), keyboardId, relay);
+            if (added) {
+              Serial.printf("✅ [MQTT] Código local añadido: %s %s -> Teclado %d, Relé %d\n", 
+                           codeType.c_str(), codeValue.c_str(), keyboardId, relay);
+              
+              DynamicJsonDocument respDoc(256);
+              respDoc["code_type"] = codeType;
+              respDoc["code_value"] = codeValue;
+              respDoc["keyboard_id"] = keyboardId;
+              respDoc["relay"] = relay;
+              respDoc["total_codes"] = storedCodes->count;
+              String respStr;
+              serializeJson(respDoc, respStr);
+              publishResponse(0, receivedMessageId, "local code added: " + respStr);
+            } else {
+              publishResponse(1, receivedMessageId, "failed to add local code (may exist or memory full)");
+            }
+          }
+          
+        } else if (action == "remove_local_code") {
+          // Eliminar código local específico
+          if (!doc["message_info"].containsKey("code_type") || 
+              !doc["message_info"].containsKey("code_value")) {
+            Serial.println("❌ Faltan parámetros para remove_local_code");
+            publishResponse(1, receivedMessageId, "missing parameters (code_type, code_value required)");
+            break;
+          }
+          
+          String codeType = doc["message_info"]["code_type"].as<String>();
+          String codeValue = doc["message_info"]["code_value"].as<String>();
+          int keyboardId = doc["message_info"].containsKey("keyboard_id") ? 
+                          doc["message_info"]["keyboard_id"].as<int>() : -1;
+          
+          // Buscar y eliminar el código
+          bool found = false;
+          for (int i = 0; i < storedCodes->count; i++) {
+            if (strcmp(storedCodes->codes[i].type, codeType.c_str()) == 0 &&
+                strcmp(storedCodes->codes[i].value, codeValue.c_str()) == 0 &&
+                (keyboardId == -1 || storedCodes->codes[i].keyboard_id == keyboardId)) {
+              // Mover el último código a esta posición
+              if (i < storedCodes->count - 1) {
+                storedCodes->codes[i] = storedCodes->codes[storedCodes->count - 1];
+              }
+              storedCodes->count--;
+              saveStoredCodes();
+              found = true;
+              Serial.printf("✅ [MQTT] Código local eliminado: %s %s\n", codeType.c_str(), codeValue.c_str());
+              publishResponse(0, receivedMessageId, "local code removed: " + codeType + " " + codeValue);
+              break;
+            }
+          }
+          
+          if (!found) {
+            publishResponse(1, receivedMessageId, "local code not found");
+          }
+          
+        } else if (action == "clear_local_codes") {
+          // Eliminar todos los códigos locales
+          storedCodes->count = 0;
+          saveStoredCodes();
+          Serial.println("✅ [MQTT] Todos los códigos locales eliminados");
+          publishResponse(0, receivedMessageId, "all local codes cleared");
+          
+        } else if (action == "list_local_codes") {
+          // Listar códigos locales
+          Serial.println("📋 [MQTT] Listando códigos locales...");
+          
+          DynamicJsonDocument listDoc(2048);
+          listDoc["count"] = storedCodes->count;
+          listDoc["max"] = MAX_CODES;
+          listDoc["validation_mode"] = storedCodes->localValidationFirst ? "local_first" : "remote_only";
+          
+          JsonArray codesArray = listDoc.createNestedArray("codes");
+          for (int i = 0; i < storedCodes->count && i < 30; i++) {  // Limitar a 30 para no exceder buffer
+            JsonObject code = codesArray.createNestedObject();
+            code["id"] = i;
+            code["type"] = storedCodes->codes[i].type;
+            code["value"] = storedCodes->codes[i].value;
+            code["keyboard"] = storedCodes->codes[i].keyboard_id;
+            code["relay"] = storedCodes->codes[i].relay;
+          }
+          
+          if (storedCodes->count > 30) {
+            listDoc["truncated"] = true;
+            listDoc["showing"] = 30;
+          }
+          
+          String listStr;
+          serializeJson(listDoc, listStr);
+          publishResponse(0, receivedMessageId, listStr);
+          
         } else {
           Serial.printf("❌ Acción desconocida para message_type 5: %s\n", action.c_str());
           publishResponse(1, receivedMessageId, "unknown action: " + action);
         }
       }
       break;
+      
+#ifdef ENABLE_BLE
+    case 6:  // Gestión de vinculaciones BLE
+      if (doc.containsKey("message_info")) {
+        String bleAction = doc["message_info"]["action"].as<String>();
+        
+        if (bleAction == "clear_all") {
+          // Limpiar todas las vinculaciones
+          Serial.println("🔵 [MQTT] Comando: Limpiar todas las vinculaciones BLE");
+          memset(&bleAuthConfig, 0, sizeof(BLEAuthConfig));
+          bleAuthConfig.validMarker = BLE_AUTH_CONFIG_MARKER;
+          bleAuthConfig.superadmin_registered = 0;
+          for (int i = 0; i < BLE_MAX_USERS; i++) {
+            bleAuthConfig.user_enabled[i] = 0;
+            bleAuthConfig.user_permissions[i] = 0;
+          }
+          saveBLEAuthConfig();
+          bleAuthenticated = false;
+          bleCurrentPermissions = 0;
+          bleConnectedUser = "";
+          publishResponse(0, receivedMessageId, "all BLE bindings cleared");
+          
+          // Publicar evento de desvinculación para monitorización
+          {
+            String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+            String eventMsg = String("{") +
+              "\"event\":\"BINDINGS_CLEARED\"," +
+              "\"type\":\"ALL\"," +
+              "\"source\":\"MQTT\"," +
+              "\"device\":\"" + fixedSerialNumber + "\"," +
+              "\"message_id\":" + String(receivedMessageId) + "," +
+              "\"details\":{" +
+                "\"superadmin_cleared\":true," +
+                "\"users_cleared\":5" +
+              "}," +
+              "\"timestamp\":\"" + getTimestamp() + "\"" +
+            "}";
+            mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+          }
+          
+        } else if (bleAction == "clear_superadmin") {
+          // Limpiar solo superadmin
+          Serial.println("🔵 [MQTT] Comando: Limpiar superadmin BLE");
+          memset(bleAuthConfig.superadmin_key, 0, BLE_KEY_SIZE);
+          bleAuthConfig.superadmin_registered = 0;
+          saveBLEAuthConfig();
+          bleAuthenticated = false;
+          bleCurrentPermissions = 0;
+          bleConnectedUser = "";
+          publishResponse(0, receivedMessageId, "superadmin BLE binding cleared");
+          
+          // Publicar evento de desvinculación para monitorización
+          {
+            String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+            String eventMsg = String("{") +
+              "\"event\":\"BINDINGS_CLEARED\"," +
+              "\"type\":\"SUPERADMIN\"," +
+              "\"source\":\"MQTT\"," +
+              "\"device\":\"" + fixedSerialNumber + "\"," +
+              "\"message_id\":" + String(receivedMessageId) + "," +
+              "\"details\":{" +
+                "\"action\":\"superadmin_removed\"," +
+                "\"awaiting_new_superadmin\":true" +
+              "}," +
+              "\"timestamp\":\"" + getTimestamp() + "\"" +
+            "}";
+            mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+          }
+          
+        } else if (bleAction == "clear_user") {
+          // Limpiar usuario específico
+          if (doc["message_info"].containsKey("slot")) {
+            int slot = doc["message_info"]["slot"].as<int>();
+            if (slot >= 1 && slot <= BLE_MAX_USERS) {
+              Serial.printf("🔵 [MQTT] Comando: Limpiar usuario BLE %d\n", slot);
+              int idx = slot - 1;
+              
+              // Guardar nombre del usuario antes de eliminarlo
+              String userName = String(bleAuthConfig.user_names[idx]);
+              if (userName.length() == 0) userName = "Usuario" + String(slot);
+              uint8_t oldPermissions = bleAuthConfig.user_permissions[idx];
+              
+              memset(bleAuthConfig.user_keys[idx], 0, BLE_KEY_SIZE);
+              bleAuthConfig.user_enabled[idx] = 0;
+              bleAuthConfig.user_permissions[idx] = 0;
+              memset(bleAuthConfig.user_names[idx], 0, 16);
+              saveBLEAuthConfig();
+              publishResponse(0, receivedMessageId, "BLE user " + String(slot) + " cleared");
+              
+              // Publicar evento de desvinculación para monitorización
+              {
+                String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+                String eventMsg = String("{") +
+                  "\"event\":\"BINDINGS_CLEARED\"," +
+                  "\"type\":\"USER\"," +
+                  "\"source\":\"MQTT\"," +
+                  "\"device\":\"" + fixedSerialNumber + "\"," +
+                  "\"message_id\":" + String(receivedMessageId) + "," +
+                  "\"details\":{" +
+                    "\"slot\":" + String(slot) + "," +
+                    "\"user_name\":\"" + userName + "\"," +
+                    "\"previous_permissions\":\"0x" + String(oldPermissions, HEX) + "\"" +
+                  "}," +
+                  "\"timestamp\":\"" + getTimestamp() + "\"" +
+                "}";
+                mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+              }
+            } else {
+              publishResponse(1, receivedMessageId, "invalid slot (1-5)");
+            }
+          } else {
+            publishResponse(1, receivedMessageId, "missing slot parameter");
+          }
+          
+        } else if (bleAction == "add_user") {
+          // Añadir usuario BLE (solo desde servidor)
+          // Formato: { "action": "add_user", "slot": 1-5, "key": "hex64bytes", "name": "nombre", "permissions": 3 }
+          if (doc["message_info"].containsKey("slot") && doc["message_info"].containsKey("key")) {
+            int slot = doc["message_info"]["slot"].as<int>();
+            String keyHex = doc["message_info"]["key"].as<String>();
+            String userName = doc["message_info"].containsKey("name") ? 
+                              doc["message_info"]["name"].as<String>() : 
+                              String("Usuario") + String(slot);
+            uint8_t permissions = doc["message_info"].containsKey("permissions") ? 
+                                  doc["message_info"]["permissions"].as<int>() : 
+                                  (BLE_PERM_RELAY_CONTROL | BLE_PERM_MODE_CHANGE);
+            
+            if (slot >= 1 && slot <= BLE_MAX_USERS && keyHex.length() == BLE_KEY_SIZE * 2) {
+              Serial.printf("🔵 [MQTT] Añadiendo usuario BLE en slot %d: %s\n", slot, userName.c_str());
+              
+              // Convertir hex a bytes
+              int idx = slot - 1;
+              for (int i = 0; i < BLE_KEY_SIZE; i++) {
+                String byteStr = keyHex.substring(i * 2, i * 2 + 2);
+                bleAuthConfig.user_keys[idx][i] = (uint8_t)strtol(byteStr.c_str(), NULL, 16);
+              }
+              bleAuthConfig.user_enabled[idx] = 1;
+              bleAuthConfig.user_permissions[idx] = permissions;
+              strncpy(bleAuthConfig.user_names[idx], userName.c_str(), 15);
+              bleAuthConfig.user_names[idx][15] = '\0';
+              saveBLEAuthConfig();
+              
+              // Respuesta
+              DynamicJsonDocument respDoc(256);
+              respDoc["slot"] = slot;
+              respDoc["name"] = userName;
+              respDoc["permissions"] = permissions;
+              respDoc["enabled"] = true;
+              String respStr;
+              serializeJson(respDoc, respStr);
+              publishResponse(0, receivedMessageId, "user added: " + respStr);
+              
+              // Evento
+              String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+              String eventMsg = String("{") +
+                "\"event\":\"USER_ADDED\"," +
+                "\"source\":\"MQTT\"," +
+                "\"device\":\"" + fixedSerialNumber + "\"," +
+                "\"slot\":" + String(slot) + "," +
+                "\"name\":\"" + userName + "\"," +
+                "\"permissions\":" + String(permissions) + "," +
+                "\"timestamp\":\"" + getTimestamp() + "\"" +
+              "}";
+              mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+            } else {
+              publishResponse(1, receivedMessageId, "invalid slot (1-5) or key length (must be 128 hex chars)");
+            }
+          } else {
+            publishResponse(1, receivedMessageId, "missing slot or key parameter");
+          }
+        
+        // =================== v4.1: AÑADIR USUARIO CON DERIVACIÓN SEGURA ===================  
+        } else if (bleAction == "add_user_derived") {
+          // Añadir usuario BLE con derivación de clave (SEGURO - no transmite clave)
+          // La clave se deriva usando HKDF: key = HKDF(device_master_key, serial, "user_key:" + user_id)
+          // Formato: { "action": "add_user_derived", "slot": 1-5, "user_id": "unique_id", "name": "nombre", "permissions": 3 }
+          
+          if (doc["message_info"].containsKey("slot") && doc["message_info"].containsKey("user_id")) {
+            int slot = doc["message_info"]["slot"].as<int>();
+            String userId = doc["message_info"]["user_id"].as<String>();
+            String userName = doc["message_info"].containsKey("name") ? 
+                              doc["message_info"]["name"].as<String>() : 
+                              String("Usuario") + String(slot);
+            uint8_t permissions = doc["message_info"].containsKey("permissions") ? 
+                                  doc["message_info"]["permissions"].as<int>() : 
+                                  (BLE_PERM_RELAY_CONTROL | BLE_PERM_MODE_CHANGE);
+            
+            if (slot >= 1 && slot <= BLE_MAX_USERS && userId.length() > 0 && userId.length() <= 64) {
+              Serial.printf("🔑 [MQTT] v4.1: Añadiendo usuario con derivación HKDF en slot %d\n", slot);
+              Serial.printf("🔑 [MQTT] user_id: %s, name: %s\n", userId.c_str(), userName.c_str());
+              
+              // Derivar clave usando HKDF
+              int idx = slot - 1;
+              if (deriveUserKey(userId.c_str(), bleAuthConfig.user_keys[idx])) {
+                bleAuthConfig.user_enabled[idx] = 1;
+                bleAuthConfig.user_permissions[idx] = permissions;
+                strncpy(bleAuthConfig.user_names[idx], userName.c_str(), 15);
+                bleAuthConfig.user_names[idx][15] = '\0';
+                saveBLEAuthConfig();
+                
+                // Respuesta (incluye info para que la APP calcule la misma clave)
+                DynamicJsonDocument respDoc(512);
+                respDoc["slot"] = slot;
+                respDoc["user_id"] = userId;
+                respDoc["name"] = userName;
+                respDoc["permissions"] = permissions;
+                respDoc["enabled"] = true;
+                respDoc["method"] = "hkdf_derived";
+                respDoc["salt"] = fixedSerialNumber;
+                respDoc["info_prefix"] = "user_key:";
+                String respStr;
+                serializeJson(respDoc, respStr);
+                publishResponse(0, receivedMessageId, "user added (derived): " + respStr);
+                
+                Serial.println("🔑 [MQTT] ✓ Usuario añadido con clave derivada HKDF");
+                
+                // Evento
+                String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+                String eventMsg = String("{") +
+                  "\"event\":\"USER_ADDED_DERIVED\"," +
+                  "\"source\":\"MQTT\"," +
+                  "\"device\":\"" + fixedSerialNumber + "\"," +
+                  "\"slot\":" + String(slot) + "," +
+                  "\"user_id\":\"" + userId + "\"," +
+                  "\"name\":\"" + userName + "\"," +
+                  "\"permissions\":" + String(permissions) + "," +
+                  "\"method\":\"hkdf\"," +
+                  "\"timestamp\":\"" + getTimestamp() + "\"" +
+                "}";
+                mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+              } else {
+                publishResponse(1, receivedMessageId, "HKDF derivation failed");
+              }
+            } else {
+              publishResponse(1, receivedMessageId, "invalid slot (1-5) or user_id (1-64 chars)");
+            }
+          } else {
+            publishResponse(1, receivedMessageId, "missing slot or user_id parameter");
+          }
+          
+        } else if (bleAction == "set_superadmin") {
+          // Establecer superadmin desde servidor (CUIDADO: sobrescribe el existente)
+          // Formato: { "action": "set_superadmin", "key": "hex64bytes" }
+          if (doc["message_info"].containsKey("key")) {
+            String keyHex = doc["message_info"]["key"].as<String>();
+            
+            if (keyHex.length() == BLE_KEY_SIZE * 2) {
+              Serial.println("🔵 [MQTT] Estableciendo superadmin BLE desde servidor");
+              
+              // Convertir hex a bytes
+              for (int i = 0; i < BLE_KEY_SIZE; i++) {
+                String byteStr = keyHex.substring(i * 2, i * 2 + 2);
+                bleAuthConfig.superadmin_key[i] = (uint8_t)strtol(byteStr.c_str(), NULL, 16);
+              }
+              bleAuthConfig.superadmin_registered = 1;
+              saveBLEAuthConfig();
+              
+              publishResponse(0, receivedMessageId, "superadmin key set from server");
+              
+              // Evento
+              String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+              String eventMsg = String("{") +
+                "\"event\":\"SUPERADMIN_SET\"," +
+                "\"source\":\"MQTT\"," +
+                "\"device\":\"" + fixedSerialNumber + "\"," +
+                "\"timestamp\":\"" + getTimestamp() + "\"" +
+              "}";
+              mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+            } else {
+              publishResponse(1, receivedMessageId, "invalid key length (must be 128 hex chars for 64 bytes)");
+            }
+          } else {
+            publishResponse(1, receivedMessageId, "missing key parameter");
+          }
+          
+        } else if (bleAction == "get_status") {
+          // Obtener estado BLE
+          Serial.println("🔵 [MQTT] Comando: Obtener estado BLE");
+          DynamicJsonDocument statusDoc(1024);
+          statusDoc["name"] = fixedSerialNumber;
+          statusDoc["connected"] = bleDeviceConnected;
+          statusDoc["authenticated"] = bleAuthenticated;
+          statusDoc["connected_user"] = bleConnectedUser;
+          statusDoc["superadmin_registered"] = (bool)bleAuthConfig.superadmin_registered;
+          
+          // Lista detallada de usuarios
+          JsonArray usersArray = statusDoc.createNestedArray("users");
+          int activeUsers = 0;
+          for (int i = 0; i < BLE_MAX_USERS; i++) {
+            if (bleAuthConfig.user_enabled[i]) {
+              activeUsers++;
+              JsonObject user = usersArray.createNestedObject();
+              user["slot"] = i + 1;
+              user["name"] = bleAuthConfig.user_names[i];
+              user["permissions"] = bleAuthConfig.user_permissions[i];
+              user["enabled"] = true;
+            }
+          }
+          statusDoc["active_users"] = activeUsers;
+          statusDoc["max_users"] = BLE_MAX_USERS;
+          
+          String statusStr;
+          serializeJson(statusDoc, statusStr);
+          publishResponse(0, receivedMessageId, statusStr);
+          
+        } else if (bleAction == "list_users") {
+          // Listar usuarios BLE detalladamente
+          Serial.println("🔵 [MQTT] Comando: Listar usuarios BLE");
+          DynamicJsonDocument usersDoc(1024);
+          
+          usersDoc["superadmin_registered"] = (bool)bleAuthConfig.superadmin_registered;
+          if (bleAuthConfig.superadmin_registered) {
+            // Mostrar primeros 8 bytes del hash de la clave (no la clave completa por seguridad)
+            char keyPreview[17];
+            sprintf(keyPreview, "%02X%02X%02X%02X%02X%02X%02X%02X",
+                    bleAuthConfig.superadmin_key[0], bleAuthConfig.superadmin_key[1],
+                    bleAuthConfig.superadmin_key[2], bleAuthConfig.superadmin_key[3],
+                    bleAuthConfig.superadmin_key[4], bleAuthConfig.superadmin_key[5],
+                    bleAuthConfig.superadmin_key[6], bleAuthConfig.superadmin_key[7]);
+            usersDoc["superadmin_key_preview"] = String(keyPreview) + "...";
+          }
+          
+          JsonArray usersArray = usersDoc.createNestedArray("users");
+          for (int i = 0; i < BLE_MAX_USERS; i++) {
+            JsonObject user = usersArray.createNestedObject();
+            user["slot"] = i + 1;
+            user["enabled"] = (bool)bleAuthConfig.user_enabled[i];
+            user["name"] = bleAuthConfig.user_names[i];
+            user["permissions"] = bleAuthConfig.user_permissions[i];
+            if (bleAuthConfig.user_enabled[i]) {
+              char keyPreview[17];
+              sprintf(keyPreview, "%02X%02X%02X%02X%02X%02X%02X%02X",
+                      bleAuthConfig.user_keys[i][0], bleAuthConfig.user_keys[i][1],
+                      bleAuthConfig.user_keys[i][2], bleAuthConfig.user_keys[i][3],
+                      bleAuthConfig.user_keys[i][4], bleAuthConfig.user_keys[i][5],
+                      bleAuthConfig.user_keys[i][6], bleAuthConfig.user_keys[i][7]);
+              user["key_preview"] = String(keyPreview) + "...";
+            }
+          }
+          
+          String usersStr;
+          serializeJson(usersDoc, usersStr);
+          publishResponse(0, receivedMessageId, usersStr);
+          
+        } else {
+          Serial.printf("❌ Acción BLE desconocida: %s\n", bleAction.c_str());
+          publishResponse(1, receivedMessageId, "unknown BLE action: " + bleAction);
+        }
+      }
+      break;
+#endif // ENABLE_BLE
   }
 }
 
@@ -1589,42 +2245,33 @@ void processKey(uint8_t key, int keyboardId) {
        Serial.printf("   Tamaño mensaje: %d bytes\n", message.length());
        Serial.printf("   Mensaje: %s\n", message.c_str());
        
-       // Intentar publicar varias veces si es necesario
-       bool published = false;
-       for (int retry = 0; retry < 3 && !published; retry++) {
-         published = mqttClient.publish(topic.c_str(), message.c_str(), false); // QoS 0, no retain
-         if (!published) {
-           Serial.printf("❌ Intento %d/3 de publicación falló\n", retry + 1);
-           delay(100);
-           mqttClient.loop(); // Procesar mensajes pendientes
-         } else {
-           Serial.printf("✅ Mensaje publicado correctamente en intento %d\n", retry + 1);
-         }
-       }
-       
-       if (!published) {
-         Serial.println("❌ ERROR: No se pudo publicar mensaje tras 3 intentos");
-         publishError(7, "Error publicando validación remota para " + type + " " + code);
-         
-         // Como último recurso, intentar validación local si existe el código
-         if (localFound) {
-           Serial.printf("🔄 [%s] Fallback LOCAL de emergencia - Relé %d\n", keyboardName.c_str(), relayToActivate);
-           controlReleWithDuration(releDuration, relayToActivate);
-           resetFailedAttempts();
-           strncpy(lastType, type.c_str(), sizeof(lastType) - 1);
-           lastType[sizeof(lastType) - 1] = '\0';
-           strncpy(lastCode, code.c_str(), sizeof(lastCode) - 1);
-           lastCode[sizeof(lastCode) - 1] = '\0';
-           strncpy(lastTime, getTimeString().c_str(), sizeof(lastTime) - 1);
-           lastTime[sizeof(lastTime) - 1] = '\0';
-           publishAccessEvent(code, type, keyboardId, true, "LOCAL_EMERGENCY");
-         } else {
-           // Marcar como intento fallido
-           failedAttempts++;
-           lastFailedAttempt = millis();
-           publishFailedAccess(code, type, keyboardId, "MQTT_PUBLISH_FAILED");
-         }
-       }
+      // Intentar publicar UNA vez (sin delays bloqueantes)
+      bool published = mqttClient.publish(topic.c_str(), message.c_str(), false);
+      
+      if (published) {
+        Serial.println("✅ Mensaje publicado correctamente");
+      } else {
+        Serial.println("❌ ERROR: No se pudo publicar mensaje");
+        
+        // Fallback LOCAL inmediato si el código existe
+        if (localFound) {
+          Serial.printf("🔄 [%s] Fallback LOCAL de emergencia - Relé %d\n", keyboardName.c_str(), relayToActivate);
+          controlReleWithDuration(releDuration, relayToActivate);
+          resetFailedAttempts();
+          strncpy(lastType, type.c_str(), sizeof(lastType) - 1);
+          lastType[sizeof(lastType) - 1] = '\0';
+          strncpy(lastCode, code.c_str(), sizeof(lastCode) - 1);
+          lastCode[sizeof(lastCode) - 1] = '\0';
+          strncpy(lastTime, getTimeString().c_str(), sizeof(lastTime) - 1);
+          lastTime[sizeof(lastTime) - 1] = '\0';
+          publishAccessEvent(code, type, keyboardId, true, "LOCAL_EMERGENCY");
+        } else {
+          // Código no existe localmente ni remotamente
+          failedAttempts++;
+          lastFailedAttempt = millis();
+          publishFailedAccess(code, type, keyboardId, "MQTT_PUBLISH_FAILED");
+        }
+      }
        
       } else if (storedCodes != nullptr && !storedCodes->localValidationFirst && localFound) {
        // Fallback local cuando MQTT no está conectado
@@ -1851,22 +2498,29 @@ void updateOTAConfiguration(const JsonDocument& doc) {
     maxFailedAttempts = config.maxFailedAttempts;
      strncpy(admin_password, config.webPassword, sizeof(admin_password));
      Serial.println("💾 Configuración cargada desde EEPROM");
-   } else {
-     // Primera ejecución - generar serial fijo
-     fixedSerialNumber = generateFixedSerial();
-    strncpy(deviceName, fixedSerialNumber.c_str(), sizeof(deviceName) - 1);
-    deviceName[sizeof(deviceName) - 1] = '\0'; // Nombre inicial igual al serial
-    useDhcp = true;
-    releDuration = 2.0;
-    localAccessBlocked = false;
-    keyboardReadingEnabled = true;
-    failedAttempts = 0;
-    blockDuration = 60000;
-    maxFailedAttempts = 3;
-     strncpy(admin_password, "admin", sizeof(admin_password));
-     saveConfiguration();
-     Serial.println("🔧 Configuración por defecto aplicada");
-   }
+  } else {
+    // Primera ejecución - generar serial fijo
+    fixedSerialNumber = generateFixedSerial();
+   strncpy(deviceName, fixedSerialNumber.c_str(), sizeof(deviceName) - 1);
+   deviceName[sizeof(deviceName) - 1] = '\0'; // Nombre inicial igual al serial
+   useDhcp = true;
+   releDuration = 2.0;
+   localAccessBlocked = false;
+   keyboardReadingEnabled = true;
+   failedAttempts = 0;
+   blockDuration = 60000;
+   maxFailedAttempts = 3;
+    strncpy(admin_password, "admin", sizeof(admin_password));
+    
+    // Modo torno DESHABILITADO por defecto
+    config.turnstile.enabled = false;
+    config.turnstile.keyboard1_relay = 1;
+    config.turnstile.keyboard2_relay = 2;
+    memset(config.turnstile.reserved, 0, sizeof(config.turnstile.reserved));
+    
+    saveConfiguration();
+    Serial.println("🔧 Configuración por defecto aplicada (Modo Normal)");
+  }
    
   Serial.printf("🆔 Serial fijo: %s\n", fixedSerialNumber.c_str());
   Serial.printf("🏷️ Nombre dispositivo: %s\n", deviceName);
@@ -2396,53 +3050,61 @@ void processRemoteValidationResponse(const JsonDocument& doc) {
 
 // Cargar configuración de entradas digitales desde EEPROM
 void loadDigitalInputConfig() {
+  Serial.println("🔄 Cargando configuración DI desde EEPROM...");
+  
   EEPROM.get(EEPROM_DIGITAL_INPUT_OFFSET, digitalInputConfig);
   
+  // Verificar marcador de validación
   if (digitalInputConfig.validMarker != DIGITAL_INPUT_CONFIG_MARKER) {
-    Serial.println("⚙️ [DI] Configuración de entradas digitales no válida, usando valores por defecto");
-    
-    // Valores por defecto
-    digitalInputConfig.di1_enabled = false;
-    digitalInputConfig.di1_relay = 1;
-    digitalInputConfig.di1_duration = 2.0;
-    digitalInputConfig.di1_inverse = false;  // Modo normal por defecto
-    
-    digitalInputConfig.di2_enabled = false;
-    digitalInputConfig.di2_relay = 2;
-    digitalInputConfig.di2_duration = 2.0;
-    digitalInputConfig.di2_inverse = false;  // Modo normal por defecto
-    
-    memset(digitalInputConfig.reserved, 0, sizeof(digitalInputConfig.reserved));
+    Serial.println("🔧 Inicializando configuración DI por primera vez...");
     digitalInputConfig.validMarker = DIGITAL_INPUT_CONFIG_MARKER;
+    digitalInputConfig.di1_enabled = 0;
+    digitalInputConfig.di1_relay = 1;
+    digitalInputConfig.di1_inverse = 0;
+    digitalInputConfig.di1_duration_ms = 2000;
+    digitalInputConfig.di2_enabled = 0;
+    digitalInputConfig.di2_relay = 2;
+    digitalInputConfig.di2_inverse = 0;
+    digitalInputConfig.di2_duration_ms = 2000;
+    digitalInputConfig.checksum = 0;
     
     saveDigitalInputConfig();
+    Serial.println("✅ Configuración DI inicializada correctamente");
+  } else {
+    Serial.printf("💾 Configuración DI cargada: DI1=%s, DI2=%s\n",
+                  digitalInputConfig.di1_enabled ? "ON" : "OFF",
+                  digitalInputConfig.di2_enabled ? "ON" : "OFF");
   }
-  
-  Serial.println("📥 [DI] Configuración de entradas digitales cargada:");
-  Serial.printf("   DI1 (GPIO%d): %s, Relé %d, %.1fs, Modo %s\n", 
-                DI1_PIN,
-                digitalInputConfig.di1_enabled ? "HABILITADA" : "DESHABILITADA",
-                digitalInputConfig.di1_relay,
-                digitalInputConfig.di1_duration,
-                digitalInputConfig.di1_inverse ? "INVERSO" : "NORMAL");
-  Serial.printf("   DI2 (GPIO%d): %s, Relé %d, %.1fs, Modo %s\n", 
-                DI2_PIN,
-                digitalInputConfig.di2_enabled ? "HABILITADA" : "DESHABILITADA",
-                digitalInputConfig.di2_relay,
-                digitalInputConfig.di2_duration,
-                digitalInputConfig.di2_inverse ? "INVERSO" : "NORMAL");
 }
 
 // Guardar configuración de entradas digitales en EEPROM
 void saveDigitalInputConfig() {
   digitalInputConfig.validMarker = DIGITAL_INPUT_CONFIG_MARKER;
+  
+  // Guardar en EEPROM (mismo estilo que saveStoredCodes original)
   EEPROM.put(EEPROM_DIGITAL_INPUT_OFFSET, digitalInputConfig);
-  EEPROM.commit();
-  Serial.println("💾 [DI] Configuración de entradas digitales guardada en EEPROM");
+  
+  if (!EEPROM.commit()) {
+    Serial.println("❌ [DI] Error: Fallo al hacer commit en EEPROM");
+    return;
+  }
+  
+  // Verificar integridad después de guardar
+  DigitalInputConfig verify;
+  EEPROM.get(EEPROM_DIGITAL_INPUT_OFFSET, verify);
+  
+  if (verify.validMarker != DIGITAL_INPUT_CONFIG_MARKER) {
+    Serial.println("❌ [DI] Error: Verificación de integridad falló");
+    return;
+  }
+  
+  Serial.printf("💾 [DI] Configuración guardada: DI1=%s, DI2=%s\n",
+                digitalInputConfig.di1_enabled ? "ON" : "OFF",
+                digitalInputConfig.di2_enabled ? "ON" : "OFF");
 }
 
 // Procesar entrada digital con modo Normal o Inverso
-void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled, uint8_t relay, float duration, bool inverse) {
+void processDigitalInput(int inputNumber, DigitalInputState &state, uint8_t enabled, uint8_t relay, uint32_t duration_ms, uint8_t inverse) {
   if (!enabled) {
     // Si está deshabilitada y el relé estaba activo por esta entrada en modo inverso, desactivarlo
     if (state.relayActivated && inverse) {
@@ -2458,15 +3120,17 @@ void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled
   int pin = (inputNumber == 1) ? DI1_PIN : DI2_PIN;
   state.currentState = digitalRead(pin);
   
+  float duration_sec = duration_ms / 1000.0f;
+  
   // MODO NORMAL: HIGH activa el relé por duración configurada
   if (!inverse) {
     // Detectar flanco de subida (LOW → HIGH)
     if (!state.lastState && state.currentState && !state.waitingForLow) {
-      Serial.printf("📍 [DI%d] Modo NORMAL - HIGH detectado → Activando Relé %d por %.1fs\n", 
-                    inputNumber, relay, duration);
+      Serial.printf("📍 [DI%d] Modo NORMAL - HIGH detectado → Activando Relé %d por %dms (%.1fs)\n", 
+                    inputNumber, relay, duration_ms, duration_sec);
       
-      // Activar relé con la duración especificada
-      controlReleWithDuration(duration, relay);
+      // Activar relé con la duración especificada (en segundos)
+      controlReleWithDuration(duration_sec, relay);
       
       // Actualizar estado
       state.relayActivated = true;
@@ -2474,7 +3138,7 @@ void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled
       state.waitingForLow = true;
       
       // Publicar evento MQTT
-      publishDigitalInputEvent(inputNumber, relay, duration);
+      publishDigitalInputEvent(inputNumber, relay, duration_ms);
     }
     
     // Detectar flanco de bajada (HIGH → LOW)
@@ -2498,7 +3162,7 @@ void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled
         
         // Publicar evento MQTT solo en cambios de estado
         if (state.lastState != state.currentState) {
-          publishDigitalInputEvent(inputNumber, relay, -1);  // -1 indica modo permanente
+          publishDigitalInputEvent(inputNumber, relay, 0xFFFFFFFF);  // Indica modo permanente
         }
       }
     }
@@ -2524,7 +3188,7 @@ void processDigitalInput(int inputNumber, DigitalInputState &state, bool enabled
 }
 
 // Publicar evento de entrada digital vía MQTT
-void publishDigitalInputEvent(int inputNumber, int relay, float duration) {
+void publishDigitalInputEvent(int inputNumber, int relay, uint32_t duration_ms) {
   if (!mqttClient.connected()) return;
   
   DynamicJsonDocument doc(256);
@@ -2533,7 +3197,8 @@ void publishDigitalInputEvent(int inputNumber, int relay, float duration) {
   doc["input"] = inputNumber;
   doc["gpio"] = (inputNumber == 1) ? DI1_PIN : DI2_PIN;
   doc["relay"] = relay;
-  doc["duration"] = duration;
+  doc["duration_ms"] = duration_ms;
+  doc["duration"] = duration_ms / 1000.0f;  // También en segundos para compatibilidad
   doc["message_id"] = String(messageId++);
   
   String output;
@@ -4153,11 +4818,11 @@ void handleDigitalInputsConfig() {
   DynamicJsonDocument doc(256);
   doc["di1_enabled"] = digitalInputConfig.di1_enabled;
   doc["di1_relay"] = digitalInputConfig.di1_relay;
-  doc["di1_duration"] = digitalInputConfig.di1_duration;
+  doc["di1_duration"] = digitalInputConfig.di1_duration_ms / 1000.0f;  // Convertir a segundos
   doc["di1_inverse"] = digitalInputConfig.di1_inverse;
   doc["di2_enabled"] = digitalInputConfig.di2_enabled;
   doc["di2_relay"] = digitalInputConfig.di2_relay;
-  doc["di2_duration"] = digitalInputConfig.di2_duration;
+  doc["di2_duration"] = digitalInputConfig.di2_duration_ms / 1000.0f;  // Convertir a segundos
   doc["di2_inverse"] = digitalInputConfig.di2_inverse;
   
   String output;
@@ -4172,45 +4837,48 @@ void handleSaveDigitalInput() {
   }
   
   int inputNumber = server.arg("input").toInt();
+  Serial.printf("📝 [DI] Guardando configuración para entrada %d\n", inputNumber);
   
   if (inputNumber == 1) {
-    digitalInputConfig.di1_enabled = server.hasArg("di1_enabled");
-    digitalInputConfig.di1_relay = server.arg("di1_relay").toInt();
-    digitalInputConfig.di1_duration = server.arg("di1_duration").toFloat();
-    digitalInputConfig.di1_inverse = (server.arg("di1_inverse").toInt() == 1);
+    digitalInputConfig.di1_enabled = server.hasArg("di1_enabled") ? 1 : 0;
+    digitalInputConfig.di1_relay = (uint8_t)server.arg("di1_relay").toInt();
+    float di1_sec = server.arg("di1_duration").toFloat();
+    digitalInputConfig.di1_inverse = (server.arg("di1_inverse").toInt() == 1) ? 1 : 0;
     
     // Validar valores
     if (digitalInputConfig.di1_relay < 1 || digitalInputConfig.di1_relay > 2) {
       digitalInputConfig.di1_relay = 1;
     }
-    if (digitalInputConfig.di1_duration < 0.5 || digitalInputConfig.di1_duration > 60) {
-      digitalInputConfig.di1_duration = 2.0;
+    if (di1_sec < 0.5 || di1_sec > 60) {
+      di1_sec = 2.0f;
     }
+    digitalInputConfig.di1_duration_ms = (uint32_t)(di1_sec * 1000);
     
-    Serial.printf("⚙️ [DI1] Configuración actualizada: %s, Relé %d, %.1fs, Modo %s\n",
+    Serial.printf("⚙️ [DI1] Configuración actualizada: %s, Relé %d, %dms (%.1fs), Modo %s\n",
                   digitalInputConfig.di1_enabled ? "HABILITADA" : "DESHABILITADA",
                   digitalInputConfig.di1_relay,
-                  digitalInputConfig.di1_duration,
+                  digitalInputConfig.di1_duration_ms, di1_sec,
                   digitalInputConfig.di1_inverse ? "INVERSO" : "NORMAL");
     
   } else if (inputNumber == 2) {
-    digitalInputConfig.di2_enabled = server.hasArg("di2_enabled");
-    digitalInputConfig.di2_relay = server.arg("di2_relay").toInt();
-    digitalInputConfig.di2_duration = server.arg("di2_duration").toFloat();
-    digitalInputConfig.di2_inverse = (server.arg("di2_inverse").toInt() == 1);
+    digitalInputConfig.di2_enabled = server.hasArg("di2_enabled") ? 1 : 0;
+    digitalInputConfig.di2_relay = (uint8_t)server.arg("di2_relay").toInt();
+    float di2_sec = server.arg("di2_duration").toFloat();
+    digitalInputConfig.di2_inverse = (server.arg("di2_inverse").toInt() == 1) ? 1 : 0;
     
     // Validar valores
     if (digitalInputConfig.di2_relay < 1 || digitalInputConfig.di2_relay > 2) {
       digitalInputConfig.di2_relay = 2;
     }
-    if (digitalInputConfig.di2_duration < 0.5 || digitalInputConfig.di2_duration > 60) {
-      digitalInputConfig.di2_duration = 2.0;
+    if (di2_sec < 0.5 || di2_sec > 60) {
+      di2_sec = 2.0f;
     }
+    digitalInputConfig.di2_duration_ms = (uint32_t)(di2_sec * 1000);
     
-    Serial.printf("⚙️ [DI2] Configuración actualizada: %s, Relé %d, %.1fs, Modo %s\n",
+    Serial.printf("⚙️ [DI2] Configuración actualizada: %s, Relé %d, %dms (%.1fs), Modo %s\n",
                   digitalInputConfig.di2_enabled ? "HABILITADA" : "DESHABILITADA",
                   digitalInputConfig.di2_relay,
-                  digitalInputConfig.di2_duration,
+                  digitalInputConfig.di2_duration_ms, di2_sec,
                   digitalInputConfig.di2_inverse ? "INVERSO" : "NORMAL");
   }
   
@@ -4225,7 +4893,6 @@ void handleSaveDigitalInput() {
 void loadStoredCodes() {
   Serial.println("🔄 Cargando códigos desde EEPROM...");
   
-  // Inicializar puntero si es necesario
   if (storedCodes == nullptr) {
     initializeStoredCodes();
   }
@@ -4241,53 +4908,38 @@ void loadStoredCodes() {
   if (storedCodes->validMarker != 0xCAFEBABE) {
     Serial.println("🔧 Inicializando códigos por primera vez...");
     storedCodes->validMarker = 0xCAFEBABE;
-    storedCodes->version = 2; // Formato nuevo
+    storedCodes->version = 2;
     storedCodes->localValidationFirst = true;
     storedCodes->count = 0;
-    
-    // Limpiar array de códigos
     memset(storedCodes->codes, 0, sizeof(storedCodes->codes));
-    
     saveStoredCodes();
     Serial.println("✅ Estructura de códigos inicializada correctamente");
   } else {
-    // Verificar integridad de los datos cargados
     if (storedCodes->count > MAX_CODES) {
-      Serial.printf("⚠️ Advertencia: Contador de códigos inválido (%d > %d). Corrigiendo...\n", 
-                    storedCodes->count, MAX_CODES);
+      Serial.printf("⚠️ Contador inválido (%d > %d). Corrigiendo...\n", storedCodes->count, MAX_CODES);
       storedCodes->count = 0;
       saveStoredCodes();
     }
-    
-    // Migrar códigos si es necesario
-    if (storedCodes->version == 1) {
-      Serial.println("🔄 Migrando códigos al formato nuevo...");
-      for (int i = 0; i < storedCodes->count; i++) {
-        storedCodes->codes[i].keyboard_id = 0; // Ambos teclados
-        storedCodes->codes[i].reserved = 0;
-      }
-      storedCodes->version = 2;
-      saveStoredCodes();
-      Serial.printf("✅ Migrados %d códigos al formato nuevo\n", storedCodes->count);
-    }
-    
-    Serial.printf("💾 Códigos cargados exitosamente: %d códigos (versión %d)\n", 
+    Serial.printf("💾 Códigos cargados: %d códigos (versión %d)\n", 
                   storedCodes->count, storedCodes->version);
-    Serial.printf("   Modo validación: %s\n", 
-                  storedCodes->localValidationFirst ? "Local primero" : "Remoto primero");
   }
 }
  
 void saveStoredCodes() {
+  Serial.println("💾 saveStoredCodes() - INICIO");
+  
   if (storedCodes == nullptr) {
     Serial.println("❌ Error: storedCodes no inicializado");
     return;
   }
   
-  // Verificar integridad antes de guardar
+  Serial.printf("💾 Datos a guardar: validMarker=0x%08X, count=%d, version=%d\n",
+                storedCodes->validMarker, storedCodes->count, storedCodes->version);
+  
   if (storedCodes->validMarker != 0xCAFEBABE) {
     Serial.println("❌ Error: Marcador de validación inválido antes de guardar");
-    return;
+    Serial.println("💾 Intentando corregir marcador...");
+    storedCodes->validMarker = 0xCAFEBABE;
   }
   
   if (storedCodes->count > MAX_CODES) {
@@ -4295,35 +4947,87 @@ void saveStoredCodes() {
     return;
   }
   
+  // Mostrar qué códigos se van a guardar
+  Serial.printf("💾 Guardando %d códigos:\n", storedCodes->count);
+  for (int i = 0; i < storedCodes->count && i < 5; i++) {
+    Serial.printf("   [%d] %s '%s' kb=%d relay=%d\n", i,
+                  storedCodes->codes[i].type, storedCodes->codes[i].value,
+                  storedCodes->codes[i].keyboard_id, storedCodes->codes[i].relay);
+  }
+  if (storedCodes->count > 5) {
+    Serial.printf("   ... y %d códigos más\n", storedCodes->count - 5);
+  }
+  
+  // Calcular tamaño a guardar
+  size_t dataSize = sizeof(StoredCodes);
+  Serial.printf("💾 Tamaño de estructura: %d bytes, EEPROM offset: %d\n", 
+                dataSize, EEPROM_CODES_OFFSET);
+  
   // Guardar en EEPROM
   EEPROM.put(EEPROM_CODES_OFFSET, *storedCodes);
-   
-   // Verificar que el commit sea exitoso
-   if (!EEPROM.commit()) {
-     Serial.println("❌ Error: Fallo al hacer commit en EEPROM");
-     return;
-   }
-   
-   // Verificar integridad después de guardar
-   StoredCodes testCodes;
-   EEPROM.get(EEPROM_CODES_OFFSET, testCodes);
-   
-   if (testCodes.validMarker != 0xCAFEBABE || testCodes.count != storedCodes->count) {
-     Serial.println("❌ Error: Verificación de integridad falló después de guardar");
-     return;
-   }
-   
-   Serial.printf("💾 Códigos guardados correctamente en EEPROM: %d códigos (versión %d)\n", 
-                 storedCodes->count, storedCodes->version);
- }
+  Serial.println("💾 EEPROM.put() completado, ejecutando commit()...");
+  
+  bool commitResult = EEPROM.commit();
+  if (!commitResult) {
+    Serial.println("❌ Error CRÍTICO: EEPROM.commit() retornó FALSE");
+    return;
+  }
+  Serial.println("💾 EEPROM.commit() exitoso");
+  
+  // Verificar integridad después de guardar
+  StoredCodes testCodes;
+  EEPROM.get(EEPROM_CODES_OFFSET, testCodes);
+  
+  Serial.printf("💾 Verificación: validMarker=0x%08X (esperado 0xCAFEBABE), count=%d (esperado %d)\n",
+                testCodes.validMarker, testCodes.count, storedCodes->count);
+  
+  if (testCodes.validMarker != 0xCAFEBABE) {
+    Serial.println("❌ Error: Marcador de validación no coincide después de guardar");
+    return;
+  }
+  
+  if (testCodes.count != storedCodes->count) {
+    Serial.printf("❌ Error: Contador no coincide después de guardar (%d != %d)\n", 
+                  testCodes.count, storedCodes->count);
+    return;
+  }
+  
+  // Verificar primer y último código
+  if (storedCodes->count > 0) {
+    int lastIdx = storedCodes->count - 1;
+    if (strcmp(testCodes.codes[lastIdx].value, storedCodes->codes[lastIdx].value) != 0) {
+      Serial.printf("❌ Error: Último código no coincide! '%s' != '%s'\n",
+                    testCodes.codes[lastIdx].value, storedCodes->codes[lastIdx].value);
+      return;
+    }
+    Serial.printf("💾 ✓ Último código verificado: '%s'\n", testCodes.codes[lastIdx].value);
+  }
+  
+  Serial.printf("💾 ✅ Códigos guardados correctamente en EEPROM: %d códigos (versión %d)\n", 
+                storedCodes->count, storedCodes->version);
+}
  
 bool addCode(const char* type, const char* value, int keyboardId, int relay) {
+  Serial.println("═══════════════════════════════════════════");
+  Serial.println("📝 addCode() - INICIO");
+  Serial.printf("📝 Parámetros: type='%s', value='%s', keyboard=%d, relay=%d\n", 
+                type, value, keyboardId, relay);
+  
+  // Verificar puntero
+  if (storedCodes == nullptr) {
+    Serial.println("❌ Error CRÍTICO: storedCodes es nullptr!");
+    return false;
+  }
+  
+  Serial.printf("📝 Estado actual: count=%d, validMarker=0x%08X, version=%d\n",
+                storedCodes->count, storedCodes->validMarker, storedCodes->version);
+  
   if (storedCodes->count >= MAX_CODES) {
     Serial.printf("❌ Error: Máximo de códigos alcanzado (%d/%d)\n", storedCodes->count, MAX_CODES);
     return false;
   }
 
-  // Validar parámetros - CORREGIDO: Permitir keyboardId = 0 (ambos teclados)
+  // Validar parámetros
   if (keyboardId < 0 || keyboardId > 2) {
     Serial.printf("❌ Error: keyboardId inválido (%d). Debe ser 0 (ambos), 1 o 2\n", keyboardId);
     return false;
@@ -4332,46 +5036,79 @@ bool addCode(const char* type, const char* value, int keyboardId, int relay) {
     Serial.printf("❌ Error: relay inválido (%d). Debe ser 1 o 2\n", relay);
     return false;
   }
+  
+  // Validar value
+  if (value == nullptr || strlen(value) == 0) {
+    Serial.println("❌ Error: value es NULL o vacío");
+    return false;
+  }
+  if (strlen(value) > 16) {
+    Serial.printf("❌ Error: value demasiado largo (%d > 16)\n", strlen(value));
+    return false;
+  }
 
   // Verificar duplicados exactos
+  Serial.printf("📝 Buscando duplicados entre %d códigos existentes...\n", storedCodes->count);
   for (int i = 0; i < storedCodes->count; i++) {
     if (strcmp(storedCodes->codes[i].type, type) == 0 &&
         strcmp(storedCodes->codes[i].value, value) == 0 &&
         storedCodes->codes[i].keyboard_id == keyboardId) {
-      return false; // Duplicado exacto
+      Serial.printf("⚠️ Duplicado encontrado en posición %d\n", i);
+      return false;
     }
   }
+  Serial.println("📝 No hay duplicados, procediendo a guardar...");
 
+  // Guardar en el slot correspondiente
+  int idx = storedCodes->count;
+  Serial.printf("📝 Guardando en slot %d...\n", idx);
+  
   // Copiar datos del código
-  strncpy(storedCodes->codes[storedCodes->count].type, type, sizeof(storedCodes->codes[storedCodes->count].type) - 1);
-  storedCodes->codes[storedCodes->count].type[sizeof(storedCodes->codes[storedCodes->count].type) - 1] = '\0';
+  strncpy(storedCodes->codes[idx].type, type, sizeof(storedCodes->codes[idx].type) - 1);
+  storedCodes->codes[idx].type[sizeof(storedCodes->codes[idx].type) - 1] = '\0';
 
-  strncpy(storedCodes->codes[storedCodes->count].value, value, sizeof(storedCodes->codes[storedCodes->count].value) - 1);
-  storedCodes->codes[storedCodes->count].value[sizeof(storedCodes->codes[storedCodes->count].value) - 1] = '\0';
+  strncpy(storedCodes->codes[idx].value, value, sizeof(storedCodes->codes[idx].value) - 1);
+  storedCodes->codes[idx].value[sizeof(storedCodes->codes[idx].value) - 1] = '\0';
 
-  storedCodes->codes[storedCodes->count].keyboard_id = keyboardId;
-  storedCodes->codes[storedCodes->count].relay = relay;
-  storedCodes->codes[storedCodes->count].reserved = 0;
+  storedCodes->codes[idx].keyboard_id = keyboardId;
+  storedCodes->codes[idx].relay = relay;
+  storedCodes->codes[idx].reserved = 0;
   storedCodes->count++;
-  storedCodes->version = 2; // Asegurar versión nueva
+  storedCodes->version = 2;
 
-  // Log del código añadido
-  String keyboardName = (keyboardId == 0) ? "Ambos teclados" : 
-                       (keyboardId == 1) ? "Teclado 1" : "Teclado 2";
-  Serial.printf("📝 Añadiendo código: %s '%s' -> %s, Relé %d (Total: %d)\n", 
-                type, value, keyboardName.c_str(), relay, storedCodes->count);
+  Serial.printf("📝 Datos en memoria: type='%s', value='%s', kb=%d, relay=%d\n",
+                storedCodes->codes[idx].type, storedCodes->codes[idx].value,
+                storedCodes->codes[idx].keyboard_id, storedCodes->codes[idx].relay);
+  Serial.printf("📝 Nuevo count=%d, llamando saveStoredCodes()...\n", storedCodes->count);
 
-  // Guardar en EEPROM con verificación
+  // Guardar en EEPROM
   saveStoredCodes();
   
-  // Verificar que se guardó correctamente
-  if (storedCodes->validMarker == 0xCAFEBABE && storedCodes->count > 0) {
-    Serial.printf("✅ Código guardado exitosamente en EEPROM\n");
-    return true;
+  // Verificar que se guardó leyendo de nuevo
+  StoredCodes verification;
+  EEPROM.get(EEPROM_CODES_OFFSET, verification);
+  
+  Serial.printf("📝 Verificación post-guardado: count=%d, validMarker=0x%08X\n",
+                verification.count, verification.validMarker);
+  
+  if (verification.validMarker == 0xCAFEBABE && verification.count == storedCodes->count) {
+    // Verificar que el código está en la posición correcta
+    if (strcmp(verification.codes[idx].value, value) == 0) {
+      Serial.println("✅ ÉXITO: Código guardado y verificado en EEPROM");
+      Serial.println("═══════════════════════════════════════════");
+      return true;
+    } else {
+      Serial.printf("❌ Error: Código en EEPROM no coincide! Esperado='%s', Leído='%s'\n",
+                    value, verification.codes[idx].value);
+    }
   } else {
-    Serial.println("❌ Error: Fallo al verificar el guardado del código");
-    return false;
+    Serial.println("❌ Error: Verificación de EEPROM falló");
+    Serial.printf("❌ validMarker: esperado=0xCAFEBABE, leído=0x%08X\n", verification.validMarker);
+    Serial.printf("❌ count: esperado=%d, leído=%d\n", storedCodes->count, verification.count);
   }
+  
+  Serial.println("═══════════════════════════════════════════");
+  return false;
 }
 
 // Sobrecarga para compatibilidad (keyboardId = 0)
@@ -4919,7 +5656,401 @@ void handleOTAStatus() {
   
   server.send(200, "application/json", response);
 }
- 
+
+// =================== FUNCIONES BLE (v4.0) ===================
+#ifdef ENABLE_BLE
+
+// Página principal de configuración BLE
+void handleBLEPage() {
+  if (!server.authenticate(admin_user, admin_password)) {
+    return server.requestAuthentication();
+  }
+  
+  String html = R"=====(
+<!DOCTYPE HTML><html lang='es'>
+<head>
+  <meta charset='UTF-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <title>Configuración BLE - SWATID</title>
+  <link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css'>
+  <style>
+    body{font-family:Arial,sans-serif;margin:0;padding:0;background:#f4f4f4;}
+    header{background:#35424a;color:#fff;padding:20px 0;text-align:center;}
+    main{padding:20px;}
+    .container{max-width:800px;margin:auto;background:#fff;padding:20px;border-radius:8px;box-shadow:0 0 10px rgba(0,0,0,0.1);}
+    h1,h2,h3{color:#333;}
+    .ble-status{padding:15px;margin:15px 0;border-radius:5px;border-left:4px solid #007bff;background:#e7f3ff;}
+    .ble-enabled{border-left-color:#28a745;background:#e8f5e8;}
+    .ble-warning{border-left-color:#ffc107;background:#fff3cd;}
+    .user-card{background:#f8f9fa;padding:15px;margin:10px 0;border-radius:5px;border:1px solid #dee2e6;}
+    .user-card.superadmin{border-color:#dc3545;background:#fff5f5;}
+    .user-card.active{border-color:#28a745;background:#f0fff0;}
+    .user-card.inactive{opacity:0.6;}
+    .btn{display:inline-block;padding:10px 20px;margin:5px;border:none;border-radius:5px;cursor:pointer;font-size:14px;text-decoration:none;}
+    .btn-danger{background:#dc3545;color:white;}
+    .btn-warning{background:#ffc107;color:#333;}
+    .btn-primary{background:#007bff;color:white;}
+    .btn-secondary{background:#6c757d;color:white;}
+    .btn:hover{opacity:0.8;}
+    table{width:100%;border-collapse:collapse;margin:15px 0;}
+    th,td{padding:12px;text-align:left;border-bottom:1px solid #ddd;}
+    th{background:#f8f9fa;}
+    .badge{padding:3px 8px;border-radius:3px;font-size:12px;}
+    .badge-success{background:#28a745;color:white;}
+    .badge-danger{background:#dc3545;color:white;}
+    .badge-warning{background:#ffc107;color:#333;}
+    .permissions{font-size:12px;color:#666;}
+    .confirm-box{background:#fff3cd;padding:15px;border-radius:5px;margin:15px 0;display:none;}
+    nav{background:#2c3e50;padding:10px;}
+    nav a{color:white;margin:0 10px;text-decoration:none;}
+    nav a:hover{text-decoration:underline;}
+  </style>
+</head>
+<body>
+  <header>
+    <h1><i class='fas fa-bluetooth-b'></i> Configuración BLE</h1>
+    <p>Gestión de vinculaciones Bluetooth</p>
+  </header>
+  <nav>
+    <a href='/'><i class='fas fa-home'></i> Inicio</a>
+    <a href='/codes'><i class='fas fa-key'></i> Códigos</a>
+    <a href='/digital_inputs'><i class='fas fa-sign-in-alt'></i> Entradas</a>
+    <a href='/ota'><i class='fas fa-cloud-download-alt'></i> OTA</a>
+  </nav>
+  <main>
+    <div class='container'>
+      <h2><i class='fas fa-info-circle'></i> Estado BLE</h2>
+      <div id='ble-status' class='ble-status'>
+        <p><strong>Nombre del dispositivo:</strong> <span id='ble-name'>)=====";
+  html += fixedSerialNumber;
+  html += R"=====(</span></p>
+        <p><strong>Estado:</strong> <span id='ble-state'>Activo</span></p>
+        <p><strong>Conexión actual:</strong> <span id='ble-connected'>)=====";
+  html += bleDeviceConnected ? "Conectado" : "Sin conexión";
+  html += R"=====(</span></p>
+      </div>
+      
+      <h2><i class='fas fa-user-shield'></i> Superadmin</h2>
+      <div class='user-card superadmin'>
+        <h3><i class='fas fa-crown'></i> Superadministrador</h3>
+        <p><strong>Estado:</strong> )=====";
+  html += bleAuthConfig.superadmin_registered ? 
+    "<span class='badge badge-success'>Registrado</span>" : 
+    "<span class='badge badge-warning'>No registrado</span>";
+  html += "</p>";
+  
+  // Mostrar preview de la clave si hay superadmin
+  if (bleAuthConfig.superadmin_registered) {
+    char keyPreview[32];
+    sprintf(keyPreview, "%02X%02X%02X%02X...", 
+            bleAuthConfig.superadmin_key[0], bleAuthConfig.superadmin_key[1],
+            bleAuthConfig.superadmin_key[2], bleAuthConfig.superadmin_key[3]);
+    html += "<p><strong>Key preview:</strong> <code>" + String(keyPreview) + "</code></p>";
+  }
+  
+  html += R"=====(
+        <p class='permissions'><i class='fas fa-key'></i> Permisos: Todos (0xFF)</p>
+        <p><small>El superadmin se registra automáticamente cuando el primer dispositivo se vincula con una clave de 64 bytes.</small></p>
+        <button class='btn btn-danger' onclick='confirmClearSuperadmin()'><i class='fas fa-trash'></i> Eliminar Superadmin</button>
+      </div>
+      
+      <h2><i class='fas fa-users'></i> Usuarios Vinculados</h2>
+      <table>
+        <tr>
+          <th>#</th>
+          <th>Nombre</th>
+          <th>Estado</th>
+          <th>Permisos</th>
+          <th>Acciones</th>
+        </tr>)=====";
+  
+  for (int i = 0; i < BLE_MAX_USERS; i++) {
+    html += "<tr class='user-card ";
+    html += bleAuthConfig.user_enabled[i] ? "active" : "inactive";
+    html += "'><td>" + String(i + 1) + "</td>";
+    
+    // Nombre del usuario
+    String userName = (bleAuthConfig.user_names[i][0] != '\0') ? String(bleAuthConfig.user_names[i]) : "-";
+    html += "<td>" + userName + "</td>";
+    
+    // Estado
+    html += "<td>";
+    html += bleAuthConfig.user_enabled[i] ? 
+      "<span class='badge badge-success'>Activo</span>" : 
+      "<span class='badge badge-danger'>Inactivo</span>";
+    html += "</td>";
+    
+    // Permisos
+    html += "<td class='permissions'>";
+    if (bleAuthConfig.user_enabled[i]) {
+      uint8_t perm = bleAuthConfig.user_permissions[i];
+      if (perm & BLE_PERM_RELAY_CONTROL) html += "Relés ";
+      if (perm & BLE_PERM_MODE_CHANGE) html += "Modo ";
+      if (perm & BLE_PERM_ADD_CODES) html += "Códigos ";
+      if (perm & BLE_PERM_NETWORK_CONFIG) html += "Red ";
+      // Mostrar preview de clave
+      char keyPreview[16];
+      sprintf(keyPreview, " [%02X%02X..]", 
+              bleAuthConfig.user_keys[i][0], bleAuthConfig.user_keys[i][1]);
+      html += "<small><code>" + String(keyPreview) + "</code></small>";
+    } else {
+      html += "-";
+    }
+    html += "</td>";
+    
+    // Acciones
+    html += "<td>";
+    if (bleAuthConfig.user_enabled[i]) {
+      html += "<a class='btn btn-danger' href='/ble/clear-user?slot=" + String(i + 1) + "' onclick='return confirm(\"¿Eliminar usuario " + String(i + 1) + "?\")'><i class='fas fa-user-minus'></i></a>";
+    }
+    html += "</td></tr>";
+  }
+  
+  html += R"=====(
+      </table>
+      
+      <h2><i class='fas fa-exclamation-triangle'></i> Zona de Peligro</h2>
+      <div class='ble-warning'>
+        <p><strong>Atención:</strong> Las siguientes acciones son irreversibles.</p>
+        <button class='btn btn-danger' onclick='confirmClearAll()'><i class='fas fa-trash-alt'></i> Eliminar TODAS las vinculaciones</button>
+        <p><small>Esto eliminará el superadmin y todos los usuarios. El próximo dispositivo en conectarse se convertirá en superadmin.</small></p>
+      </div>
+      
+      <div id='confirm-superadmin' class='confirm-box'>
+        <p><strong>¿Está seguro de eliminar el Superadmin?</strong></p>
+        <p>El próximo dispositivo en enviar una clave se convertirá en el nuevo superadmin.</p>
+        <a class='btn btn-danger' href='/ble/clear-superadmin'><i class='fas fa-check'></i> Confirmar</a>
+        <button class='btn btn-secondary' onclick='hideConfirm("superadmin")'><i class='fas fa-times'></i> Cancelar</button>
+      </div>
+      
+      <div id='confirm-all' class='confirm-box'>
+        <p><strong>¿Está seguro de eliminar TODAS las vinculaciones?</strong></p>
+        <p>Se eliminarán el superadmin y los 5 usuarios.</p>
+        <a class='btn btn-danger' href='/ble/clear-all'><i class='fas fa-check'></i> Confirmar</a>
+        <button class='btn btn-secondary' onclick='hideConfirm("all")'><i class='fas fa-times'></i> Cancelar</button>
+      </div>
+      
+      <h2><i class='fas fa-bug'></i> Información de Debug</h2>
+      <div class='ble-status' style='font-family:monospace;font-size:12px;'>)=====";
+  
+  // Debug info
+  html += "<p><strong>Estructura BLEAuthConfig:</strong></p>";
+  html += "<p>validMarker: 0x" + String(bleAuthConfig.validMarker, HEX) + " (esperado: 0xB1E4C0DE)</p>";
+  html += "<p>superadmin_registered: " + String(bleAuthConfig.superadmin_registered) + "</p>";
+  html += "<p>checksum: 0x" + String(bleAuthConfig.checksum, HEX) + "</p>";
+  
+  // Verificar checksum
+  uint32_t calcChecksum = calculateBLEChecksum(bleAuthConfig);
+  html += "<p>checksum calculado: 0x" + String(calcChecksum, HEX);
+  html += (bleAuthConfig.checksum == calcChecksum) ? " ✓" : " ✗ ERROR";
+  html += "</p>";
+  
+  // Contar usuarios activos
+  int activeUsers = 0;
+  for (int i = 0; i < BLE_MAX_USERS; i++) {
+    if (bleAuthConfig.user_enabled[i]) activeUsers++;
+  }
+  html += "<p>Usuarios activos: " + String(activeUsers) + " de " + String(BLE_MAX_USERS) + "</p>";
+  html += "<p>Tamaño estructura: " + String(sizeof(BLEAuthConfig)) + " bytes</p>";
+  html += "<p>EEPROM offset: " + String(EEPROM_BLE_AUTH_OFFSET) + "</p>";
+  
+  html += R"=====(
+      </div>
+    </div>
+  </main>
+  <script>
+    function confirmClearSuperadmin() {
+      document.getElementById('confirm-superadmin').style.display = 'block';
+      document.getElementById('confirm-all').style.display = 'none';
+    }
+    function confirmClearAll() {
+      document.getElementById('confirm-all').style.display = 'block';
+      document.getElementById('confirm-superadmin').style.display = 'none';
+    }
+    function hideConfirm(type) {
+      document.getElementById('confirm-' + type).style.display = 'none';
+    }
+  </script>
+</body></html>
+)=====";
+  
+  server.send(200, "text/html", html);
+}
+
+// Limpiar todas las vinculaciones BLE
+void handleBLEClearAll() {
+  if (!server.authenticate(admin_user, admin_password)) {
+    return server.requestAuthentication();
+  }
+  
+  Serial.println("🔵 [BLE] Limpiando TODAS las vinculaciones...");
+  
+  // Reiniciar configuración
+  memset(&bleAuthConfig, 0, sizeof(BLEAuthConfig));
+  bleAuthConfig.validMarker = BLE_AUTH_CONFIG_MARKER;
+  bleAuthConfig.superadmin_registered = 0;
+  for (int i = 0; i < BLE_MAX_USERS; i++) {
+    bleAuthConfig.user_enabled[i] = 0;
+    bleAuthConfig.user_permissions[i] = 0;
+  }
+  saveBLEAuthConfig();
+  
+  // Desconectar si hay conexión activa
+  bleAuthenticated = false;
+  bleCurrentPermissions = 0;
+  bleConnectedUser = "";
+  
+  Serial.println("🔵 [BLE] Todas las vinculaciones eliminadas");
+  
+  // Publicar evento MQTT para monitorización remota
+  if (mqttClient.connected()) {
+    String topic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+    String message = String("{") +
+      "\"event\":\"BINDINGS_CLEARED\"," +
+      "\"type\":\"ALL\"," +
+      "\"source\":\"WEB\"," +
+      "\"device\":\"" + fixedSerialNumber + "\"," +
+      "\"details\":{" +
+        "\"superadmin_cleared\":true," +
+        "\"users_cleared\":5" +
+      "}," +
+      "\"timestamp\":\"" + getTimestamp() + "\"" +
+    "}";
+    mqttClient.publish(topic.c_str(), message.c_str());
+    Serial.println("📤 [MQTT] Evento de desvinculación total publicado");
+  }
+  
+  server.sendHeader("Location", "/ble");
+  server.send(303);
+}
+
+// Limpiar superadmin
+void handleBLEClearSuperadmin() {
+  if (!server.authenticate(admin_user, admin_password)) {
+    return server.requestAuthentication();
+  }
+  
+  Serial.println("🔵 [BLE] Eliminando superadmin...");
+  
+  memset(bleAuthConfig.superadmin_key, 0, BLE_KEY_SIZE);
+  bleAuthConfig.superadmin_registered = 0;
+  saveBLEAuthConfig();
+  
+  bleAuthenticated = false;
+  bleCurrentPermissions = 0;
+  bleConnectedUser = "";
+  
+  Serial.println("🔵 [BLE] Superadmin eliminado");
+  
+  // Publicar evento MQTT para monitorización remota
+  if (mqttClient.connected()) {
+    String topic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+    String message = String("{") +
+      "\"event\":\"BINDINGS_CLEARED\"," +
+      "\"type\":\"SUPERADMIN\"," +
+      "\"source\":\"WEB\"," +
+      "\"device\":\"" + fixedSerialNumber + "\"," +
+      "\"details\":{" +
+        "\"action\":\"superadmin_removed\"," +
+        "\"awaiting_new_superadmin\":true" +
+      "}," +
+      "\"timestamp\":\"" + getTimestamp() + "\"" +
+    "}";
+    mqttClient.publish(topic.c_str(), message.c_str());
+    Serial.println("📤 [MQTT] Evento de desvinculación superadmin publicado");
+  }
+  
+  server.sendHeader("Location", "/ble");
+  server.send(303);
+}
+
+// Limpiar un usuario específico
+void handleBLEClearUser() {
+  if (!server.authenticate(admin_user, admin_password)) {
+    return server.requestAuthentication();
+  }
+  
+  if (!server.hasArg("slot")) {
+    server.send(400, "text/plain", "Falta parámetro slot");
+    return;
+  }
+  
+  int slot = server.arg("slot").toInt();
+  if (slot < 1 || slot > BLE_MAX_USERS) {
+    server.send(400, "text/plain", "Slot inválido (1-5)");
+    return;
+  }
+  
+  Serial.printf("🔵 [BLE] Eliminando usuario %d...\n", slot);
+  
+  int idx = slot - 1;
+  
+  // Guardar nombre del usuario antes de eliminarlo (para el evento)
+  String userName = String(bleAuthConfig.user_names[idx]);
+  if (userName.length() == 0) userName = "Usuario" + String(slot);
+  uint8_t oldPermissions = bleAuthConfig.user_permissions[idx];
+  
+  // Eliminar usuario
+  memset(bleAuthConfig.user_keys[idx], 0, BLE_KEY_SIZE);
+  bleAuthConfig.user_enabled[idx] = 0;
+  bleAuthConfig.user_permissions[idx] = 0;
+  memset(bleAuthConfig.user_names[idx], 0, 16);
+  saveBLEAuthConfig();
+  
+  Serial.printf("🔵 [BLE] Usuario %d eliminado\n", slot);
+  
+  // Publicar evento MQTT para monitorización remota
+  if (mqttClient.connected()) {
+    String topic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+    String message = String("{") +
+      "\"event\":\"BINDINGS_CLEARED\"," +
+      "\"type\":\"USER\"," +
+      "\"source\":\"WEB\"," +
+      "\"device\":\"" + fixedSerialNumber + "\"," +
+      "\"details\":{" +
+        "\"slot\":" + String(slot) + "," +
+        "\"user_name\":\"" + userName + "\"," +
+        "\"previous_permissions\":\"0x" + String(oldPermissions, HEX) + "\"" +
+      "}," +
+      "\"timestamp\":\"" + getTimestamp() + "\"" +
+    "}";
+    mqttClient.publish(topic.c_str(), message.c_str());
+    Serial.printf("📤 [MQTT] Evento de desvinculación usuario %d publicado\n", slot);
+  }
+  
+  server.sendHeader("Location", "/ble");
+  server.send(303);
+}
+
+// API para obtener estado BLE
+void handleBLEStatus() {
+  if (!server.authenticate(admin_user, admin_password)) {
+    return server.requestAuthentication();
+  }
+  
+  DynamicJsonDocument doc(1024);
+  doc["name"] = fixedSerialNumber;
+  doc["connected"] = bleDeviceConnected;
+  doc["authenticated"] = bleAuthenticated;
+  doc["connected_user"] = bleConnectedUser;
+  doc["superadmin_registered"] = (bool)bleAuthConfig.superadmin_registered;
+  
+  JsonArray users = doc.createNestedArray("users");
+  for (int i = 0; i < BLE_MAX_USERS; i++) {
+    JsonObject user = users.createNestedObject();
+    user["slot"] = i + 1;
+    user["enabled"] = (bool)bleAuthConfig.user_enabled[i];
+    user["name"] = bleAuthConfig.user_names[i];
+    user["permissions"] = bleAuthConfig.user_permissions[i];
+  }
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+#endif // ENABLE_BLE
+
  bool deleteCode(const char* type, const char* value, int keyboardId = -1) {
    for (uint16_t i = 0; i < storedCodes->count; i++) {
      if (strcmp(storedCodes->codes[i].value, value) == 0 &&
@@ -5047,6 +6178,16 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
   server.on("/ota/status", HTTP_GET, handleOTAStatus);
   server.on("/security/disable-keyboards", HTTP_GET, handleSecurityDisableKeyboards);
   server.on("/security/enable-keyboards", HTTP_GET, handleSecurityEnableKeyboards);
+  
+#ifdef ENABLE_BLE
+  // =================== RUTAS BLE ===================
+  server.on("/ble", HTTP_GET, handleBLEPage);
+  server.on("/ble/clear-all", HTTP_GET, handleBLEClearAll);
+  server.on("/ble/clear-superadmin", HTTP_GET, handleBLEClearSuperadmin);
+  server.on("/ble/clear-user", HTTP_GET, handleBLEClearUser);
+  server.on("/api/ble/status", HTTP_GET, handleBLEStatus);
+#endif
+
   server.onNotFound(handleNotFound);
    
    server.begin();
@@ -5268,6 +6409,9 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
  html += "<a href='/codes'><button class='btn-info'><i class='fas fa-database icon'></i>Gestión de Códigos</button></a>";
  html += "<a href='/remote-codes'><button class='btn-info'><i class='fas fa-cloud icon'></i>Códigos Remotos</button></a>";
  html += "<a href='/digital_inputs'><button class='btn-info'><i class='fas fa-plug icon'></i>Entradas Digitales</button></a>";
+#ifdef ENABLE_BLE
+ html += "<a href='/ble'><button class='btn-info'><i class='fas fa-bluetooth-b icon'></i>Config BLE</button></a>";
+#endif
  html += "<a href='/reboot'><button class='btn-warning'><i class='fas fa-sync-alt icon'></i>Reiniciar</button></a>";
  html += "<a href='/reset'><button class='btn-danger'><i class='fas fa-exclamation-triangle icon'></i>Resetear</button></a>";
   html += "</div>";
@@ -6088,14 +7232,1785 @@ void handleCodes() {
    return String(macStr);
  }
  
- // =================== FUNCIÓN SETUP ===================
- void setup() {
+// =================== FUNCIONES BLE (v4.1) ===================
+#ifdef ENABLE_BLE
+
+// Calcular checksum para BLEAuthConfig
+uint32_t calculateBLEChecksum(const BLEAuthConfig& cfg) {
+  uint32_t sum = 0;
+  for (int i = 0; i < BLE_KEY_SIZE; i++) {
+    sum += cfg.superadmin_key[i];
+  }
+  for (int u = 0; u < BLE_MAX_USERS; u++) {
+    sum += cfg.user_enabled[u];
+    sum += cfg.user_permissions[u];
+    for (int i = 0; i < BLE_KEY_SIZE; i++) {
+      sum += cfg.user_keys[u][i];
+    }
+  }
+  return sum ^ 0xB1E4C0DE;
+}
+
+// =================== FUNCIONES DE SEGURIDAD BLE v4.1 ===================
+
+// Generar nonce aleatorio para challenge
+void generateBLEChallenge() {
+  esp_fill_random(bleSessionNonce, 16);
+  bleChallengeReady = true;
+  bleConnectionTime = millis();  // Reiniciar timeout de challenge
+  Serial.println("🔐 [BLE] Challenge generado (16 bytes)");
+  Serial.printf("🔐 [BLE] Nonce: ");
+  for (int i = 0; i < 16; i++) {
+    Serial.printf("%02X", bleSessionNonce[i]);
+  }
+  Serial.println();
+}
+
+// Generar token de sesión
+void generateBLESessionToken() {
+  esp_fill_random(bleSessionToken, 8);
+  bleSessionValid = true;
+  bleSessionTime = millis();
+  Serial.println("🔐 [BLE] Token de sesión generado (8 bytes)");
+  Serial.printf("🔐 [BLE] Token: ");
+  for (int i = 0; i < 8; i++) {
+    Serial.printf("%02X", bleSessionToken[i]);
+  }
+  Serial.println();
+}
+
+// Calcular SHA256 de clave + nonce
+void calculateSHA256Response(const uint8_t* key, const uint8_t* nonce, uint8_t* output) {
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);  // 0 = SHA256 (1 = SHA224)
+  mbedtls_sha256_update(&ctx, key, BLE_KEY_SIZE);  // 64 bytes de clave
+  mbedtls_sha256_update(&ctx, nonce, 16);          // 16 bytes de nonce
+  mbedtls_sha256_finish(&ctx, output);             // 32 bytes de salida
+  mbedtls_sha256_free(&ctx);
+}
+
+// Verificar response del challenge contra todas las claves almacenadas
+// Retorna: -1 = no coincide, 0 = superadmin, 1-5 = usuario (slot)
+int verifyBLEChallengeResponse(const uint8_t* response) {
+  if (!bleChallengeReady) {
+    Serial.println("🔐 [BLE] Error: No hay challenge pendiente");
+    return -1;
+  }
+  
+  uint8_t expected[32];
+  
+  // Verificar contra superadmin
+  if (bleAuthConfig.superadmin_registered) {
+    calculateSHA256Response(bleAuthConfig.superadmin_key, bleSessionNonce, expected);
+    if (memcmp(response, expected, 32) == 0) {
+      Serial.println("🔐 [BLE] ✓ Response válido - SUPERADMIN");
+      bleChallengeReady = false;
+      return 0;
+    }
+  }
+  
+  // Verificar contra usuarios registrados
+  for (int u = 0; u < BLE_MAX_USERS; u++) {
+    if (bleAuthConfig.user_enabled[u]) {
+      calculateSHA256Response(bleAuthConfig.user_keys[u], bleSessionNonce, expected);
+      if (memcmp(response, expected, 32) == 0) {
+        Serial.printf("🔐 [BLE] ✓ Response válido - Usuario %d (%s)\n", 
+                      u + 1, bleAuthConfig.user_names[u]);
+        bleChallengeReady = false;
+        return u + 1;
+      }
+    }
+  }
+  
+  Serial.println("🔐 [BLE] ✗ Response inválido - No coincide con ninguna clave");
+  return -1;
+}
+
+// Verificar token de sesión en operaciones BLE
+// Los primeros 8 bytes del comando deben ser el token válido
+bool verifyBLESessionToken(const uint8_t* receivedToken) {
+  if (!bleSessionValid) {
+    Serial.println("🔐 [BLE] Token rechazado: No hay sesión activa");
+    return false;
+  }
+  
+  // Verificar timeout de sesión por inactividad
+  unsigned long now = millis();
+  if (now - bleSessionTime > BLE_SESSION_TIMEOUT_MS) {
+    Serial.println("🔐 [BLE] Token rechazado: Sesión expirada por inactividad");
+    bleSessionValid = false;
+    bleAuthenticated = false;
+    return false;
+  }
+  
+  // Verificar token
+  if (memcmp(receivedToken, bleSessionToken, 8) != 0) {
+    Serial.println("🔐 [BLE] Token rechazado: No coincide");
+    Serial.printf("🔐 [BLE] Recibido: %02X%02X%02X%02X%02X%02X%02X%02X\n",
+                  receivedToken[0], receivedToken[1], receivedToken[2], receivedToken[3],
+                  receivedToken[4], receivedToken[5], receivedToken[6], receivedToken[7]);
+    return false;
+  }
+  
+  // Token válido - actualizar timestamp de actividad
+  bleSessionTime = now;
+  return true;
+}
+
+// Invalidar sesión BLE (al desconectar o por timeout)
+void invalidateBLESession() {
+  bleSessionValid = false;
+  bleAuthenticated = false;
+  bleChallengeReady = false;
+  bleCurrentPermissions = 0;
+  bleConnectedUser = "";
+  memset(bleSessionToken, 0, 8);
+  memset(bleSessionNonce, 0, 16);
+  Serial.println("🔐 [BLE] Sesión invalidada");
+}
+
+// Convertir token a string hexadecimal
+String tokenToHex(const uint8_t* token, size_t len) {
+  String hex = "";
+  for (size_t i = 0; i < len; i++) {
+    char buf[3];
+    sprintf(buf, "%02X", token[i]);
+    hex += buf;
+  }
+  return hex;
+}
+
+// =================== FUNCIONES DE CLAVE MAESTRA Y HKDF (v4.1) ===================
+
+// Calcular checksum para DeviceKeyConfig
+uint32_t calculateDeviceKeyChecksum(const DeviceKeyConfig& cfg) {
+  uint32_t sum = 0;
+  for (int i = 0; i < DEVICE_MASTER_KEY_SIZE; i++) {
+    sum += cfg.master_key[i];
+  }
+  sum += cfg.key_version;
+  sum += cfg.generation_time;
+  return sum ^ 0xDE41CE41;
+}
+
+// Cargar configuración de clave maestra desde EEPROM
+void loadDeviceKeyConfig() {
+  Serial.println("🔑 [MQTT] Cargando clave maestra del dispositivo...");
+  
+  EEPROM.get(EEPROM_DEVICE_KEY_OFFSET, deviceKeyConfig);
+  
+  if (deviceKeyConfig.validMarker != DEVICE_KEY_CONFIG_MARKER) {
+    Serial.println("🔑 [MQTT] Primera ejecución - Generando clave maestra aleatoria...");
+    
+    // Generar clave maestra aleatoria (32 bytes)
+    esp_fill_random(deviceKeyConfig.master_key, DEVICE_MASTER_KEY_SIZE);
+    
+    deviceKeyConfig.validMarker = DEVICE_KEY_CONFIG_MARKER;
+    deviceKeyConfig.key_version = 1;
+    deviceKeyConfig.generation_time = millis() / 1000;  // Segundos desde boot
+    deviceKeyConfig.checksum = calculateDeviceKeyChecksum(deviceKeyConfig);
+    
+    // Guardar en EEPROM
+    EEPROM.put(EEPROM_DEVICE_KEY_OFFSET, deviceKeyConfig);
+    if (EEPROM.commit()) {
+      Serial.println("🔑 [MQTT] ✓ Clave maestra generada y guardada");
+      Serial.printf("🔑 [MQTT] Key preview: %02X%02X%02X%02X...%02X%02X%02X%02X\n",
+                    deviceKeyConfig.master_key[0], deviceKeyConfig.master_key[1],
+                    deviceKeyConfig.master_key[2], deviceKeyConfig.master_key[3],
+                    deviceKeyConfig.master_key[28], deviceKeyConfig.master_key[29],
+                    deviceKeyConfig.master_key[30], deviceKeyConfig.master_key[31]);
+    } else {
+      Serial.println("🔑 [MQTT] ✗ Error guardando clave maestra");
+    }
+  } else {
+    // Verificar checksum
+    uint32_t calculated = calculateDeviceKeyChecksum(deviceKeyConfig);
+    if (deviceKeyConfig.checksum != calculated) {
+      Serial.println("⚠️ [MQTT] Checksum de clave maestra inválido - Regenerando...");
+      esp_fill_random(deviceKeyConfig.master_key, DEVICE_MASTER_KEY_SIZE);
+      deviceKeyConfig.key_version++;
+      deviceKeyConfig.checksum = calculateDeviceKeyChecksum(deviceKeyConfig);
+      EEPROM.put(EEPROM_DEVICE_KEY_OFFSET, deviceKeyConfig);
+      EEPROM.commit();
+    }
+    
+    Serial.printf("🔑 [MQTT] ✓ Clave maestra cargada (versión %d)\n", deviceKeyConfig.key_version);
+    Serial.printf("🔑 [MQTT] Key preview: %02X%02X%02X%02X...%02X%02X%02X%02X\n",
+                  deviceKeyConfig.master_key[0], deviceKeyConfig.master_key[1],
+                  deviceKeyConfig.master_key[2], deviceKeyConfig.master_key[3],
+                  deviceKeyConfig.master_key[28], deviceKeyConfig.master_key[29],
+                  deviceKeyConfig.master_key[30], deviceKeyConfig.master_key[31]);
+  }
+}
+
+// Implementación manual de HKDF-SHA256 (Extract-and-Expand)
+// Porque mbedtls_hkdf no está disponible en esta versión de ESP-IDF
+
+// HKDF-Extract: PRK = HMAC-Hash(salt, IKM)
+bool hkdfExtract(const uint8_t* salt, size_t saltLen, 
+                 const uint8_t* ikm, size_t ikmLen,
+                 uint8_t* prk) {
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  
+  const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (md == nullptr) return false;
+  
+  if (mbedtls_md_setup(&ctx, md, 1) != 0) {
+    mbedtls_md_free(&ctx);
+    return false;
+  }
+  
+  mbedtls_md_hmac_starts(&ctx, salt, saltLen);
+  mbedtls_md_hmac_update(&ctx, ikm, ikmLen);
+  mbedtls_md_hmac_finish(&ctx, prk);
+  
+  mbedtls_md_free(&ctx);
+  return true;
+}
+
+// HKDF-Expand: OKM = T(1) || T(2) || ... donde T(i) = HMAC-Hash(PRK, T(i-1) || info || i)
+bool hkdfExpand(const uint8_t* prk, size_t prkLen,
+                const uint8_t* info, size_t infoLen,
+                uint8_t* okm, size_t okmLen) {
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  
+  const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (md == nullptr) return false;
+  
+  if (mbedtls_md_setup(&ctx, md, 1) != 0) {
+    mbedtls_md_free(&ctx);
+    return false;
+  }
+  
+  uint8_t t[32];  // SHA256 output size
+  size_t tLen = 0;
+  size_t pos = 0;
+  uint8_t counter = 1;
+  
+  while (pos < okmLen) {
+    mbedtls_md_hmac_starts(&ctx, prk, prkLen);
+    
+    if (tLen > 0) {
+      mbedtls_md_hmac_update(&ctx, t, tLen);
+    }
+    
+    mbedtls_md_hmac_update(&ctx, info, infoLen);
+    mbedtls_md_hmac_update(&ctx, &counter, 1);
+    mbedtls_md_hmac_finish(&ctx, t);
+    
+    tLen = 32;  // SHA256 output
+    size_t copyLen = (okmLen - pos < 32) ? (okmLen - pos) : 32;
+    memcpy(okm + pos, t, copyLen);
+    pos += copyLen;
+    counter++;
+  }
+  
+  mbedtls_md_free(&ctx);
+  return true;
+}
+
+// Derivar clave de usuario usando HKDF-SHA256
+// info = "user_key:" + user_id
+// output = 64 bytes (BLE_KEY_SIZE)
+bool deriveUserKey(const char* userId, uint8_t* outputKey) {
+  Serial.printf("🔑 [MQTT] Derivando clave para usuario: %s\n", userId);
+  
+  // Construir info string
+  String info = "user_key:" + String(userId);
+  
+  // Salt = serial number del dispositivo
+  String salt = fixedSerialNumber;
+  
+  // Paso 1: Extract - PRK = HMAC(salt, master_key)
+  uint8_t prk[32];  // SHA256 output
+  if (!hkdfExtract((const uint8_t*)salt.c_str(), salt.length(),
+                   deviceKeyConfig.master_key, DEVICE_MASTER_KEY_SIZE, prk)) {
+    Serial.println("🔑 [MQTT] ✗ Error en HKDF-Extract");
+    return false;
+  }
+  
+  // Paso 2: Expand - OKM = HKDF-Expand(PRK, info, 64)
+  if (!hkdfExpand(prk, 32, (const uint8_t*)info.c_str(), info.length(),
+                  outputKey, BLE_KEY_SIZE)) {
+    Serial.println("🔑 [MQTT] ✗ Error en HKDF-Expand");
+    return false;
+  }
+  
+  Serial.printf("🔑 [MQTT] ✓ Clave derivada: %02X%02X%02X%02X...%02X%02X%02X%02X\n",
+                outputKey[0], outputKey[1], outputKey[2], outputKey[3],
+                outputKey[60], outputKey[61], outputKey[62], outputKey[63]);
+  return true;
+}
+
+// Obtener la clave maestra en formato hex (para registro inicial en servidor)
+// NOTA: Esto solo debe exponerse durante el registro del dispositivo, no en producción
+String getDeviceMasterKeyHex() {
+  return tokenToHex(deviceKeyConfig.master_key, DEVICE_MASTER_KEY_SIZE);
+}
+
+// Cargar configuración BLE desde EEPROM
+void loadBLEAuthConfig() {
+  Serial.println("🔵 [BLE] Cargando configuración de autenticación...");
+  Serial.printf("🔵 [BLE] Tamaño estructura BLEAuthConfig: %d bytes\n", sizeof(BLEAuthConfig));
+  Serial.printf("🔵 [BLE] Offset EEPROM: %d\n", EEPROM_BLE_AUTH_OFFSET);
+  
+  EEPROM.get(EEPROM_BLE_AUTH_OFFSET, bleAuthConfig);
+  
+  // Verificar marcador válido
+  if (bleAuthConfig.validMarker != BLE_AUTH_CONFIG_MARKER) {
+    Serial.printf("🔵 [BLE] Marcador inválido: 0x%08X (esperado: 0x%08X)\n", 
+                  bleAuthConfig.validMarker, BLE_AUTH_CONFIG_MARKER);
+    Serial.println("🔵 [BLE] Primera ejecución - Inicializando configuración");
+    memset(&bleAuthConfig, 0, sizeof(BLEAuthConfig));
+    bleAuthConfig.validMarker = BLE_AUTH_CONFIG_MARKER;
+    bleAuthConfig.superadmin_registered = 0;
+    for (int i = 0; i < BLE_MAX_USERS; i++) {
+      bleAuthConfig.user_enabled[i] = 0;
+      bleAuthConfig.user_permissions[i] = 0;
+    }
+    saveBLEAuthConfig();
+  } else {
+    // Verificar checksum
+    uint32_t storedChecksum = bleAuthConfig.checksum;
+    uint32_t calculatedChecksum = calculateBLEChecksum(bleAuthConfig);
+    
+    if (storedChecksum != calculatedChecksum) {
+      Serial.printf("⚠️ [BLE] Checksum inválido: guardado=0x%08X, calculado=0x%08X\n",
+                    storedChecksum, calculatedChecksum);
+      Serial.println("⚠️ [BLE] ADVERTENCIA: Datos pueden estar corruptos");
+      // NO reinicializar automáticamente - mantener datos existentes pero advertir
+    }
+    
+    Serial.printf("🔵 [BLE] Configuración cargada - Superadmin: %s (valor raw: %d)\n",
+                  bleAuthConfig.superadmin_registered ? "SÍ REGISTRADO" : "NO registrado",
+                  bleAuthConfig.superadmin_registered);
+    
+    // Mostrar primeros bytes de la clave del superadmin para debug
+    if (bleAuthConfig.superadmin_registered) {
+      Serial.printf("🔵 [BLE] Superadmin key (primeros 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
+                    bleAuthConfig.superadmin_key[0], bleAuthConfig.superadmin_key[1],
+                    bleAuthConfig.superadmin_key[2], bleAuthConfig.superadmin_key[3],
+                    bleAuthConfig.superadmin_key[4], bleAuthConfig.superadmin_key[5],
+                    bleAuthConfig.superadmin_key[6], bleAuthConfig.superadmin_key[7]);
+    }
+    
+    int userCount = 0;
+    for (int i = 0; i < BLE_MAX_USERS; i++) {
+      if (bleAuthConfig.user_enabled[i]) {
+        userCount++;
+        Serial.printf("🔵 [BLE] Usuario %d habilitado: %s\n", i + 1, bleAuthConfig.user_names[i]);
+      }
+    }
+    Serial.printf("🔵 [BLE] Total usuarios activos: %d\n", userCount);
+  }
+}
+
+// Declaración forward de updateBLEDeviceInfo
+void updateBLEDeviceInfo();
+
+// Guardar configuración BLE en EEPROM
+void saveBLEAuthConfig() {
+  bleAuthConfig.validMarker = BLE_AUTH_CONFIG_MARKER;
+  bleAuthConfig.checksum = calculateBLEChecksum(bleAuthConfig);
+  
+  EEPROM.put(EEPROM_BLE_AUTH_OFFSET, bleAuthConfig);
+  if (EEPROM.commit()) {
+    Serial.println("🔵 [BLE] Configuración guardada correctamente");
+    // Actualizar la característica de info del dispositivo (FF08)
+    // para que la APP vea los cambios en superadmin_registered y active_users
+    updateBLEDeviceInfo();
+  } else {
+    Serial.println("❌ [BLE] Error al guardar configuración");
+  }
+}
+
+// Verificar clave de autenticación
+int verifyBLEKey(const uint8_t* key) {
+  Serial.println("🔵 [BLE] === Verificando clave ===");
+  
+  // Verificar integridad de la configuración
+  uint32_t calculatedChecksum = calculateBLEChecksum(bleAuthConfig);
+  if (bleAuthConfig.checksum != calculatedChecksum) {
+    Serial.println("⚠️ [BLE] ADVERTENCIA: Checksum de configuración no coincide");
+    Serial.printf("⚠️ [BLE] Checksum guardado: 0x%08X, calculado: 0x%08X\n", 
+                  bleAuthConfig.checksum, calculatedChecksum);
+  }
+  
+  // Mostrar clave recibida (primeros 8 bytes)
+  Serial.printf("🔵 [BLE] Clave a verificar: %02X%02X%02X%02X%02X%02X%02X%02X...\n",
+                key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
+  
+  // Verificar si es superadmin
+  if (bleAuthConfig.superadmin_registered) {
+    Serial.println("🔵 [BLE] Comparando con clave de SUPERADMIN...");
+    Serial.printf("🔵 [BLE] Superadmin key: %02X%02X%02X%02X%02X%02X%02X%02X...\n",
+                  bleAuthConfig.superadmin_key[0], bleAuthConfig.superadmin_key[1],
+                  bleAuthConfig.superadmin_key[2], bleAuthConfig.superadmin_key[3],
+                  bleAuthConfig.superadmin_key[4], bleAuthConfig.superadmin_key[5],
+                  bleAuthConfig.superadmin_key[6], bleAuthConfig.superadmin_key[7]);
+    
+    bool match = (memcmp(bleAuthConfig.superadmin_key, key, BLE_KEY_SIZE) == 0);
+    if (match) {
+      Serial.println("🔵 [BLE] ✓ Clave COINCIDE con SUPERADMIN");
+      return 0; // 0 = superadmin
+    } else {
+      Serial.println("🔵 [BLE] ✗ Clave NO coincide con superadmin");
+    }
+  } else {
+    Serial.println("🔵 [BLE] No hay superadmin registrado - Solo auto-registro permitido");
+  }
+  
+  // Verificar usuarios registrados
+  Serial.println("🔵 [BLE] Verificando contra usuarios registrados...");
+  int usersChecked = 0;
+  for (int u = 0; u < BLE_MAX_USERS; u++) {
+    if (bleAuthConfig.user_enabled[u]) {
+      usersChecked++;
+      Serial.printf("🔵 [BLE] Slot %d: Usuario '%s' (permisos=0x%02X)\n", 
+                    u + 1, bleAuthConfig.user_names[u], bleAuthConfig.user_permissions[u]);
+      Serial.printf("🔵 [BLE] Slot %d key: %02X%02X%02X%02X%02X%02X%02X%02X...\n",
+                    u + 1,
+                    bleAuthConfig.user_keys[u][0], bleAuthConfig.user_keys[u][1],
+                    bleAuthConfig.user_keys[u][2], bleAuthConfig.user_keys[u][3],
+                    bleAuthConfig.user_keys[u][4], bleAuthConfig.user_keys[u][5],
+                    bleAuthConfig.user_keys[u][6], bleAuthConfig.user_keys[u][7]);
+      
+      bool match = (memcmp(bleAuthConfig.user_keys[u], key, BLE_KEY_SIZE) == 0);
+      if (match) {
+        Serial.printf("🔵 [BLE] ✓ Clave COINCIDE con Usuario %d (%s)\n", u + 1, bleAuthConfig.user_names[u]);
+        return u + 1; // 1-5 = usuarios
+      }
+    }
+  }
+  
+  Serial.printf("🔵 [BLE] ✗ Clave NO coincide. Usuarios revisados: %d de %d\n", usersChecked, BLE_MAX_USERS);
+  return -1; // No autenticado
+}
+
+// Callback para conexiones BLE (v4.1 con soporte de sesiones seguras)
+class SWATIDServerCallbacks: public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer) {
+    bleDeviceConnected = true;
+    invalidateBLESession();  // Limpiar cualquier sesión anterior
+    bleConnectionTime = millis();  // Registrar momento de conexión
+    Serial.println("🔵 [BLE] Dispositivo conectado - Esperando autenticación...");
+    Serial.printf("🔵 [BLE] Timeout de autenticación: %d segundos\n", BLE_AUTH_TIMEOUT_MS / 1000);
+    Serial.println("🔐 [BLE] v4.1: Usar FF0B para obtener challenge, luego FF01 con SHA256(key+nonce)");
+  }
+
+  void onDisconnect(NimBLEServer* pServer) {
+    bleDeviceConnected = false;
+    invalidateBLESession();  // Invalidar sesión al desconectar
+    bleConnectionTime = 0;
+    Serial.println("🔵 [BLE] Dispositivo desconectado - Sesión invalidada");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+// =================== CALLBACK FF0B - CHALLENGE (v4.1) ===================
+// Esta característica genera un nonce aleatorio para autenticación segura
+// La APP debe: 1) Leer FF0B para obtener challenge, 2) Calcular SHA256(key+nonce), 3) Enviar a FF01
+class ChallengeCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pCharacteristic) {
+    Serial.println("🔐 [BLE] FF0B - Solicitud de challenge para auth seguro");
+    
+    // Generar nuevo nonce aleatorio (16 bytes)
+    generateBLEChallenge();
+    
+    // Devolver el nonce
+    pCharacteristic->setValue(bleSessionNonce, 16);
+    
+    Serial.println("🔐 [BLE] FF0B - Challenge enviado, esperando response en FF01...");
+  }
+};
+
+// =================== CALLBACK FF01 - AUTENTICACIÓN (v4.1 con Challenge-Response) ===================
+class AuthCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pCharacteristic) {
+    std::string value = pCharacteristic->getValue();
+    
+    Serial.printf("🔵 [BLE] FF01 - Recibidos %d bytes para autenticación\n", value.length());
+    
+    // =================== v4.1: CHALLENGE-RESPONSE (32 bytes = SHA256) ===================
+    if (value.length() == 32 && bleChallengeReady) {
+      Serial.println("🔐 [BLE] FF01 - Modo Challenge-Response (v4.1 seguro)");
+      const uint8_t* response = (const uint8_t*)value.data();
+      
+      // Verificar response contra todas las claves
+      int userIndex = verifyBLEChallengeResponse(response);
+      
+      if (userIndex >= 0) {
+        // Autenticación exitosa - generar token de sesión
+        generateBLESessionToken();
+        
+        bleAuthenticated = true;
+        if (userIndex == 0) {
+          bleCurrentPermissions = BLE_PERM_ADMIN;
+          bleConnectedUser = "SUPERADMIN";
+          Serial.println("🔐 [BLE] ✓ Challenge-Response OK - SUPERADMIN");
+        } else {
+          bleCurrentPermissions = bleAuthConfig.user_permissions[userIndex - 1];
+          bleConnectedUser = String(bleAuthConfig.user_names[userIndex - 1]);
+          Serial.printf("🔐 [BLE] ✓ Challenge-Response OK - Usuario %d (%s)\n", 
+                        userIndex, bleConnectedUser.c_str());
+        }
+        
+        // Actualizar valores de FF09 y FF0A tras autenticación
+        updateFF09Value();
+        updateFF0AValue(0);
+        
+        // Responder con token de sesión (8 bytes hex = 16 chars)
+        String tokenHex = tokenToHex(bleSessionToken, 8);
+        String response = "OK:TOKEN:" + tokenHex;
+        pCharacteristic->setValue((uint8_t*)response.c_str(), response.length());
+        Serial.printf("🔐 [BLE] Token de sesión: %s\n", tokenHex.c_str());
+        
+        // Publicar evento de autenticación exitosa
+        if (mqttClient.connected()) {
+          String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+          String eventMsg = String("{") +
+            "\"event\":\"AUTH_SUCCESS\"," +
+            "\"method\":\"challenge_response\"," +
+            "\"user\":\"" + bleConnectedUser + "\"," +
+            "\"timestamp\":\"" + getTimestamp() + "\"" +
+          "}";
+          mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+        }
+      } else {
+        // Response inválido
+        invalidateBLESession();
+        String err = "ERROR:INVALID_RESPONSE";
+        pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+        
+        // Publicar evento de fallo
+        if (mqttClient.connected()) {
+          String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+          String eventMsg = String("{") +
+            "\"event\":\"AUTH_FAILED\"," +
+            "\"method\":\"challenge_response\"," +
+            "\"reason\":\"invalid_response\"," +
+            "\"timestamp\":\"" + getTimestamp() + "\"" +
+          "}";
+          mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+        }
+      }
+      pCharacteristic->notify();
+      return;
+    }
+    
+    // =================== MODO LEGADO (64 bytes = clave directa) ===================
+    // NOTA: Este modo se mantiene para compatibilidad con APPs antiguas
+    // En una futura versión puede eliminarse para forzar Challenge-Response
+    if (value.length() == BLE_KEY_SIZE) {
+      Serial.println("⚠️ [BLE] FF01 - Modo LEGADO (clave directa) - Considere usar Challenge-Response");
+      const uint8_t* key = (const uint8_t*)value.data();
+      
+      // Mostrar primeros bytes de la clave recibida para debug
+      Serial.printf("🔵 [BLE] Clave recibida (primeros 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
+                    key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
+      
+      Serial.printf("🔵 [BLE] Estado actual: superadmin_registered=%d\n", bleAuthConfig.superadmin_registered);
+      
+      // Si no hay superadmin registrado, el primero se convierte en superadmin
+      if (!bleAuthConfig.superadmin_registered) {
+        Serial.println("🔵 [BLE] *** NO HAY SUPERADMIN - Registrando nuevo ***");
+        memcpy(bleAuthConfig.superadmin_key, key, BLE_KEY_SIZE);
+        bleAuthConfig.superadmin_registered = 1;
+        saveBLEAuthConfig();
+        
+        bleAuthenticated = true;
+        bleCurrentPermissions = BLE_PERM_ADMIN;
+        bleConnectedUser = "SUPERADMIN";
+        
+        // Generar token de sesión incluso en modo legado
+        generateBLESessionToken();
+        
+        // Actualizar valores de FF09 y FF0A tras autenticación
+        updateFF09Value();
+        updateFF0AValue(0);
+        
+        Serial.println("🔵 [BLE] ¡Nuevo SUPERADMIN registrado!");
+        String tokenHex = tokenToHex(bleSessionToken, 8);
+        String ok = "OK:SUPERADMIN_REGISTERED:TOKEN:" + tokenHex;
+        pCharacteristic->setValue((uint8_t*)ok.c_str(), ok.length());
+        pCharacteristic->notify();
+        return;
+      }
+      
+      // YA HAY SUPERADMIN - Solo verificar credenciales, NO registrar nuevo
+      Serial.println("🔵 [BLE] Ya existe SUPERADMIN - Verificando credenciales...");
+      
+      // Verificar credenciales
+      int userIndex = verifyBLEKey(key);
+      Serial.printf("🔵 [BLE] Resultado verificación: userIndex=%d\n", userIndex);
+      
+      if (userIndex >= 0) {
+        bleAuthenticated = true;
+        
+        // Generar token de sesión
+        generateBLESessionToken();
+        
+        if (userIndex == 0) {
+          bleCurrentPermissions = BLE_PERM_ADMIN;
+          bleConnectedUser = "SUPERADMIN";
+          Serial.println("🔵 [BLE] ✓ Autenticado como SUPERADMIN");
+        } else {
+          bleCurrentPermissions = bleAuthConfig.user_permissions[userIndex - 1];
+          bleConnectedUser = String(bleAuthConfig.user_names[userIndex - 1]);
+          Serial.printf("🔵 [BLE] ✓ Autenticado como Usuario %d (%s)\n", userIndex, bleConnectedUser.c_str());
+        }
+        
+        // Actualizar valores de FF09 y FF0A tras autenticación
+        updateFF09Value();
+        updateFF0AValue(0);
+        
+        // Responder con token (modo legado también genera token)
+        String tokenHex = tokenToHex(bleSessionToken, 8);
+        String ok = "OK:AUTHENTICATED:TOKEN:" + tokenHex;
+        pCharacteristic->setValue((uint8_t*)ok.c_str(), ok.length());
+      } else {
+        invalidateBLESession();
+        Serial.println("🔵 [BLE] ✗ Autenticación FALLIDA - Clave no coincide con ningún usuario");
+        Serial.println("🔵 [BLE] ✗ NO SE PERMITE AUTO-REGISTRO - Solo superadmin puede añadir usuarios");
+        
+        // Publicar evento de intento fallido
+        if (mqttClient.connected()) {
+          String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+          String eventMsg = String("{") +
+            "\"event\":\"AUTH_FAILED\"," +
+            "\"device\":\"" + fixedSerialNumber + "\"," +
+            "\"reason\":\"invalid_key\"," +
+            "\"superadmin_exists\":" + (bleAuthConfig.superadmin_registered ? "true" : "false") + "," +
+            "\"timestamp\":\"" + getTimestamp() + "\"" +
+          "}";
+          mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+        }
+        
+        String err = "ERROR:INVALID_KEY";
+        pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+      }
+      pCharacteristic->notify();
+      return;
+    }
+    
+    // =================== COMANDOS DE ADMINISTRACIÓN ===================
+    if (value.length() > BLE_KEY_SIZE && bleAuthenticated && bleCurrentPermissions == BLE_PERM_ADMIN) {
+      // Comandos de administración (solo SUPERADMIN autenticado)
+      String cmd = String(value.c_str());
+      Serial.printf("🔵 [BLE] Comando admin recibido: %s\n", cmd.substring(0, 20).c_str());
+      
+      if (cmd.startsWith("ADD_USER:")) {
+        // Formato: ADD_USER:<slot>:<key 64 bytes hex 128 chars>:<permissions>:<name>
+        // Ejemplo: ADD_USER:1:A1B2C3...128chars...:3:Juan
+        int firstColon = 9;
+        int secondColon = cmd.indexOf(':', firstColon);
+        int thirdColon = cmd.indexOf(':', secondColon + 1);
+        int fourthColon = cmd.indexOf(':', thirdColon + 1);
+        
+        if (secondColon > firstColon) {
+          int slot = cmd.substring(firstColon, secondColon).toInt();
+          String keyHex = cmd.substring(secondColon + 1, thirdColon > 0 ? thirdColon : cmd.length());
+          uint8_t permissions = BLE_PERM_RELAY_CONTROL | BLE_PERM_MODE_CHANGE;
+          String userName = "Usuario" + String(slot);
+          
+          if (thirdColon > 0) {
+            permissions = cmd.substring(thirdColon + 1, fourthColon > 0 ? fourthColon : cmd.length()).toInt();
+          }
+          if (fourthColon > 0) {
+            userName = cmd.substring(fourthColon + 1);
+            userName.trim();
+          }
+          
+          Serial.printf("🔵 [BLE] ADD_USER: slot=%d, keyLen=%d, perm=%d, name=%s\n", 
+                        slot, keyHex.length(), permissions, userName.c_str());
+          
+          if (slot >= 1 && slot <= BLE_MAX_USERS && keyHex.length() == BLE_KEY_SIZE * 2) {
+            int idx = slot - 1;
+            // Convertir hex a bytes
+            for (int i = 0; i < BLE_KEY_SIZE; i++) {
+              String byteStr = keyHex.substring(i * 2, i * 2 + 2);
+              bleAuthConfig.user_keys[idx][i] = (uint8_t)strtol(byteStr.c_str(), NULL, 16);
+            }
+            bleAuthConfig.user_enabled[idx] = 1;
+            bleAuthConfig.user_permissions[idx] = permissions;
+            strncpy(bleAuthConfig.user_names[idx], userName.c_str(), 15);
+            bleAuthConfig.user_names[idx][15] = '\0';
+            saveBLEAuthConfig();
+            
+            String ok = "OK:USER_ADDED:" + String(slot) + ":" + userName;
+            pCharacteristic->setValue((uint8_t*)ok.c_str(), ok.length());
+            Serial.printf("🔵 [BLE] ✓ Usuario %d (%s) añadido con permisos 0x%02X\n", slot, userName.c_str(), permissions);
+          } else {
+            String err = "ERROR:INVALID_PARAMS";
+            pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+            Serial.println("🔵 [BLE] ✗ Parámetros inválidos para ADD_USER");
+          }
+        }
+        
+      } else if (cmd.startsWith("DEL_USER:")) {
+        // Formato: DEL_USER:<slot>
+        int slot = cmd.substring(9).toInt();
+        if (slot >= 1 && slot <= BLE_MAX_USERS) {
+          int idx = slot - 1;
+          String userName = String(bleAuthConfig.user_names[idx]);
+          memset(bleAuthConfig.user_keys[idx], 0, BLE_KEY_SIZE);
+          bleAuthConfig.user_enabled[idx] = 0;
+          bleAuthConfig.user_permissions[idx] = 0;
+          memset(bleAuthConfig.user_names[idx], 0, 16);
+          saveBLEAuthConfig();
+          
+          String ok = "OK:USER_DELETED:" + String(slot);
+          pCharacteristic->setValue((uint8_t*)ok.c_str(), ok.length());
+          Serial.printf("🔵 [BLE] ✓ Usuario %d (%s) eliminado\n", slot, userName.c_str());
+        } else {
+          String err = "ERROR:INVALID_SLOT";
+          pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+        }
+        
+      } else if (cmd.startsWith("LIST_USERS")) {
+        // Listar usuarios habilitados
+        Serial.println("🔵 [BLE] Listando usuarios...");
+        String response = "USERS:";
+        for (int i = 0; i < BLE_MAX_USERS; i++) {
+          if (bleAuthConfig.user_enabled[i]) {
+            response += String(i + 1) + ":" + String(bleAuthConfig.user_names[i]) + ",";
+          }
+        }
+        pCharacteristic->setValue((uint8_t*)response.c_str(), response.length());
+        
+      } else {
+        String err = "ERROR:UNKNOWN_COMMAND";
+        pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+        Serial.printf("🔵 [BLE] ✗ Comando desconocido: %s\n", cmd.c_str());
+      }
+      pCharacteristic->notify();
+    } else {
+      pCharacteristic->setValue("ERROR:INVALID_LENGTH");
+      pCharacteristic->notify();
+    }
+  }
+};
+
+// Callback para control de relés
+// Formato del comando BLE:
+//   Byte 0: relay_id (1 o 2)
+//   Byte 1: action (0=OFF, 1=ON con duración configurada, 2=PULSE con duración opcional)
+//   Bytes 2-3 (opcional): duración en milisegundos (big-endian)
+//
+// Si NO se envía duración (solo 2 bytes), se usa la duración configurada del dispositivo (releDuration)
+// Esto es similar al comportamiento de la web y MQTT
+class RelayCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pCharacteristic) {
+    if (!bleAuthenticated || !(bleCurrentPermissions & BLE_PERM_RELAY_CONTROL)) {
+      pCharacteristic->setValue("ERROR:NOT_AUTHORIZED");
+      pCharacteristic->notify();
+      return;
+    }
+
+    std::string value = pCharacteristic->getValue();
+    if (value.length() >= 2) {
+      uint8_t relayId = value[0];
+      uint8_t action = value[1];
+      
+      // Duración en milisegundos (opcional, big-endian)
+      uint16_t durationMs = 0;
+      if (value.length() >= 4) {
+        durationMs = (value[2] << 8) | value[3];
+      }
+
+      if (relayId >= 1 && relayId <= 2) {
+        int pin = (relayId == 1) ? RELE1_PIN : RELE2_PIN;
+
+        if (action == 1 || action == 2) { // ON o PULSE (mismo comportamiento)
+          // Si se envía duración, usarla; si no, usar la duración configurada
+          float durSec = (durationMs > 0) ? (durationMs / 1000.0) : releDuration;
+          
+          // Usar la función estándar que también publica eventos MQTT
+          controlReleWithDuration(durSec, relayId);
+          
+          Serial.printf("🔵 [BLE] Relé %d ACTIVADO por %s (%.1fs)\n", 
+                        relayId, bleConnectedUser.c_str(), durSec);
+          
+          // Publicar evento BLE de acción
+          if (mqttClient.connected()) {
+            String topic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+            String msg = String("{") +
+              "\"event\":\"RELAY_ACTIVATED\"," +
+              "\"relay\":" + String(relayId) + "," +
+              "\"duration\":" + String(durSec, 1) + "," +
+              "\"source\":\"BLE\"," +
+              "\"user\":\"" + bleConnectedUser + "\"," +
+              "\"timestamp\":\"" + getTimestamp() + "\"" +
+            "}";
+            mqttClient.publish(topic.c_str(), msg.c_str());
+          }
+          
+          pCharacteristic->setValue(action == 1 ? "OK:RELAY_ON" : "OK:RELAY_PULSE");
+          
+        } else if (action == 0) { // Desactivar inmediatamente
+          digitalWrite(pin, LOW);
+          releActive[relayId] = false;
+
+          Serial.printf("🔵 [BLE] Relé %d DESACTIVADO por %s\n", relayId, bleConnectedUser.c_str());
+          
+          // Publicar evento MQTT
+          if (mqttClient.connected()) {
+            String topic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+            String msg = String("{") +
+              "\"event\":\"RELAY_DEACTIVATED\"," +
+              "\"relay\":" + String(relayId) + "," +
+              "\"source\":\"BLE\"," +
+              "\"user\":\"" + bleConnectedUser + "\"," +
+              "\"timestamp\":\"" + getTimestamp() + "\"" +
+            "}";
+            mqttClient.publish(topic.c_str(), msg.c_str());
+          }
+          
+          pCharacteristic->setValue("OK:RELAY_OFF");
+        }
+      } else {
+        pCharacteristic->setValue("ERROR:INVALID_RELAY");
+      }
+      pCharacteristic->notify();
+    }
+  }
+};
+
+// Callback para cambio de modo
+class ModeCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pCharacteristic) {
+    uint8_t mode = config.turnstile.enabled ? 1 : 0;
+    pCharacteristic->setValue(&mode, 1);
+  }
+  
+  void onWrite(NimBLECharacteristic* pCharacteristic) {
+    if (!bleAuthenticated || !(bleCurrentPermissions & BLE_PERM_MODE_CHANGE)) {
+      pCharacteristic->setValue("ERROR:NOT_AUTHORIZED");
+      pCharacteristic->notify();
+      return;
+    }
+    
+    std::string value = pCharacteristic->getValue();
+    if (value.length() >= 1) {
+      uint8_t newMode = value[0];
+      config.turnstile.enabled = (newMode == 1);
+      saveConfiguration();
+      
+      Serial.printf("🔵 [BLE] Modo cambiado a %s por %s\n", 
+                    config.turnstile.enabled ? "TORNO" : "NORMAL", 
+                    bleConnectedUser.c_str());
+      pCharacteristic->setValue(config.turnstile.enabled ? "OK:MODE_TURNSTILE" : "OK:MODE_NORMAL");
+      pCharacteristic->notify();
+    }
+  }
+};
+
+// Estructura para código pendiente de guardar (procesado en loop())
+struct PendingCode {
+  bool pending;
+  char type[4];
+  char value[17];
+  uint8_t keyboard;
+  uint8_t relay;
+} pendingCode = {false, "", "", 0, 0};
+
+// Reinicio pendiente programado (para aplicar cambios de red)
+unsigned long pendingRestartTime = 0;  // 0 = no hay reinicio pendiente
+
+// Callback para añadir códigos (FF04)
+// OPTIMIZADO: Responde rápido y difiere el guardado EEPROM al loop()
+class AddCodeCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pCharacteristic) {
+    Serial.println("🔵 [BLE] FF04 - Recibido");
+    
+    // Obtener valor rápidamente
+    std::string value = pCharacteristic->getValue();
+    
+    // Verificaciones rápidas
+    if (!bleAuthenticated) {
+      pCharacteristic->setValue("ERROR:NOT_AUTHENTICATED");
+      pCharacteristic->notify();
+      return;
+    }
+    
+    if (!(bleCurrentPermissions & BLE_PERM_ADD_CODES)) {
+      pCharacteristic->setValue("ERROR:NO_PERMISSION");
+      pCharacteristic->notify();
+      return;
+    }
+    
+    if (storedCodes == nullptr) {
+      pCharacteristic->setValue("ERROR:STORAGE_NOT_READY");
+      pCharacteristic->notify();
+      return;
+    }
+    
+    if (value.length() < 4) {
+      pCharacteristic->setValue("ERROR:INVALID_LENGTH");
+      pCharacteristic->notify();
+      return;
+    }
+    
+    uint8_t typeByte = value[0];
+    uint8_t keyboard = value[1];
+    uint8_t relay = value[2];
+    
+    if (typeByte > 1) {
+      pCharacteristic->setValue("ERROR:INVALID_TYPE");
+      pCharacteristic->notify();
+      return;
+    }
+    if (keyboard > 2) {
+      pCharacteristic->setValue("ERROR:INVALID_KEYBOARD");
+      pCharacteristic->notify();
+      return;
+    }
+    if (relay < 1 || relay > 2) {
+      pCharacteristic->setValue("ERROR:INVALID_RELAY");
+      pCharacteristic->notify();
+      return;
+    }
+    
+    size_t codeLen = value.length() - 3;
+    if (codeLen == 0 || codeLen > 16) {
+      pCharacteristic->setValue("ERROR:INVALID_CODE_LENGTH");
+      pCharacteristic->notify();
+      return;
+    }
+    
+    // Copiar datos a buffer local
+    char codeBuffer[17] = {0};
+    memcpy(codeBuffer, value.data() + 3, codeLen);
+    
+    const char* typeStr = (typeByte == 0) ? "PIN" : "TAG";
+    
+    Serial.printf("🔵 [BLE] FF04 - %s '%s' kb=%d relay=%d\n", typeStr, codeBuffer, keyboard, relay);
+    
+    // Verificar duplicados (búsqueda rápida en RAM)
+    for (int i = 0; i < storedCodes->count; i++) {
+      if (strcmp(storedCodes->codes[i].type, typeStr) == 0 &&
+          strcmp(storedCodes->codes[i].value, codeBuffer) == 0) {
+        pCharacteristic->setValue("ERROR:CODE_EXISTS");
+        pCharacteristic->notify();
+        return;
+      }
+    }
+    
+    // Verificar espacio
+    if (storedCodes->count >= MAX_CODES) {
+      pCharacteristic->setValue("ERROR:STORAGE_FULL");
+      pCharacteristic->notify();
+      return;
+    }
+    
+    // AÑADIR SOLO A RAM (MUY RÁPIDO)
+    int idx = storedCodes->count;
+    strncpy(storedCodes->codes[idx].type, typeStr, 3);
+    storedCodes->codes[idx].type[3] = '\0';
+    strncpy(storedCodes->codes[idx].value, codeBuffer, 16);
+    storedCodes->codes[idx].value[16] = '\0';
+    storedCodes->codes[idx].keyboard_id = keyboard;
+    storedCodes->codes[idx].relay = relay;
+    storedCodes->codes[idx].reserved = 0;
+    storedCodes->count++;
+    storedCodes->version = 2;
+    
+    // RESPONDER INMEDIATAMENTE (antes de guardar en EEPROM)
+    char response[24];
+    snprintf(response, sizeof(response), "OK:CODE_ADDED:%d", storedCodes->count);
+    pCharacteristic->setValue(response);
+    pCharacteristic->notify();
+    
+    Serial.printf("🔵 [BLE] FF04 ✅ Añadido a RAM, total=%d\n", storedCodes->count);
+    
+    // MARCAR PARA GUARDAR EN LOOP (evita bloquear el callback BLE)
+    strncpy(pendingCode.type, typeStr, 3);
+    strncpy(pendingCode.value, codeBuffer, 16);
+    pendingCode.keyboard = keyboard;
+    pendingCode.relay = relay;
+    pendingCode.pending = true;
+  }
+};
+
+// Callback para configuración de red (FF05)
+// JSON optimizado para caber en MTU (~240 bytes)
+class NetworkCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pCharacteristic) {
+    Serial.println("🔵 [BLE] FF05 - Solicitud de configuración de red");
+    
+    // JSON compacto: solo campos esenciales
+    DynamicJsonDocument doc(256);
+    
+    doc["dhcp"] = config.useDhcp;
+    doc["eth"] = ethConnected;
+    doc["ip"] = ETH.localIP().toString();
+    doc["gw"] = ETH.gatewayIP().toString();
+    doc["mask"] = ETH.subnetMask().toString();
+    doc["mac"] = ETH.macAddress();
+    
+    // Solo incluir config estática si NO es DHCP
+    if (!config.useDhcp) {
+      char cfgIP[16], cfgGW[16], cfgMask[16];
+      sprintf(cfgIP, "%d.%d.%d.%d", config.ip[0], config.ip[1], config.ip[2], config.ip[3]);
+      sprintf(cfgGW, "%d.%d.%d.%d", config.gateway[0], config.gateway[1], config.gateway[2], config.gateway[3]);
+      sprintf(cfgMask, "%d.%d.%d.%d", config.subnet[0], config.subnet[1], config.subnet[2], config.subnet[3]);
+      doc["cfg_ip"] = cfgIP;
+      doc["cfg_gw"] = cfgGW;
+      doc["cfg_mask"] = cfgMask;
+    }
+    
+    String output;
+    serializeJson(doc, output);
+    
+    Serial.printf("🔵 [BLE] FF05 JSON: %d bytes\n", output.length());
+    
+    // Añadir EOT y enviar
+    if (output.length() <= 230) {
+      output += '\x04';  // EOT marker
+      pCharacteristic->setValue((uint8_t*)output.c_str(), output.length());
+      pCharacteristic->notify();
+      Serial.printf("🔵 [BLE] FF05 enviado con EOT (%d bytes)\n", output.length());
+    } else {
+      // Si es muy grande, usar chunking con EOT
+      sendBLEWithEOT(pCharacteristic, output);
+    }
+  }
+  
+  void onWrite(NimBLECharacteristic* pCharacteristic) {
+    Serial.println("🔵 [BLE] FF05 - onWrite llamado");
+    Serial.printf("🔵 [BLE] FF05 - Auth: %d, Permisos: 0x%02X, NETWORK_CONFIG: 0x%02X\n", 
+                  bleAuthenticated, bleCurrentPermissions, BLE_PERM_NETWORK_CONFIG);
+    
+    if (!bleAuthenticated) {
+      Serial.println("🔵 [BLE] FF05 - ERROR: No autenticado");
+      String err = "ERROR:NOT_AUTHENTICATED";
+      pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+      pCharacteristic->notify();
+      return;
+    }
+    
+    if (!(bleCurrentPermissions & BLE_PERM_NETWORK_CONFIG)) {
+      Serial.println("🔵 [BLE] FF05 - ERROR: Sin permiso NETWORK_CONFIG");
+      String err = "ERROR:NO_PERMISSION";
+      pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+      pCharacteristic->notify();
+      return;
+    }
+    
+    std::string value = pCharacteristic->getValue();
+    Serial.printf("🔵 [BLE] FF05 - Recibidos %d bytes\n", value.length());
+    
+    if (value.length() >= 17) {
+      // Parsear datos binarios
+      bool newDhcp = (value[0] != 0);  // 0 = IP fija, != 0 = DHCP
+      
+      Serial.printf("🔵 [BLE] FF05 - Byte DHCP: 0x%02X -> %s\n", 
+                    (uint8_t)value[0], newDhcp ? "DHCP" : "IP Fija");
+      
+      // IMPORTANTE: Actualizar las VARIABLES GLOBALES que usa saveConfiguration()
+      useDhcp = newDhcp;
+      staticIP = IPAddress(value[1], value[2], value[3], value[4]);
+      staticGateway = IPAddress(value[5], value[6], value[7], value[8]);
+      staticSubnet = IPAddress(value[9], value[10], value[11], value[12]);
+      staticDns = IPAddress(value[13], value[14], value[15], value[16]);
+      
+      // También actualizar config.* para consistencia
+      config.useDhcp = newDhcp;
+      memcpy(config.ip, value.data() + 1, 4);
+      memcpy(config.gateway, value.data() + 5, 4);
+      memcpy(config.subnet, value.data() + 9, 4);
+      memcpy(config.dns, value.data() + 13, 4);
+      
+      Serial.printf("🔵 [BLE] FF05 - Nueva config: DHCP=%s, IP=%s\n",
+                    useDhcp ? "true" : "false", staticIP.toString().c_str());
+      Serial.printf("🔵 [BLE] FF05 - GW=%s, Mask=%s, DNS=%s\n",
+                    staticGateway.toString().c_str(), 
+                    staticSubnet.toString().c_str(),
+                    staticDns.toString().c_str());
+      
+      saveConfiguration();
+      Serial.println("🔵 [BLE] FF05 - Configuración guardada en EEPROM");
+      
+      Serial.printf("🔵 [BLE] Red configurada: DHCP=%s por %s\n", 
+                    config.useDhcp ? "Sí" : "No", 
+                    bleConnectedUser.c_str());
+      
+      // Responder OK antes del reinicio
+      String ok = "OK:NETWORK_CONFIGURED:RESTARTING";
+      pCharacteristic->setValue((uint8_t*)ok.c_str(), ok.length());
+      pCharacteristic->notify();
+      
+      // Programar reinicio en 2 segundos (para que la respuesta llegue a la App)
+      pendingRestartTime = millis() + 2000;
+      Serial.println("🔵 [BLE] FF05 - Reinicio programado en 2 segundos para aplicar configuración de red");
+    } else {
+      Serial.printf("🔵 [BLE] FF05 - ERROR: Datos insuficientes (%d bytes, necesita 17)\n", value.length());
+      String err = "ERROR:INVALID_DATA";
+      pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+      pCharacteristic->notify();
+    }
+  }
+};
+
+// Callback para información del dispositivo (FF08) - Público, sin autenticación
+class DevInfoCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pCharacteristic) {
+    Serial.println("🔵 [BLE] FF08 - Solicitud de info del dispositivo");
+    
+    // Contar usuarios activos
+    int activeUsers = 0;
+    for (int i = 0; i < BLE_MAX_USERS; i++) {
+      if (bleAuthConfig.user_enabled[i]) activeUsers++;
+    }
+    
+    // Crear JSON usando ArduinoJson para evitar problemas de formato
+    DynamicJsonDocument doc(512);
+    doc["device_type"] = DEVICE_TYPE;
+    doc["serial"] = fixedSerialNumber;
+    doc["firmware_version"] = firmwareVersion;
+    doc["firmware_variant"] = "BLE";
+    doc["protocol_version"] = PROTOCOL_VERSION;
+    
+    JsonObject caps = doc.createNestedObject("capabilities");
+    caps["relays"] = 2;
+    caps["wiegand_inputs"] = 2;
+    caps["digital_inputs"] = 2;
+    caps["ble_users"] = BLE_MAX_USERS;
+    
+    doc["superadmin_registered"] = (bool)bleAuthConfig.superadmin_registered;
+    doc["active_users"] = activeUsers;
+    
+    String output;
+    serializeJson(doc, output);
+    
+    Serial.printf("🔵 [BLE] FF08 - Enviando %d bytes: %s\n", output.length(), output.substring(0, 50).c_str());
+    pCharacteristic->setValue((uint8_t*)output.c_str(), output.length());
+    pCharacteristic->notify();
+  }
+};
+
+// Callback para estado del dispositivo (FF07)
+class StatusCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pCharacteristic) {
+    Serial.println("🔵 [BLE] FF07 - Solicitud de estado");
+    
+    // Crear JSON de estado
+    DynamicJsonDocument doc(256);
+    doc["relay1"] = (bool)digitalRead(RELE1_PIN);
+    doc["relay2"] = (bool)digitalRead(RELE2_PIN);
+    doc["mode"] = config.turnstile.enabled ? "torno" : "normal";
+    doc["auth"] = bleAuthenticated;
+    doc["user"] = bleConnectedUser;
+    doc["eth_connected"] = ethConnected;
+    doc["mqtt_connected"] = mqttClient.connected();
+    
+    String output;
+    serializeJson(doc, output);
+    
+    pCharacteristic->setValue((uint8_t*)output.c_str(), output.length());
+    pCharacteristic->notify();
+    Serial.printf("🔵 [BLE] FF07 actualizado (%d bytes): %s\n", output.length(), output.c_str());
+  }
+};
+
+// Callback para tiempo de relé
+class RelayTimeCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pCharacteristic) {
+    uint32_t durationMs = (uint32_t)(config.releDuration * 1000);
+    pCharacteristic->setValue((uint8_t*)&durationMs, 4);
+  }
+  
+  void onWrite(NimBLECharacteristic* pCharacteristic) {
+    if (!bleAuthenticated || !(bleCurrentPermissions & BLE_PERM_RELAY_CONTROL)) {
+      pCharacteristic->setValue("ERROR:NOT_AUTHORIZED");
+      pCharacteristic->notify();
+      return;
+    }
+    
+    std::string value = pCharacteristic->getValue();
+    if (value.length() >= 4) {
+      uint32_t durationMs = *((uint32_t*)value.data());
+      config.releDuration = durationMs / 1000.0;
+      releDuration = config.releDuration;
+      saveConfiguration();
+      
+      Serial.printf("🔵 [BLE] Tiempo de relé: %.1fs por %s\n", 
+                    releDuration, bleConnectedUser.c_str());
+      pCharacteristic->setValue("OK:RELAY_TIME_SET");
+      pCharacteristic->notify();
+    }
+  }
+};
+
+// =================== FUNCIONES HELPER PARA ACTUALIZAR FF09 y FF0A ===================
+// Estas funciones actualizan los valores de las características BLE
+// Se llaman después de la autenticación y cuando cambia el estado
+
+// Función para enviar datos grandes por BLE usando chunking
+// Protocolo: cada chunk tiene 1 byte de control + datos
+// Byte de control: 0x01 = más chunks, 0x00 = último chunk
+#define BLE_CHUNK_SIZE 236  // 240 - 4 bytes de overhead para control
+
+void sendBLEChunked(NimBLECharacteristic* pChar, const String& data) {
+  int totalLen = data.length();
+  int offset = 0;
+  int chunkNum = 0;
+  int totalChunks = (totalLen + BLE_CHUNK_SIZE - 1) / BLE_CHUNK_SIZE;
+  
+  Serial.printf("🔵 [BLE] Enviando %d bytes en %d chunks\n", totalLen, totalChunks);
+  
+  while (offset < totalLen) {
+    int remaining = totalLen - offset;
+    int chunkLen = (remaining > BLE_CHUNK_SIZE) ? BLE_CHUNK_SIZE : remaining;
+    bool isLast = (offset + chunkLen >= totalLen);
+    
+    // Crear buffer con byte de control
+    // Formato: [flags][chunk_num][total_chunks][data...]
+    // flags: 0x00 = último, 0x01 = más chunks
+    uint8_t buffer[BLE_CHUNK_SIZE + 4];
+    buffer[0] = isLast ? 0x00 : 0x01;  // Flag de continuación
+    buffer[1] = (uint8_t)chunkNum;      // Número de chunk (0-255)
+    buffer[2] = (uint8_t)totalChunks;   // Total de chunks
+    buffer[3] = 0x00;                   // Reservado
+    
+    // Copiar datos
+    memcpy(buffer + 4, data.c_str() + offset, chunkLen);
+    
+    pChar->setValue(buffer, chunkLen + 4);
+    pChar->notify();
+    
+    Serial.printf("🔵 [BLE] Chunk %d/%d: %d bytes, last=%d\n", 
+                  chunkNum + 1, totalChunks, chunkLen, isLast);
+    
+    offset += chunkLen;
+    chunkNum++;
+    
+    // Pausa entre chunks para que el cliente procese
+    if (!isLast) {
+      delay(30);
+    }
+  }
+  
+  Serial.printf("🔵 [BLE] Envío chunked completado\n");
+}
+
+// Función alternativa: enviar datos JSON sin chunking binario
+// Usa terminador \x04 (EOT) para indicar fin de transmisión
+void sendBLEWithEOT(NimBLECharacteristic* pChar, const String& data) {
+  int totalLen = data.length();
+  int offset = 0;
+  int chunkSize = 240;
+  
+  Serial.printf("🔵 [BLE] Enviando %d bytes con EOT\n", totalLen);
+  
+  while (offset < totalLen) {
+    int remaining = totalLen - offset;
+    int chunkLen = (remaining > chunkSize) ? chunkSize : remaining;
+    bool isLast = (offset + chunkLen >= totalLen);
+    
+    String chunk = data.substring(offset, offset + chunkLen);
+    
+    // Añadir EOT al último chunk
+    if (isLast) {
+      chunk += '\x04';  // EOT (End Of Transmission)
+    }
+    
+    pChar->setValue((uint8_t*)chunk.c_str(), chunk.length());
+    pChar->notify();
+    
+    Serial.printf("🔵 [BLE] Chunk: offset=%d, len=%d, last=%d\n", offset, chunkLen, isLast);
+    
+    offset += chunkLen;
+    
+    if (!isLast) {
+      delay(25);
+    }
+  }
+}
+
+void updateFF09Value() {
+  if (pFullInfoChar == nullptr) {
+    Serial.println("🔵 [BLE] FF09 - ERROR: pFullInfoChar es NULL");
+    return;
+  }
+  
+  if (!bleAuthenticated) {
+    String notAuth = "{\"error\":\"NOT_AUTHORIZED\"}";
+    pFullInfoChar->setValue((uint8_t*)notAuth.c_str(), notAuth.length());
+    Serial.println("🔵 [BLE] FF09 - No autenticado");
+    return;
+  }
+  
+  // JSON optimizado con nombres cortos para caber en MTU
+  DynamicJsonDocument doc(512);
+  
+  doc["type"] = DEVICE_TYPE;
+  doc["sn"] = fixedSerialNumber;
+  doc["name"] = deviceName;
+  doc["fw"] = firmwareVersion;
+  
+  // Red (nombres cortos)
+  JsonObject net = doc.createNestedObject("net");
+  net["ip"] = ETH.localIP().toString();
+  net["gw"] = ETH.gatewayIP().toString();
+  net["mask"] = ETH.subnetMask().toString();
+  net["dhcp"] = config.useDhcp;
+  net["eth"] = ethConnected;
+  
+  // Estado (nombres cortos)
+  JsonObject st = doc.createNestedObject("st");
+  st["r1"] = (bool)digitalRead(RELE1_PIN);
+  st["r2"] = (bool)digitalRead(RELE2_PIN);
+  st["dur"] = releDuration;
+  st["mode"] = config.turnstile.enabled ? 1 : 0;
+  st["mqtt"] = mqttClient.connected();
+  
+  // Códigos (nombres cortos)
+  JsonObject cd = doc.createNestedObject("cd");
+  cd["loc"] = (storedCodes != nullptr) ? storedCodes->count : 0;
+  cd["max"] = MAX_CODES;
+  cd["rem"] = (storedRemoteCodes != nullptr) ? storedRemoteCodes->count : 0;
+  
+  doc["up"] = millis() / 1000;
+  
+  String output;
+  serializeJson(doc, output);
+  
+  Serial.printf("🔵 [BLE] FF09 JSON: %d bytes\n", output.length());
+  
+  if (!doc.overflowed()) {
+    // Añadir EOT y enviar
+    if (output.length() <= 230) {
+      output += '\x04';  // EOT marker
+      pFullInfoChar->setValue((uint8_t*)output.c_str(), output.length());
+      pFullInfoChar->notify();
+      Serial.printf("🔵 [BLE] FF09 enviado con EOT (%d bytes)\n", output.length());
+    } else {
+      // Si es muy grande, usar chunking con EOT
+      sendBLEWithEOT(pFullInfoChar, output);
+    }
+  } else {
+    String overflow = "{\"error\":\"JSON_OVERFLOW\"}";
+    pFullInfoChar->setValue((uint8_t*)overflow.c_str(), overflow.length());
+    Serial.println("🔵 [BLE] FF09 - ERROR: JSON overflow");
+  }
+}
+
+void updateFF0AValue(int page) {
+  if (pCodesChar == nullptr) {
+    Serial.println("🔵 [BLE] FF0A - ERROR: pCodesChar es NULL");
+    return;
+  }
+  
+  if (!bleAuthenticated) {
+    String notAuth = "{\"error\":\"NOT_AUTHORIZED\"}";
+    pCodesChar->setValue((uint8_t*)notAuth.c_str(), notAuth.length());
+    Serial.println("🔵 [BLE] FF0A - No autenticado");
+    return;
+  }
+  
+  // Página muy pequeña (3 códigos) para garantizar que quepa en MTU
+  DynamicJsonDocument doc(512);
+  int totalCodes = (storedCodes != nullptr) ? storedCodes->count : 0;
+  int pageSize = 3;  // Solo 3 códigos por página (~180 bytes max)
+  int startIdx = page * pageSize;
+  int endIdx = min(startIdx + pageSize, totalCodes);
+  int totalPages = (totalCodes > 0) ? ((totalCodes + pageSize - 1) / pageSize) : 1;
+  
+  // JSON compacto con nombres cortos
+  doc["n"] = totalCodes;        // count total
+  doc["m"] = MAX_CODES;         // max
+  doc["p"] = page;              // page actual
+  doc["ps"] = pageSize;         // page size
+  doc["tp"] = totalPages;       // total pages
+  doc["more"] = (endIdx < totalCodes);
+  
+  JsonArray arr = doc.createNestedArray("c");  // codes array
+  if (storedCodes != nullptr) {
+    for (int i = startIdx; i < endIdx; i++) {
+      JsonObject c = arr.createNestedObject();
+      c["i"] = i;
+      c["t"] = storedCodes->codes[i].type;
+      c["v"] = storedCodes->codes[i].value;
+      c["k"] = storedCodes->codes[i].keyboard_id;
+      c["r"] = storedCodes->codes[i].relay;
+    }
+  }
+  
+  String output;
+  serializeJson(doc, output);
+  
+  Serial.printf("🔵 [BLE] FF0A JSON: %d bytes (página %d/%d)\n", output.length(), page, totalPages);
+  
+  if (!doc.overflowed()) {
+    // Usar EOT para indicar fin de transmisión
+    if (output.length() <= 230) {
+      // Cabe en un solo NOTIFY - añadir EOT
+      output += '\x04';  // EOT marker
+      pCodesChar->setValue((uint8_t*)output.c_str(), output.length());
+      pCodesChar->notify();
+      Serial.printf("🔵 [BLE] FF0A enviado con EOT (%d bytes)\n", output.length());
+    } else {
+      // Necesita chunking con EOT
+      sendBLEWithEOT(pCodesChar, output);
+    }
+  } else {
+    String overflow = "{\"error\":\"JSON_OVERFLOW\"}";
+    pCodesChar->setValue((uint8_t*)overflow.c_str(), overflow.length());
+    Serial.println("🔵 [BLE] FF0A - ERROR: JSON overflow");
+  }
+}
+
+// Callback para información completa del dispositivo (FF09)
+class FullInfoCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pCharacteristic) {
+    Serial.println("🔵 [BLE] FF09 - Solicitud de configuración completa");
+    updateFF09Value();  // Actualizar antes de que se lea
+  }
+};
+
+// Callback para lista de códigos locales (FF0A)
+class CodesCharCallbacks: public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pCharacteristic) {
+    Serial.println("🔵 [BLE] FF0A - Solicitud de lista de códigos");
+    updateFF0AValue(0);  // Actualizar antes de que se lea
+  }
+  
+  void onWrite(NimBLECharacteristic* pCharacteristic) {
+    Serial.println("🔵 [BLE] FF0A - Solicitud de página específica");
+    
+    if (!bleAuthenticated) {
+      String err = "{\"error\":\"NOT_AUTHORIZED\"}";
+      pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+      pCharacteristic->notify();
+      return;
+    }
+    
+    std::string value = pCharacteristic->getValue();
+    if (value.length() == 0) {
+      String err = "{\"error\":\"EMPTY_REQUEST\"}";
+      pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+      pCharacteristic->notify();
+      return;
+    }
+    
+    DynamicJsonDocument reqDoc(128);
+    DeserializationError error = deserializeJson(reqDoc, value.c_str());
+    
+    if (error) {
+      String err = "{\"error\":\"INVALID_JSON\"}";
+      pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+      pCharacteristic->notify();
+      return;
+    }
+    
+    if (!reqDoc.containsKey("page")) {
+      String err = "{\"error\":\"MISSING_PAGE\"}";
+      pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+      pCharacteristic->notify();
+      return;
+    }
+    
+    int page = reqDoc["page"].as<int>();
+    int totalCodes = (storedCodes != nullptr) ? storedCodes->count : 0;
+    int pageSize = 3;  // Reducido para caber en MTU
+    int totalPages = (totalCodes > 0) ? ((totalCodes + pageSize - 1) / pageSize) : 1;
+    int startIdx = page * pageSize;
+    int endIdx = min(startIdx + pageSize, totalCodes);
+    
+    // Validar página (permitir página 0 siempre)
+    if (page < 0 || (page > 0 && startIdx >= totalCodes)) {
+      String err = "{\"error\":\"INVALID_PAGE\"}";
+      pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+      pCharacteristic->notify();
+      Serial.printf("🔵 [BLE] FF0A - Error: Página %d inválida (total: %d)\n", page, totalPages);
+      return;
+    }
+    
+    // JSON compacto con nombres cortos
+    DynamicJsonDocument doc(512);
+    doc["n"] = totalCodes;        // count
+    doc["m"] = MAX_CODES;         // max
+    doc["p"] = page;              // page
+    doc["ps"] = pageSize;         // page size
+    doc["tp"] = totalPages;       // total pages
+    doc["more"] = (endIdx < totalCodes);
+    
+    JsonArray arr = doc.createNestedArray("c");  // codes
+    if (storedCodes != nullptr) {
+      for (int i = startIdx; i < endIdx; i++) {
+        JsonObject c = arr.createNestedObject();
+        c["i"] = i;
+        c["t"] = storedCodes->codes[i].type;
+        c["v"] = storedCodes->codes[i].value;
+        c["k"] = storedCodes->codes[i].keyboard_id;
+        c["r"] = storedCodes->codes[i].relay;
+      }
+    }
+    
+    String output;
+    serializeJson(doc, output);
+    
+    if (doc.overflowed()) {
+      String err = "{\"error\":\"JSON_OVERFLOW\"}";
+      pCharacteristic->setValue((uint8_t*)err.c_str(), err.length());
+      pCharacteristic->notify();
+      return;
+    }
+    
+    // Añadir EOT y enviar
+    output += '\x04';  // EOT marker
+    pCharacteristic->setValue((uint8_t*)output.c_str(), output.length());
+    pCharacteristic->notify();
+    
+    Serial.printf("🔵 [BLE] FF0A página %d/%d enviada con EOT (%d bytes)\n", page, totalPages, output.length());
+  }
+};
+
+// Inicializar servidor BLE
+void initBLE() {
+  Serial.println("\n🔵 =================== INICIALIZANDO BLE ===================");
+
+  // v4.1: Cargar clave maestra del dispositivo para HKDF
+  loadDeviceKeyConfig();
+  
+  // Cargar configuración de autenticación
+  loadBLEAuthConfig();
+  
+  // Inicializar NimBLE con el número de serie completo para fácil identificación
+  // El serial ya tiene formato SWATID_XXXXXXXXXXXX (19 chars), cabe en límite BLE de 29 chars
+  String bleName = fixedSerialNumber;
+  NimBLEDevice::init(bleName.c_str());
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9); // Máxima potencia
+  
+  Serial.printf("🔵 [BLE] Nombre del dispositivo: %s\n", bleName.c_str());
+  
+  // Crear servidor
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new SWATIDServerCallbacks());
+  
+  // Crear servicio
+  NimBLEService* pService = pServer->createService(SERVICE_UUID);
+  
+  // Característica de autenticación
+  pAuthChar = pService->createCharacteristic(
+    CHAR_AUTH_UUID,
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY
+  );
+  pAuthChar->setCallbacks(new AuthCharCallbacks());
+  
+  // Característica de control de relés
+  // WRITE_NR añadido para soportar writeWithoutResponse de la App
+  pRelayChar = pService->createCharacteristic(
+    CHAR_RELAY_UUID,
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
+  );
+  pRelayChar->setCallbacks(new RelayCharCallbacks());
+
+  // Característica de modo
+  // WRITE_NR añadido para soportar writeWithoutResponse de la App
+  pModeChar = pService->createCharacteristic(
+    CHAR_MODE_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
+  );
+  pModeChar->setCallbacks(new ModeCharCallbacks());
+
+  // Característica para añadir códigos
+  // WRITE_NR añadido para soportar writeWithoutResponse de la App
+  pAddCodeChar = pService->createCharacteristic(
+    CHAR_ADDCODE_UUID,
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
+  );
+  pAddCodeChar->setCallbacks(new AddCodeCharCallbacks());
+
+  // Característica de configuración de red
+  // WRITE_NR añadido para soportar writeWithoutResponse de la App
+  pNetworkChar = pService->createCharacteristic(
+    CHAR_NETWORK_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
+  );
+  pNetworkChar->setCallbacks(new NetworkCharCallbacks());
+
+  // Característica de tiempo de relé
+  // WRITE_NR añadido para soportar writeWithoutResponse de la App
+  pRelayTimeChar = pService->createCharacteristic(
+    CHAR_RELAYTIME_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
+  );
+  pRelayTimeChar->setCallbacks(new RelayTimeCharCallbacks());
+  
+  // Característica de estado (FF07) - Solo lectura con notify
+  pStatusChar = pService->createCharacteristic(
+    CHAR_STATUS_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+  pStatusChar->setCallbacks(new StatusCharCallbacks());
+  // Valor inicial de FF07
+  String ff07Init = "{\"relay1\":false,\"relay2\":false,\"mode\":\"normal\",\"auth\":false,\"user\":\"\",\"eth_connected\":false,\"mqtt_connected\":false}";
+  pStatusChar->setValue((uint8_t*)ff07Init.c_str(), ff07Init.length());
+  Serial.printf("🔵 [BLE] FF07 inicializado con %d bytes\n", ff07Init.length());
+  
+  // Característica de información del dispositivo (FF08) - Provisión automática
+  // Esta característica permite a la APP identificar automáticamente el tipo
+  // de dispositivo, versión de firmware y capacidades SIN necesidad de autenticarse
+  pDevInfoChar = pService->createCharacteristic(
+    CHAR_DEVINFO_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+  pDevInfoChar->setCallbacks(new DevInfoCharCallbacks());
+
+  // Establecer valor inicial de información del dispositivo
+  int activeUsers = 0;
+  for (int i = 0; i < BLE_MAX_USERS; i++) {
+    if (bleAuthConfig.user_enabled[i]) activeUsers++;
+  }
+
+  String devInfo = String("{") +
+    "\"device_type\":\"" + DEVICE_TYPE + "\"," +
+    "\"serial\":\"" + fixedSerialNumber + "\"," +
+    "\"firmware_version\":\"" + firmwareVersion + "\"," +
+    "\"firmware_variant\":\"BLE\"," +
+    "\"protocol_version\":" + PROTOCOL_VERSION + "," +
+    "\"capabilities\":{" +
+      "\"relays\":2," +
+      "\"wiegand_inputs\":2," +
+      "\"digital_inputs\":2," +
+      "\"ble_users\":" + BLE_MAX_USERS +
+    "}," +
+    "\"superadmin_registered\":" + (bleAuthConfig.superadmin_registered ? "true" : "false") +
+  "}";
+  pDevInfoChar->setValue((uint8_t*)devInfo.c_str(), devInfo.length());
+  Serial.printf("🔵 [BLE] FF08 inicializado con %d bytes\n", devInfo.length());
+
+  // Característica de información completa (FF09) - Requiere autenticación
+  // IMPORTANTE: NOTIFY es necesario para enviar datos actualizados
+  pFullInfoChar = pService->createCharacteristic(
+    CHAR_FULLINFO_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+  pFullInfoChar->setCallbacks(new FullInfoCharCallbacks());
+  String ff09Init = "{\"error\":\"NOT_AUTHORIZED\"}";
+  pFullInfoChar->setValue((uint8_t*)ff09Init.c_str(), ff09Init.length());
+  Serial.printf("🔵 [BLE] FF09 inicializado con %d bytes\n", ff09Init.length());
+
+  // Característica de códigos locales (FF0A) - Requiere autenticación
+  // WRITE_NR añadido para soportar writeWithoutResponse de la App
+  pCodesChar = pService->createCharacteristic(
+    CHAR_CODES_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
+  );
+  pCodesChar->setCallbacks(new CodesCharCallbacks());
+  String ff0aInit = "{\"error\":\"NOT_AUTHORIZED\"}";
+  pCodesChar->setValue((uint8_t*)ff0aInit.c_str(), ff0aInit.length());
+  Serial.printf("🔵 [BLE] FF0A inicializado con %d bytes\n", ff0aInit.length());
+
+  // =================== v4.1: Característica de Challenge (FF0B) ===================
+  // Esta característica permite autenticación segura sin transmitir la clave
+  // Flujo: 1) APP lee FF0B -> obtiene nonce 16 bytes
+  //        2) APP calcula SHA256(key + nonce) 
+  //        3) APP envía response (32 bytes) a FF01
+  //        4) Dispositivo verifica y devuelve token de sesión
+  pChallengeChar = pService->createCharacteristic(
+    CHAR_CHALLENGE_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+  pChallengeChar->setCallbacks(new ChallengeCharCallbacks());
+  
+  // Valor inicial vacío (se genera al leer)
+  uint8_t emptyChallenge[16] = {0};
+  pChallengeChar->setValue(emptyChallenge, 16);
+  Serial.println("🔐 [BLE] FF0B (Challenge) inicializado - Auth seguro v4.1 habilitado");
+
+  // Iniciar servicio
+  pService->start();
+  
+  // Configurar advertising
+  NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMaxPreferred(0x12);
+  pAdvertising->start();
+  
+  Serial.printf("🔵 [BLE] Servidor iniciado: %s\n", bleName.c_str());
+  Serial.println("🔵 [BLE] Esperando conexiones...");
+  Serial.println("🔵 ==========================================================\n");
+}
+
+// Actualizar estado BLE (llamar desde loop)
+void updateBLEStatus() {
+  if (pStatusChar != nullptr) {
+    // Crear JSON de estado usando ArduinoJson
+    DynamicJsonDocument doc(256);
+    doc["relay1"] = (bool)digitalRead(RELE1_PIN);
+    doc["relay2"] = (bool)digitalRead(RELE2_PIN);
+    doc["mode"] = config.turnstile.enabled ? "torno" : "normal";
+    doc["auth"] = bleAuthenticated;
+    doc["user"] = bleConnectedUser;
+    doc["eth_connected"] = ethConnected;
+    doc["mqtt_connected"] = mqttClient.connected();
+    
+    String output;
+    serializeJson(doc, output);
+    
+    // Usar setValue con longitud explícita
+    pStatusChar->setValue((uint8_t*)output.c_str(), output.length());
+    // No llamamos notify() aquí porque se llama desde loop constantemente
+    // Solo notificamos cuando hay cambios significativos
+  }
+}
+
+// Actualizar información del dispositivo BLE (FF08) - Para provisión automática
+void updateBLEDeviceInfo() {
+  if (pDevInfoChar != nullptr) {
+    int activeUsers = 0;
+    for (int i = 0; i < BLE_MAX_USERS; i++) {
+      if (bleAuthConfig.user_enabled[i]) activeUsers++;
+    }
+    
+    DynamicJsonDocument doc(512);
+    doc["device_type"] = DEVICE_TYPE;
+    doc["serial"] = fixedSerialNumber;
+    doc["firmware_version"] = firmwareVersion;
+    doc["firmware_variant"] = "BLE";
+    doc["protocol_version"] = PROTOCOL_VERSION;
+    
+    JsonObject caps = doc.createNestedObject("capabilities");
+    caps["relays"] = 2;
+    caps["wiegand_inputs"] = 2;
+    caps["digital_inputs"] = 2;
+    caps["ble_users"] = BLE_MAX_USERS;
+    
+    doc["superadmin_registered"] = (bool)bleAuthConfig.superadmin_registered;
+    doc["active_users"] = activeUsers;
+    
+    String output;
+    serializeJson(doc, output);
+    
+    pDevInfoChar->setValue((uint8_t*)output.c_str(), output.length());
+    Serial.printf("🔵 [BLE] FF08 actualizado: %d bytes\n", output.length());
+  }
+}
+
+#endif // ENABLE_BLE
+
+// =================== FUNCIÓN SETUP ===================
+void setup() {
    Serial.begin(115200);
    delay(1000);
    
    Serial.println("\n╔══════════════════════════════════════════════════════════════╗");
    Serial.println("║                    KC868-A2 DUAL WIEGAND                    ║");
-   Serial.println("║                  Firmware v2.5.0                  ║");
+#ifdef ENABLE_BLE
+   Serial.println("║                   Firmware v4.0.0 (BLE)                     ║");
+   Serial.println("║         + Entradas Digitales + Servidor BLE                 ║");
+#else
+   Serial.println("║                   Firmware v3.0.2 (EEPROM)                  ║");
+   Serial.println("║              + Entradas Digitales DI1/DI2                   ║");
+#endif
    Serial.println("╚══════════════════════════════════════════════════════════════╝");
    
    // Inicializar RS-485 para compatibilidad
@@ -6108,17 +9023,95 @@ void handleCodes() {
    Serial.printf("   RS485: GPIO%d/%d (Compatibilidad)\n", RS485_RX2, RS485_TX2);
    Serial.printf("   Relés: R1=GPIO%d, R2=GPIO%d\n", RELE1_PIN, RELE2_PIN);
    
-  EEPROM.begin(10240);  // Aumentado a 10KB para soportar 100 códigos locales + 100 códigos remotos
+  // =================== INICIALIZACIÓN EEPROM ===================
+  Serial.println("\n📦 Inicializando EEPROM...");
+  
+  // Probar diferentes tamaños de EEPROM
+  size_t EEPROM_SIZE = 0;
+  bool eepromOK = false;
+  
+  // Intentar con tamaños decrecientes hasta que funcione
+  size_t sizes[] = {4096, 2048, 1024, 512};
+  for (int i = 0; i < 4 && !eepromOK; i++) {
+    EEPROM_SIZE = sizes[i];
+    Serial.printf("   Probando EEPROM con %d bytes... ", EEPROM_SIZE);
+    
+    if (EEPROM.begin(EEPROM_SIZE)) {
+      // Test de escritura
+      EEPROM.write(0, 0x55);
+      EEPROM.write(EEPROM_SIZE - 1, 0xAA);
+      if (EEPROM.commit()) {
+        uint8_t v1 = EEPROM.read(0);
+        uint8_t v2 = EEPROM.read(EEPROM_SIZE - 1);
+        if (v1 == 0x55 && v2 == 0xAA) {
+          Serial.println("✅ OK");
+          eepromOK = true;
+        } else {
+          Serial.printf("❌ Verificación falló (0x%02X, 0x%02X)\n", v1, v2);
+        }
+      } else {
+        Serial.println("❌ commit() falló");
+      }
+    } else {
+      Serial.println("❌ begin() falló");
+    }
+  }
+  
+  if (!eepromOK) {
+    Serial.println("❌ ERROR CRÍTICO: No se pudo inicializar EEPROM!");
+    Serial.println("   Intentando método alternativo...");
+    
+    // Método alternativo: usar NVS directamente para EEPROM
+    EEPROM_SIZE = 4096;
+    EEPROM.begin(EEPROM_SIZE);
+  }
+  
+  Serial.printf("📦 EEPROM configurada: %d bytes\n", EEPROM_SIZE);
+  
+  // Diagnóstico de EEPROM - Tamaños REALES de estructuras
+  Serial.println("\n🔍 === MAPA DE MEMORIA EEPROM ===");
+  Serial.printf("   Config:        0 - %d (%d bytes)\n", (int)sizeof(Config), (int)sizeof(Config));
+  Serial.printf("   DigitalInput:  %d - %d (%d bytes)\n", 
+                EEPROM_DIGITAL_INPUT_OFFSET, 
+                EEPROM_DIGITAL_INPUT_OFFSET + (int)sizeof(DigitalInputConfig),
+                (int)sizeof(DigitalInputConfig));
+  Serial.printf("   StoredCodes:   %d - %d (%d bytes, max %d códigos)\n", 
+                EEPROM_CODES_OFFSET, 
+                EEPROM_CODES_OFFSET + (int)sizeof(StoredCodes),
+                (int)sizeof(StoredCodes), MAX_CODES);
+  Serial.printf("   RemoteCodes:   %d - %d (%d bytes, max %d códigos)\n", 
+                EEPROM_REMOTE_CODES_OFFSET, 
+                EEPROM_REMOTE_CODES_OFFSET + (int)sizeof(StoredRemoteCodes),
+                (int)sizeof(StoredRemoteCodes), MAX_REMOTE_CODES);
+  Serial.printf("   Total EEPROM:  %d bytes\n", EEPROM_SIZE);
+  
+  // Verificar solapamientos
+  bool overlap = false;
+  if (sizeof(Config) > EEPROM_DIGITAL_INPUT_OFFSET) {
+    Serial.println("   ❌ Config se solapa con DigitalInput!");
+    overlap = true;
+  }
+  if (EEPROM_DIGITAL_INPUT_OFFSET + sizeof(DigitalInputConfig) > EEPROM_CODES_OFFSET) {
+    Serial.println("   ❌ DigitalInput se solapa con StoredCodes!");
+    overlap = true;
+  }
+  if (EEPROM_CODES_OFFSET + sizeof(StoredCodes) > EEPROM_REMOTE_CODES_OFFSET) {
+    Serial.println("   ❌ StoredCodes se solapa con RemoteCodes!");
+    overlap = true;
+  }
+  if (EEPROM_REMOTE_CODES_OFFSET + sizeof(StoredRemoteCodes) > EEPROM_SIZE) {
+    Serial.println("   ❌ RemoteCodes excede EEPROM!");
+    overlap = true;
+  }
+  if (!overlap) {
+    Serial.println("   ✅ Sin solapamientos - OK");
+  }
+  Serial.println("=====================================\n");
+  
   loadConfiguration();
   loadTurnstileConfig();  // Cargar configuración del modo torno
   loadStoredCodes();
   loadStoredRemoteCodes();  // Cargar códigos remotos
-  
-  // Funciones de diagnóstico comentadas para reducir tamaño del firmware
-  // diagnoseEEPROM();
-  // verifyMemoryLayout();
-  // testPersistence();
-  // verifyEEPROMIntegrity();
   
   // =================== INICIALIZACIÓN OTA ===================
   loadOTAConfig();
@@ -6260,7 +9253,13 @@ void handleCodes() {
     Serial.println("📶 AP Config: http://" + ip.toString() + " (SSID: SWATID_CONFIG_*)");
     Serial.println("✅ Códigos locales: Completamente operativos");
   }
-  
+
+#ifdef ENABLE_BLE
+  // Inicializar servidor BLE
+  initBLE();
+  Serial.println("🔵 BLE: Servidor activo y esperando conexiones");
+#endif
+
   Serial.println("═══════════════════════════════════════════════════════════\n");
  }
  
@@ -6268,24 +9267,78 @@ void handleCodes() {
  void loop() {
    unsigned long currentTime = millis();
    
-   // ========== CONEXIÓN MQTT ==========
-   if (!mqttClient.connected() && ethConnected) {
-     static unsigned long lastReconnectAttempt = 0;
-     
-     if (currentTime - lastReconnectAttempt > 5000) {
-       lastReconnectAttempt = currentTime;
-       Serial.println("🔄 Intentando reconexión MQTT...");
-       connectToMqtt();
-     }
-   }
+#ifdef ENABLE_BLE
+  // ========== REINICIO PENDIENTE (para cambios de red BLE) ==========
+  if (pendingRestartTime > 0 && currentTime >= pendingRestartTime) {
+    Serial.println("🔄 [LOOP] Ejecutando reinicio programado para aplicar configuración de red...");
+    delay(100);  // Pequeña pausa para asegurar que los logs se envían
+    ESP.restart();
+  }
+  
+  // ========== PROCESAR CÓDIGO BLE PENDIENTE (FF04) ==========
+  // El guardado en EEPROM se difiere aquí para evitar crashes en el callback BLE
+  if (pendingCode.pending) {
+    pendingCode.pending = false;
+    Serial.println("💾 [LOOP] Guardando código pendiente en EEPROM...");
+    saveStoredCodes();
+    Serial.printf("💾 [LOOP] Código '%s' guardado en EEPROM\n", pendingCode.value);
+    
+    // Publicar evento MQTT
+    if (mqttClient.connected()) {
+      String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/codes";
+      String eventMsg = String("{") +
+        "\"event\":\"CODE_ADDED\"," +
+        "\"source\":\"BLE\"," +
+        "\"user\":\"" + bleConnectedUser + "\"," +
+        "\"code_type\":\"" + String(pendingCode.type) + "\"," +
+        "\"code_value\":\"" + String(pendingCode.value) + "\"," +
+        "\"keyboard\":" + String(pendingCode.keyboard) + "," +
+        "\"relay\":" + String(pendingCode.relay) + "," +
+        "\"total_codes\":" + String(storedCodes->count) + "," +
+        "\"timestamp\":\"" + getTimestamp() + "\"" +
+      "}";
+      mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+    }
+  }
+#endif // ENABLE_BLE
    
-   // Procesar cola MQTT si está conectado
-   if (mqttClient.connected()) {
-     if (!mqttClient.loop()) {
-       Serial.println("❌ Error en mqttClient.loop() - Reintentando conexión");
-       mqttClient.disconnect();
-     }
-   }
+  // ========== CONEXIÓN MQTT (NO BLOQUEANTE) ==========
+  static unsigned long lastReconnectAttempt = 0;
+  static int reconnectBackoff = 5000;  // Backoff exponencial inicial 5s
+  
+  // Procesar conexión pendiente desde callback ETH
+  if (mqttConnectionPending && ethConnected) {
+    mqttConnectionPending = false;
+    Serial.println("📡 Procesando conexión MQTT pendiente...");
+    connectToMqtt();
+    lastReconnectAttempt = currentTime;
+    reconnectBackoff = 5000;  // Reset backoff
+  }
+  
+  // Reconexión MQTT con backoff exponencial
+  if (!mqttClient.connected() && ethConnected && !mqttConnectionPending) {
+    if (currentTime - lastReconnectAttempt > reconnectBackoff) {
+      lastReconnectAttempt = currentTime;
+      Serial.printf("🔄 Reconexión MQTT (backoff: %ds)...\n", reconnectBackoff/1000);
+      connectToMqtt();
+      
+      // Backoff exponencial: 5s -> 10s -> 20s -> 30s (max)
+      if (!mqttClient.connected()) {
+        reconnectBackoff = min(reconnectBackoff * 2, 30000);
+      } else {
+        reconnectBackoff = 5000;  // Reset en conexión exitosa
+      }
+    }
+  }
+  
+  // Procesar cola MQTT si está conectado (no bloqueante)
+  if (mqttClient.connected()) {
+    if (!mqttClient.loop()) {
+      Serial.println("❌ Error en mqttClient.loop()");
+      mqttClient.disconnect();
+      reconnectBackoff = 5000;  // Reset backoff para reconectar pronto
+    }
+  }
    
   // ========== PROCESAMIENTO DE TECLADOS ==========
   processWiegand1Data();
@@ -6294,10 +9347,10 @@ void handleCodes() {
   
   // ========== PROCESAMIENTO DE ENTRADAS DIGITALES ==========
   processDigitalInput(1, di1State, digitalInputConfig.di1_enabled, 
-                     digitalInputConfig.di1_relay, digitalInputConfig.di1_duration, 
+                     digitalInputConfig.di1_relay, digitalInputConfig.di1_duration_ms, 
                      digitalInputConfig.di1_inverse);
   processDigitalInput(2, di2State, digitalInputConfig.di2_enabled,
-                     digitalInputConfig.di2_relay, digitalInputConfig.di2_duration,
+                     digitalInputConfig.di2_relay, digitalInputConfig.di2_duration_ms,
                      digitalInputConfig.di2_inverse);
   
   // ========== VERIFICACIÓN DE TIMEOUT DEL MODO TORNO ==========
@@ -6325,6 +9378,45 @@ void handleCodes() {
    
   // ========== CONTROL DE RELÉS ==========
   checkRelayTimeout();
+  
+#ifdef ENABLE_BLE
+  // ========== ACTUALIZACIÓN DE ESTADO BLE ==========
+  static unsigned long lastBLEStatusUpdate = 0;
+  if (currentTime - lastBLEStatusUpdate > 1000) { // Cada segundo
+    lastBLEStatusUpdate = currentTime;
+    if (bleDeviceConnected) {
+      updateBLEStatus();
+    }
+  }
+  
+  // ========== TIMEOUT DE AUTENTICACIÓN BLE ==========
+  // Si hay un dispositivo conectado pero no autenticado, desconectarlo tras timeout
+  if (bleDeviceConnected && !bleAuthenticated && bleConnectionTime > 0) {
+    if (currentTime - bleConnectionTime > BLE_AUTH_TIMEOUT_MS) {
+      Serial.println("⚠️ [BLE] TIMEOUT DE AUTENTICACIÓN - Desconectando dispositivo no autenticado");
+      Serial.printf("⚠️ [BLE] Tiempo conectado sin autenticar: %lu ms\n", currentTime - bleConnectionTime);
+      
+      // Publicar evento de timeout
+      if (mqttClient.connected()) {
+        String eventTopic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+        String eventMsg = String("{") +
+          "\"event\":\"AUTH_TIMEOUT\"," +
+          "\"device\":\"" + fixedSerialNumber + "\"," +
+          "\"reason\":\"no_authentication_received\"," +
+          "\"timeout_ms\":" + String(BLE_AUTH_TIMEOUT_MS) + "," +
+          "\"timestamp\":\"" + getTimestamp() + "\"" +
+        "}";
+        mqttClient.publish(eventTopic.c_str(), eventMsg.c_str());
+      }
+      
+      // Desconectar el cliente
+      if (pServer != nullptr) {
+        pServer->disconnect(0);
+      }
+      bleConnectionTime = 0;
+    }
+  }
+#endif
   
   // ========== VERIFICACIÓN DE ACTUALIZACIONES OTA ==========
   if (otaConfig.autoUpdateEnabled && 
@@ -7104,7 +10196,6 @@ void handleRemoteCodesDeleteAll() {
 // =================== FUNCIONES PARA CÓDIGOS REMOTOS ===================
 
 void loadStoredRemoteCodes() {
-  // Inicializar puntero si es necesario
   if (storedRemoteCodes == nullptr) {
     initializeStoredRemoteCodes();
   }
@@ -7116,7 +10207,6 @@ void loadStoredRemoteCodes() {
   
   EEPROM.get(EEPROM_REMOTE_CODES_OFFSET, *storedRemoteCodes);
   
-  // Verificar si los datos son válidos
   if (storedRemoteCodes->validMarker != 0xDEADBEEF || storedRemoteCodes->version != 1) {
     Serial.println("📦 Inicializando códigos remotos por primera vez");
     storedRemoteCodes->validMarker = 0xDEADBEEF;

@@ -1,10 +1,10 @@
 {
   "version": "3.0.0",
-  "release_date": "2025-12-11",
+  "release_date": "2026-01-12",
   "firmware": {
     "file": "SWATID-A2_v3.0.0.bin",
-    "size": 1185949,
-    "sha256": "51c136fd184ac9b09eb95f299d6eed4b8858b2950928270cd01d371488caa469",
+    "size": 1208640,
+    "sha256": "e5dacfea054dbd10f1013a7910819222587ed3e42ceec7b964b49a1d559c52a6",
     "url": "https://your-server.com/firmware/SWATID-A2_v3.0.0.bin"
   },
   "changelog": {

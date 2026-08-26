@@ -1,0 +1,44 @@
+---
+description: Docs por rama en docs/<rama>/; referencia estable e histórico en docs/00 - docref/
+alwaysApply: true
+---
+
+# Documentación del proyecto (`docs/`)
+
+## Por rama (obligatorio)
+
+Al **crear o trabajar una rama Git nueva**:
+
+1. Crear `docs/<nombre-rama>/` (mismo nombre que la rama).
+2. Incluir `docs/<nombre-rama>/README.md` con alcance, contexto, índice y enlaces.
+3. Actualizar el listado de ramas en `docs/README.md`.
+
+```
+docs/
+├── README.md                 # Índice general + listado de ramas
+├── 00 - docref/              # Referencia, versiones, archivo, sketches, csv
+└── v4.1.0/
+    ├── README.md
+    └── ...
+```
+
+## Referencia e histórico (`00 - docref`)
+
+| Subcarpeta | Uso |
+|------------|-----|
+| `referencia/` | Guías vigentes (hardware, API, MQTT, compilación, integración, OTA…) |
+| `versiones/` | Release notes / README de firmware (no binarios) |
+| `archivo/` | Histórico (mejoras, análisis, notas sueltas) |
+| `sketches/` | Sketches Arduino / versiones previas |
+| `csv/` | CSV de prueba |
+
+- Documentación **atemporal o compartida** → `docs/00 - docref/referencia/` (o `versiones/` si es release).
+- Documentación **del alcance de una rama** → `docs/<rama>/`.
+- Binarios → `firmware/` (solo `.bin`, `.sha256`, `manifest*.json`).
+
+## Qué no hacer
+
+- No dejar una rama sin `docs/<rama>/README.md`.
+- No mezclar histórico en `referencia/` (usar `archivo/`).
+- No guardar release notes solo en `firmware/` (van a `00 - docref/versiones/`).
+- No documentar solo en el chat: el alcance debe quedar en `/docs`.

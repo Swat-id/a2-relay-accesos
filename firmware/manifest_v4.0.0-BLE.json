@@ -1,0 +1,31 @@
+{
+  "name": "SWATID-A2",
+  "version": "4.0.0-BLE",
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        {
+          "path": "SWATID-A2_v4.0.0-BLE.bin",
+          "offset": 65536
+        }
+      ]
+    }
+  ],
+  "release_date": "2026-02-26",
+  "release_notes": [
+    "Servidor BLE para configuración desde APP móvil",
+    "Sistema de autenticación con superadmin + 5 usuarios",
+    "Control de relés, modo, códigos y red vía BLE",
+    "Características FF01-FF0A para gestión completa",
+    "FF09: Información completa del dispositivo (IP, red, estado)",
+    "FF0A: Lista de códigos locales con paginación",
+    "Provisión automática de dispositivo (FF08)",
+    "Eventos MQTT para desvinculación BLE",
+    "Documentación completa de protocolos"
+  ],
+  "sha256": "92792ec9ef9dce1311468bc2be9ed7355bd70c9a2c256427082e6b4a339b9986",
+  "size": 1474032,
+  "min_version": "3.0.0",
+  "changelog_url": "https://github.com/swat-id/KC868-A2/blob/main/firmware/RELEASE_NOTES_v4.0.0-BLE.md"
+}

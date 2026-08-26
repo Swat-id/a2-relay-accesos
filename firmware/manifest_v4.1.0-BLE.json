@@ -1,0 +1,48 @@
+{
+  "name": "SWATID-A2",
+  "version": "4.1.0-BLE",
+  "version_code": 41000,
+  "release_date": "2026-02-05",
+  "min_hardware_version": "1.0",
+  "description": "Firmware v4.1.0 con seguridad BLE mejorada (Challenge-Response, HKDF)",
+  "changelog": [
+    "Challenge-Response para autenticación BLE segura",
+    "Token de sesión BLE con timeout de 5 minutos",
+    "Derivación segura de claves MQTT con HKDF",
+    "Clave maestra del dispositivo de 32 bytes",
+    "Nueva característica BLE FF0B (Challenge)",
+    "Compatibilidad con modo legado v4.0"
+  ],
+  "files": {
+    "binary": "SWATID-A2_v4.1.0-BLE.bin",
+    "checksum": "SWATID-A2_v4.1.0-BLE.sha256"
+  },
+  "size_bytes": 1503008,
+  "sha256": "d1cd7cb29c23b2307f5beb65099a7824d003a62bfdc23c6753bfa2b4c6c0a56a",
+  "features": {
+    "ble": true,
+    "challenge_response": true,
+    "hkdf": true,
+    "session_token": true,
+    "dual_wiegand": true,
+    "ethernet": true,
+    "mqtt": true,
+    "ota": true,
+    "digital_inputs": true
+  },
+  "memory": {
+    "flash_used": 1497229,
+    "flash_total": 1966080,
+    "flash_percent": 76.2,
+    "ram_used": 59992,
+    "ram_total": 327680,
+    "ram_percent": 18.3
+  },
+  "security": {
+    "ble_auth": "challenge_response",
+    "ble_legacy_support": true,
+    "mqtt_user_derivation": "hkdf_sha256",
+    "session_timeout_ms": 300000,
+    "auth_timeout_ms": 30000
+  }
+}

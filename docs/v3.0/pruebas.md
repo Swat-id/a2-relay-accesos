@@ -457,8 +457,8 @@ Para reportar issues encontrados en pruebas:
 
 ## 🔗 Referencias
 
-- [Release Notes](/firmware/RELEASE_NOTES_v3.0.0.md)
-- [README del Firmware](/firmware/README_v3.0.0.md)
+- [Release Notes](../00%20-%20docref/versiones/RELEASE_NOTES_v3.0.0.md)
+- [README del Firmware](../00%20-%20docref/versiones/README_v3.0.0.md)
 - [Contexto de Desarrollo](/docs/v3.0/contexto-desarrollo.md)
 - [Manual Completo](/docs/Manual_Completo_Coms.md)
 

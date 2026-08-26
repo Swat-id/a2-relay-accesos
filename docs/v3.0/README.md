@@ -239,7 +239,7 @@ Para reportar problemas o sugerencias relacionadas con esta rama:
 
 - [Manual Completo](/docs/Manual_Completo_Coms.md)
 - [API MQTT](/docs/api/mqtt-api-reference.md)
-- [Documentación de Hardware](/docs/hardware/pinout-diagram.md)
+- [Documentación de Hardware](../00%20-%20docref/referencia/hardware/pinout-diagram.md)
 - [Procedimientos de Mantenimiento](/docs/processes/maintenance-procedures.md)
 
 ---

@@ -1018,8 +1018,8 @@ curl -X POST http://192.168.1.100/import/codes \
 ## 📚 Referencias
 
 ### Documentación Técnica
-- [Análisis del Modo Torno](mejoras/analisis-modo-torno.md)
-- [Propuesta de Mejoras](mejoras/propuesta-mejora.md)
+- [Análisis del Modo Torno](../archivo/mejoras/analisis-modo-torno.md)
+- [Propuesta de Mejoras](../archivo/mejoras/propuesta-mejora.md)
 - [API MQTT](api/mqtt-api-reference.md)
 
 ### Configuración de Red

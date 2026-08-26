@@ -1,210 +1,84 @@
 # KC868A2 - Sistema de Control de Acceso Dual Wiegand
 
-## Información General del Proyecto
+## Información general
 
-### Descripción
-El **KC868A2** es un sistema de control de acceso avanzado basado en la placa KinCony KC868-A2 con ESP32, que implementa un controlador de seguridad dual con soporte para dos teclados Wiegand simultáneos, sistema de mensajería MQTT, interfaz web completa y funcionalidades de seguridad avanzadas.
+Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Ethernet LAN8720, OTA y BLE (v4.x).
 
-### Versión del Firmware
-- **Versión**: 3.0.0
-- **Fecha**: 11 de Diciembre, 2025
-- **Estado**: Producción - Estable
+| Campo | Valor |
+|-------|-------|
+| Versión actual | **4.1.0-BLE** — rama `v4.1.0` |
+| Anterior | 4.0.0-BLE |
+| Fecha | Agosto 2026 |
+| Estado | Producción |
 
-### Ramas de Desarrollo
-- **main**: Versión estable en producción
-- **v3.0**: Corrección crítica de validación remota (actual)
-- **Versiones anteriores**: v2.5.x (legacy)
-
-### Características Principales
-
-#### 🔐 Sistema Dual Wiegand
-- **Teclado 1**: GPIO 33/14 (Principal)
-- **Teclado 2**: GPIO 4/16 (Secundario)
-- Soporte simultáneo para ambos teclados
-- Procesamiento independiente de códigos PIN y TAG RFID/NFC
-
-#### 🌐 Conectividad
-- **Ethernet**: PHY LAN8720 con soporte DHCP/IP estática
-- **MQTT**: Broker remoto con autenticación
-- **Web**: Interfaz administrativa completa
-- **RS485**: Compatibilidad con sistemas legacy
-
-#### ⚡ Control de Relés
-- **Relé 1**: GPIO 15
-- **Relé 2**: GPIO 2
-- Temporización individual configurable
-- Control remoto vía MQTT y web
-
-#### 🔒 Seguridad Avanzada
-- Bloqueo automático tras intentos fallidos
-- Configuración remota de parámetros de seguridad
-- Almacenamiento local de hasta 500 códigos
-- Validación dual (local/remoto)
-
-## Estructura de Documentación
-
-### 📁 Directorios de Documentación
+## Estructura del repositorio (desarrollo)
 
 ```
-docs/
-├── README.md                    # Este archivo - Información general
-├── v3.0/                       # Documentación rama v3.0 (ACTUAL)
-│   ├── README.md               # Información de la rama v3.0
-│   ├── contexto-desarrollo.md  # Contexto y análisis del desarrollo
-│   └── pruebas.md              # Suite completa de pruebas
-├── mejoras/                    # Documentación de mejoras y correcciones
-│   └── correccion-mensaje-granted-v2.5.4.md
-├── web-environment/            # Entorno web y funcionalidades
-│   ├── interface-overview.md
-│   ├── configuration-pages.md
-│   └── security-management.md
-├── messaging/                  # Sistema de mensajería MQTT
-│   ├── mqtt-protocol.md
-│   ├── message-types.md
-│   └── integration-examples.md
-├── processes/                  # Procesos y operativa
-│   ├── system-operations.md
-│   ├── security-processes.md
-│   └── maintenance-procedures.md
-├── api/                       # API completa
-│   ├── mqtt-api-reference.md
-│   ├── web-api-reference.md
-│   └── integration-guides.md
-├── hardware/                  # Hardware y conexiones
-│   ├── pinout-diagram.md
-│   └── ...
-├── security/                  # Seguridad y autenticación
-│   └── access-control.md
-├── analisis/                  # Análisis técnicos
-│   └── ...
-└── OTAA/                      # Over-The-Air Updates
-    └── ...
+01 - CURSOR/
+├── platformio.ini
+├── partitions_ble.csv
+├── src/main.ino                 # Código activo
+├── firmware/                    # .bin, .sha256, manifest*.json
+├── docs/
+│   ├── README.md                # Este índice
+│   ├── 00 - docref/             # Referencia, versiones, archivo, sketches, csv
+│   ├── v3.0/ … v4.1.0/          # Documentación por rama Git
+└── .cursor/rules/
 ```
 
-## Información Técnica
+## Listado de ramas
 
-### Hardware Requerido
-- **Placa**: KinCony KC868-A2
-- **Microcontrolador**: ESP32
-- **Ethernet**: PHY LAN8720
-- **Almacenamiento**: EEPROM 4KB
-- **Conectores**: 2x Wiegand, 2x Relé, 1x RS485
+| Rama | Enfoque | Entorno PIO | Documentación |
+|------|---------|-------------|---------------|
+| `v3.0` | Sin BLE, EEPROM | `esp32dev` | [v3.0/](v3.0/) |
+| `v4.0` | BLE inicial | `esp32dev_ble` | [v4.0/](v4.0/) |
+| `v4.1` | Challenge-Response, HKDF | `esp32dev_ble` | [v4.1/](v4.1/) |
+| **`v4.1.0`** | Dual-build estable | ambos | [v4.1.0/](v4.1.0/) |
 
-### Software Requerido
-- **Build System**: PlatformIO Core 6.1.18+
-- **Plataforma**: Espressif32@5.4.0
-- **Framework**: Arduino ESP32 v2.0.6
-- **Librerías**:
-  - ArduinoJson 6.21.5
-  - PubSubClient 2.8.0
-  - ETH, WiFi, WebServer, Update (incluidas en ESP32)
+Diferencias entre entornos: **[v4.1.0/ENTORNOS_COMPILACION.md](v4.1.0/ENTORNOS_COMPILACION.md)**
 
-### Configuración de Red
-- **Broker MQTT**: 188.245.213.181:1883
-- **Usuario MQTT**: swatidhome
-- **Protocolo**: TCP/IP con autenticación
-- **Puerto Web**: 80
+## Documentación de referencia
 
-## Funcionalidades Implementadas
+Índice completo: **[00 - docref/README.md](00%20-%20docref/README.md)**
 
-### ✅ Completadas (v3.0.0)
-- [x] Sistema dual Wiegand operativo
-- [x] Interfaz web completa
-- [x] Sistema MQTT con autenticación
-- [x] Control de relés con temporización
-- [x] Sistema de seguridad avanzado
-- [x] Almacenamiento de códigos (500 máximo)
-- [x] **Validación local y remota (CORREGIDA v3.0.0)** ✨
-- [x] Modo AP de emergencia
-- [x] Monitoreo de sistema
-- [x] Logging y auditoría mejorada
-- [x] Actualización OTA
+| Área | Ruta |
+|------|------|
+| Compilación | [00 - docref/referencia/compilacion/](00%20-%20docref/referencia/compilacion/) |
+| Integración BLE/MQTT | [00 - docref/referencia/integration/](00%20-%20docref/referencia/integration/) |
+| Mensajería | [00 - docref/referencia/messaging/](00%20-%20docref/referencia/messaging/) |
+| Hardware | [00 - docref/referencia/hardware/](00%20-%20docref/referencia/hardware/) |
+| API | [00 - docref/referencia/api/](00%20-%20docref/referencia/api/) |
+| OTA | [00 - docref/referencia/OTAA/](00%20-%20docref/referencia/OTAA/) |
+| Release notes | [00 - docref/versiones/](00%20-%20docref/versiones/) |
+| Histórico / sketches / CSV | [00 - docref/archivo/](00%20-%20docref/archivo/), [sketches/](00%20-%20docref/sketches/), [csv/](00%20-%20docref/csv/) |
 
-### 🔄 En Desarrollo (v3.1.0)
-- [ ] Optimización de uso de Flash (actualmente 90.5%)
-- [ ] WiFi directo sin AP intermedio
-- [ ] Gestión de múltiples redes WiFi
-- [ ] Tests automatizados
-- [ ] Métricas de telemetría
+## Documentación técnica v4.1
 
-### 🚀 Planificado (v4.0)
-- [ ] Integración con sistemas de videovigilancia
-- [ ] API REST adicional
-- [ ] Sistema de backup automático
-- [ ] Dashboard de monitoreo avanzado
+| Documento | Descripción |
+|-----------|-------------|
+| [v4.1/Firmware_description/](v4.1/Firmware_description/) | BLE, MQTT, EEPROM (detalle firmware) |
+| [BLE_INTEGRATION_GUIDE.md](00%20-%20docref/referencia/integration/BLE_INTEGRATION_GUIDE.md) | App móvil |
+| [MQTT_INTEGRATION_GUIDE.md](00%20-%20docref/referencia/integration/MQTT_INTEGRATION_GUIDE.md) | Backend |
+| [IMPLEMENTATION_CHECKLIST.md](00%20-%20docref/referencia/integration/IMPLEMENTATION_CHECKLIST.md) | Checklist v4.1 |
 
-## Estado del Sistema
+## Compilación
 
-### Conectividad
-- **Ethernet**: ✅ Operativo
-- **MQTT**: ✅ Conectado
-- **Web**: ✅ Accesible
-- **Teclados**: ✅ Ambos operativos
+```bash
+pio run -e esp32dev          # sin BLE (v3.x)
+pio run -e esp32dev_ble      # con BLE (v4.1.x)
+pio run -e esp32dev -e esp32dev_ble
+```
 
-### Seguridad
-- **Acceso Local**: 🔓 Permitido
-- **Intentos Fallidos**: 0/3
-- **Códigos Almacenados**: Variable
-- **Modo Validación**: Configurable
+Manual: [MANUAL_COMPILACION.md](00%20-%20docref/referencia/compilacion/MANUAL_COMPILACION.md)
 
-## Acceso Rápido
+## Hardware y red (resumen)
 
-### Interfaz Web
-- **URL**: http://[IP_DISPOSITIVO]
-- **Usuario**: admin
-- **Contraseña**: admin (cambiar en primera configuración)
-
-### MQTT
-- **Broker**: 188.245.213.181:1883
-- **Usuario**: swatidhome
-- **Contraseña**: Swatid2025!
-
-### Serial Monitor
-- **Baudrate**: 115200
-- **Debug**: Completo con emojis
-- **Logs**: Tiempo real
-
-## Soporte y Mantenimiento
-
-### Monitoreo
-- Estado del sistema cada 30 segundos
-- Keepalive MQTT cada minuto
-- Verificación de memoria automática
-- Logs detallados de eventos
-
-### Mantenimiento
-- Reinicio remoto vía MQTT/web
-- Reset a configuración por defecto
-- Actualización de configuración en caliente
-- Backup automático de códigos
-
-## Contacto y Soporte
-
-Para soporte técnico o consultas sobre el sistema:
-- Revisar documentación completa en subdirectorios
-- Consultar logs del Serial Monitor
-- Verificar conexiones hardware
-- Revisar configuración de red
-
-## 🆕 Novedades en v3.0.0
-
-### Corrección Crítica de Validación Remota
-La versión 3.0.0 resuelve un **bug crítico** que impedía el funcionamiento de la validación remota:
-- ✅ Los relés ahora se abren correctamente cuando el backend aprueba un acceso
-- ✅ Procesamiento correcto de campos `relay_number` y `duration`
-- ✅ Validación de `message_id` entre solicitud y respuesta
-- ✅ Eliminación de código duplicado que causaba errores
-
-**Documentación completa**: [`/docs/v3.0/README.md`](/docs/v3.0/README.md)
-
-### Archivos del Firmware v3.0.0
-- [`firmware/SWATID-A2_v3.0.0.bin`](/firmware/SWATID-A2_v3.0.0.bin) - Firmware compilado
-- [`firmware/README_v3.0.0.md`](/firmware/README_v3.0.0.md) - Documentación técnica
-- [`firmware/RELEASE_NOTES_v3.0.0.md`](/firmware/RELEASE_NOTES_v3.0.0.md) - Notas de la versión
-- [`firmware/manifest_v3.0.0.json`](/firmware/manifest_v3.0.0.json) - Manifest para OTA
+- Placa KC868-A2, ESP32, PHY LAN8720, EEPROM 4 KB
+- MQTT: `188.245.213.181:1883` (usuario `swatidhome`)
+- Web: puerto 80 (admin / admin por defecto — cambiar en producción)
+- Serial: 115200
 
 ---
 
-**Última actualización**: 11 de Diciembre, 2025  
-**Versión del documento**: 2.0  
-**Estado**: Documentación completa - Rama v3.0
+**Última actualización**: 26 Agosto 2026  
+**Versión del documento**: 2.0 (reorganización `00 - docref`)
