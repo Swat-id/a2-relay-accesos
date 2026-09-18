@@ -6,10 +6,11 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 
 | Campo | Valor |
 |-------|-------|
-| Versión actual | **4.1.0-BLE** — rama `v4.1.0` |
+| Versión en desarrollo | **5.0.0** — rama `v5.0.0` (WiFi A2 + 4G A2v3) |
+| Versión estable | **4.1.0-BLE** — rama `v4.1.0` |
 | Anterior | 4.0.0-BLE |
-| Fecha | Agosto 2026 |
-| Estado | Producción |
+| Fecha | Septiembre 2026 |
+| Estado | `v4.1.0` producción · `v5.0.0` planificación |
 
 ## Estructura del repositorio (desarrollo)
 
@@ -23,6 +24,7 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 │   ├── README.md                # Este índice
 │   ├── 00 - docref/             # Referencia, versiones, archivo, sketches, csv
 │   ├── v3.0/ … v4.1.0/          # Documentación por rama Git
+│   └── v5.0.0/                  # Dual-target WiFi + 4G
 └── .cursor/rules/
 ```
 
@@ -33,9 +35,11 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 | `v3.0` | Sin BLE, EEPROM | `esp32dev` | [v3.0/](v3.0/) |
 | `v4.0` | BLE inicial | `esp32dev_ble` | [v4.0/](v4.0/) |
 | `v4.1` | Challenge-Response, HKDF | `esp32dev_ble` | [v4.1/](v4.1/) |
-| **`v4.1.0`** | Dual-build estable | ambos | [v4.1.0/](v4.1.0/) |
+| `v4.1.0` | Dual-build estable | ambos | [v4.1.0/](v4.1.0/) |
+| **`v5.0.0`** | WiFi (A2) + GSM/4G (A2v3) | `esp32dev*` + `esp32dev_s3*` | [v5.0.0/](v5.0.0/) |
 
-Diferencias entre entornos: **[v4.1.0/ENTORNOS_COMPILACION.md](v4.1.0/ENTORNOS_COMPILACION.md)**
+Diferencias entre entornos v4: **[v4.1.0/ENTORNOS_COMPILACION.md](v4.1.0/ENTORNOS_COMPILACION.md)**  
+Plan dual-target v5: **[v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md](v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md)**
 
 ## Documentación de referencia
 
@@ -64,21 +68,22 @@ Diferencias entre entornos: **[v4.1.0/ENTORNOS_COMPILACION.md](v4.1.0/ENTORNOS_C
 ## Compilación
 
 ```bash
-pio run -e esp32dev          # sin BLE (v3.x)
-pio run -e esp32dev_ble      # con BLE (v4.1.x)
-pio run -e esp32dev -e esp32dev_ble
+pio run -e esp32dev          # A2 sin BLE
+pio run -e esp32dev_ble      # A2 con BLE (v4.1.x / base v5)
+# v5 (cuando existan): pio run -e esp32dev_s3
 ```
 
 Manual: [MANUAL_COMPILACION.md](00%20-%20docref/referencia/compilacion/MANUAL_COMPILACION.md)
 
 ## Hardware y red (resumen)
 
-- Placa KC868-A2, ESP32, PHY LAN8720, EEPROM 4 KB
+- **A2:** KC868-A2, ESP32, PHY LAN8720 — [ficha KinCony](https://www.kincony.com/esp32-4g-gps-arduino-relay.html)
+- **A2v3 (v5):** ESP32-S3, W5500, socket SIM7600E — [ficha KinCony](https://www.kincony.com/kincony-kc868-a2v3-esp32-s3-2-channel-relay-module-released.html)
 - MQTT: `188.245.213.181:1883` (usuario `swatidhome`)
 - Web: puerto 80 (admin / admin por defecto — cambiar en producción)
 - Serial: 115200
 
 ---
 
-**Última actualización**: 26 Agosto 2026  
-**Versión del documento**: 2.0 (reorganización `00 - docref`)
+**Última actualización**: 18 Septiembre 2026  
+**Versión del documento**: 2.1 (rama `v5.0.0` + listado)

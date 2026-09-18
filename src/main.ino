@@ -37,6 +37,7 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <EEPROM.h>
+#include <Preferences.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <Update.h>
@@ -87,15 +88,15 @@
 #ifdef ENABLE_BLE
 #define FIRMWARE_VERSION_MAJOR 4
 #define FIRMWARE_VERSION_MINOR 1
-#define FIRMWARE_VERSION_PATCH 0
-const char* firmwareVersion = "v4.1.0";
-const char* firmwareFullVersion = "v4.1.0-BLE";
+#define FIRMWARE_VERSION_PATCH 1
+const char* firmwareVersion = "v4.1.1";
+const char* firmwareFullVersion = "v4.1.1-BLE";
 #else
 #define FIRMWARE_VERSION_MAJOR 3
 #define FIRMWARE_VERSION_MINOR 0
-#define FIRMWARE_VERSION_PATCH 2
-const char* firmwareVersion = "v3.0.2";
-const char* firmwareFullVersion = "v3.0.2-EEPROM";
+#define FIRMWARE_VERSION_PATCH 3
+const char* firmwareVersion = "v3.0.3";
+const char* firmwareFullVersion = "v3.0.3-EEPROM";
 #endif
 #define FIRMWARE_VERSION_BUILD __DATE__ " " __TIME__
 const char* firmwareBuild = FIRMWARE_VERSION_BUILD;
@@ -131,7 +132,10 @@ struct TurnstileConfig {
   uint8_t reserved[5];    // Reservado para futuras extensiones
 };
 
-#define EEPROM_REMOTE_CODES_OFFSET 1800  // Offset en EEPROM para códigos remotos (ajustado para 4KB)
+// Zona EEPROM 1800-3199 reservada (antiguos códigos remotos; desde v0.5 de
+// saneamiento los códigos remotos se persisten en NVS, namespace "a2acc_rc",
+// porque la estructura no cabe en la EEPROM de 4 KB junto a las zonas BLE)
+#define EEPROM_REMOTE_CODES_OFFSET 1800
 
 // Estructura de configuración
 struct Config {
@@ -197,13 +201,19 @@ struct RemoteCodeEntry {
 };
 
 // Estructura para almacenamiento de códigos remotos
-#define MAX_REMOTE_CODES 40    // Ajustado para caber en 4KB EEPROM
+#define MAX_REMOTE_CODES 40
 struct StoredRemoteCodes {
   uint32_t validMarker;
   uint32_t version;
   uint16_t count;
   RemoteCodeEntry codes[MAX_REMOTE_CODES];
 };
+
+// Persistencia de códigos remotos en NVS (no caben en la EEPROM de 4 KB
+// junto a las zonas BLE 3200/3400). Namespace según convención v5 (a2acc_*).
+#define REMOTE_CODES_NVS_NS  "a2acc_rc"
+#define REMOTE_CODES_NVS_KEY "codes"
+Preferences remoteCodesPrefs;
 
 // =================== ESTRUCTURAS DEL MODO TORNO ===================
 struct PendingRequest {
@@ -317,6 +327,21 @@ struct DigitalInputState {
 // DI Config justo después de Config (que termina ~200 bytes)
 #define EEPROM_DIGITAL_INPUT_OFFSET 256
 
+// =================== MAPA EEPROM (verificado en compilación) ===================
+#define EEPROM_TOTAL_SIZE 4096
+// 2 bytes de scratch para el test de arranque: fuera de todas las estructuras
+// (la última zona usada es BLEAuthConfig, que termina en ~3883)
+#define EEPROM_TEST_SCRATCH_OFFSET 4090
+
+static_assert(sizeof(Config) <= EEPROM_DIGITAL_INPUT_OFFSET,
+              "Config se solapa con DigitalInputConfig");
+static_assert(EEPROM_DIGITAL_INPUT_OFFSET + sizeof(DigitalInputConfig) <= EEPROM_CODES_OFFSET,
+              "DigitalInputConfig se solapa con StoredCodes");
+static_assert(EEPROM_CODES_OFFSET + sizeof(StoredCodes) <= EEPROM_REMOTE_CODES_OFFSET,
+              "StoredCodes invade la zona reservada 1800+");
+static_assert(EEPROM_TEST_SCRATCH_OFFSET + 2 <= EEPROM_TOTAL_SIZE,
+              "Scratch de test fuera de la EEPROM");
+
 // =================== CONFIGURACIÓN BLE (v4.0) ===================
 #ifdef ENABLE_BLE
 #define BLE_AUTH_CONFIG_MARKER 0xB1E4C0DE  // Marcador para config BLE (hex válido)
@@ -363,6 +388,13 @@ struct BLEAuthConfig {
   uint32_t checksum;                       // Checksum para integridad
 };
 #pragma pack(pop)
+
+static_assert(EEPROM_DEVICE_KEY_OFFSET >= EEPROM_REMOTE_CODES_OFFSET,
+              "DeviceKeyConfig invade StoredCodes");
+static_assert(EEPROM_DEVICE_KEY_OFFSET + sizeof(DeviceKeyConfig) <= EEPROM_BLE_AUTH_OFFSET,
+              "DeviceKeyConfig se solapa con BLEAuthConfig");
+static_assert(EEPROM_BLE_AUTH_OFFSET + sizeof(BLEAuthConfig) <= EEPROM_TEST_SCRATCH_OFFSET,
+              "BLEAuthConfig invade el scratch de test / fin de EEPROM");
 
 BLEAuthConfig bleAuthConfig;
 bool bleAuthenticated = false;
@@ -460,6 +492,8 @@ DigitalInputState di2State = {false, false, false, 0, false};
 WebServer server(80);
 IPAddress ip;
 bool ethConnected = false;
+bool apModeActive = false;              // AP de emergencia activo
+#define AP_FALLBACK_TIMEOUT_MS 30000    // Sin ETH tras 30 s de arranque → AP
 
 // Declaraciones de funciones del servidor web
 void handleRoot();
@@ -814,8 +848,10 @@ void connectToMqtt() {
      message += (char)payload[i];
    }
    Serial.println(message);
- 
-   DynamicJsonDocument doc(1024);
+
+   // 2048 = mismo tamaño que el buffer de PubSubClient; con 1024 un sync de
+   // códigos remotos con franjas horarias podía descartarse en silencio
+   DynamicJsonDocument doc(2048);
    DeserializationError error = deserializeJson(doc, message);
    if (error) {
      Serial.print("❌ deserializeJson() falló: ");
@@ -6106,23 +6142,25 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
    String macSuffix = fixedSerialNumber.substring(fixedSerialNumber.length() - 6);
    String apSSID = "SWATID_CONFIG_" + macSuffix;
    String apPassword = "12345678";
-   
+
    WiFi.mode(WIFI_AP);
    WiFi.softAP(apSSID.c_str(), apPassword.c_str());
-   
+
    IPAddress apIP(192, 168, 4, 1);
    IPAddress apGateway(192, 168, 4, 1);
    IPAddress apSubnet(255, 255, 255, 0);
    WiFi.softAPConfig(apIP, apGateway, apSubnet);
-   
+
    Serial.printf("📶 SSID: %s\n", apSSID.c_str());
    Serial.printf("📶 Password: %s\n", apPassword.c_str());
    Serial.printf("📶 IP: %s\n", apIP.toString().c_str());
    Serial.println("📶 Conectar a esta red WiFi para configurar");
-   
+
    ip = apIP; // Actualizar IP global
-   setupWebServer();
-   
+   apModeActive = true;
+   // El servidor web ya está arrancado desde setup() (escucha en todas las
+   // interfaces), no hay que reiniciarlo aquí
+
    // Iniciar mDNS para acceso fácil
   if (MDNS.begin(deviceName)) {
     Serial.printf("📶 mDNS: http://%s.local\n", deviceName);
@@ -9004,11 +9042,10 @@ void setup() {
    
    Serial.println("\n╔══════════════════════════════════════════════════════════════╗");
    Serial.println("║                    KC868-A2 DUAL WIEGAND                    ║");
+   Serial.printf("║                   Firmware %-24s     ║\n", firmwareFullVersion);
 #ifdef ENABLE_BLE
-   Serial.println("║                   Firmware v4.0.0 (BLE)                     ║");
    Serial.println("║         + Entradas Digitales + Servidor BLE                 ║");
 #else
-   Serial.println("║                   Firmware v3.0.2 (EEPROM)                  ║");
    Serial.println("║              + Entradas Digitales DI1/DI2                   ║");
 #endif
    Serial.println("╚══════════════════════════════════════════════════════════════╝");
@@ -9024,88 +9061,63 @@ void setup() {
    Serial.printf("   Relés: R1=GPIO%d, R2=GPIO%d\n", RELE1_PIN, RELE2_PIN);
    
   // =================== INICIALIZACIÓN EEPROM ===================
+  // Tamaño fijo: el mapa de memoria requiere 4096 bytes y está verificado
+  // con static_assert en compilación (un tamaño menor rompería silenciosamente
+  // toda la persistencia, así que no hay fallback a tamaños inferiores).
   Serial.println("\n📦 Inicializando EEPROM...");
-  
-  // Probar diferentes tamaños de EEPROM
-  size_t EEPROM_SIZE = 0;
+
   bool eepromOK = false;
-  
-  // Intentar con tamaños decrecientes hasta que funcione
-  size_t sizes[] = {4096, 2048, 1024, 512};
-  for (int i = 0; i < 4 && !eepromOK; i++) {
-    EEPROM_SIZE = sizes[i];
-    Serial.printf("   Probando EEPROM con %d bytes... ", EEPROM_SIZE);
-    
-    if (EEPROM.begin(EEPROM_SIZE)) {
-      // Test de escritura
-      EEPROM.write(0, 0x55);
-      EEPROM.write(EEPROM_SIZE - 1, 0xAA);
-      if (EEPROM.commit()) {
-        uint8_t v1 = EEPROM.read(0);
-        uint8_t v2 = EEPROM.read(EEPROM_SIZE - 1);
-        if (v1 == 0x55 && v2 == 0xAA) {
-          Serial.println("✅ OK");
-          eepromOK = true;
-        } else {
-          Serial.printf("❌ Verificación falló (0x%02X, 0x%02X)\n", v1, v2);
-        }
-      } else {
-        Serial.println("❌ commit() falló");
-      }
-    } else {
-      Serial.println("❌ begin() falló");
+  if (EEPROM.begin(EEPROM_TOTAL_SIZE)) {
+    // Test NO destructivo: usa la zona scratch reservada (fuera de todas las
+    // estructuras) y restaura el contenido original al terminar
+    uint8_t orig0 = EEPROM.read(EEPROM_TEST_SCRATCH_OFFSET);
+    uint8_t orig1 = EEPROM.read(EEPROM_TEST_SCRATCH_OFFSET + 1);
+
+    EEPROM.write(EEPROM_TEST_SCRATCH_OFFSET, 0x55);
+    EEPROM.write(EEPROM_TEST_SCRATCH_OFFSET + 1, 0xAA);
+    if (EEPROM.commit() &&
+        EEPROM.read(EEPROM_TEST_SCRATCH_OFFSET) == 0x55 &&
+        EEPROM.read(EEPROM_TEST_SCRATCH_OFFSET + 1) == 0xAA) {
+      eepromOK = true;
     }
+
+    // Restaurar contenido original de la zona scratch
+    EEPROM.write(EEPROM_TEST_SCRATCH_OFFSET, orig0);
+    EEPROM.write(EEPROM_TEST_SCRATCH_OFFSET + 1, orig1);
+    EEPROM.commit();
   }
-  
-  if (!eepromOK) {
-    Serial.println("❌ ERROR CRÍTICO: No se pudo inicializar EEPROM!");
-    Serial.println("   Intentando método alternativo...");
-    
-    // Método alternativo: usar NVS directamente para EEPROM
-    EEPROM_SIZE = 4096;
-    EEPROM.begin(EEPROM_SIZE);
+
+  if (eepromOK) {
+    Serial.printf("📦 EEPROM configurada: %d bytes ✅\n", EEPROM_TOTAL_SIZE);
+  } else {
+    Serial.println("❌ ERROR CRÍTICO: EEPROM no verificada - la persistencia puede fallar");
   }
-  
-  Serial.printf("📦 EEPROM configurada: %d bytes\n", EEPROM_SIZE);
-  
-  // Diagnóstico de EEPROM - Tamaños REALES de estructuras
+
+  // Mapa de memoria (solapamientos verificados en compilación con static_assert)
   Serial.println("\n🔍 === MAPA DE MEMORIA EEPROM ===");
   Serial.printf("   Config:        0 - %d (%d bytes)\n", (int)sizeof(Config), (int)sizeof(Config));
-  Serial.printf("   DigitalInput:  %d - %d (%d bytes)\n", 
-                EEPROM_DIGITAL_INPUT_OFFSET, 
+  Serial.printf("   DigitalInput:  %d - %d (%d bytes)\n",
+                EEPROM_DIGITAL_INPUT_OFFSET,
                 EEPROM_DIGITAL_INPUT_OFFSET + (int)sizeof(DigitalInputConfig),
                 (int)sizeof(DigitalInputConfig));
-  Serial.printf("   StoredCodes:   %d - %d (%d bytes, max %d códigos)\n", 
-                EEPROM_CODES_OFFSET, 
+  Serial.printf("   StoredCodes:   %d - %d (%d bytes, max %d códigos)\n",
+                EEPROM_CODES_OFFSET,
                 EEPROM_CODES_OFFSET + (int)sizeof(StoredCodes),
                 (int)sizeof(StoredCodes), MAX_CODES);
-  Serial.printf("   RemoteCodes:   %d - %d (%d bytes, max %d códigos)\n", 
-                EEPROM_REMOTE_CODES_OFFSET, 
-                EEPROM_REMOTE_CODES_OFFSET + (int)sizeof(StoredRemoteCodes),
-                (int)sizeof(StoredRemoteCodes), MAX_REMOTE_CODES);
-  Serial.printf("   Total EEPROM:  %d bytes\n", EEPROM_SIZE);
-  
-  // Verificar solapamientos
-  bool overlap = false;
-  if (sizeof(Config) > EEPROM_DIGITAL_INPUT_OFFSET) {
-    Serial.println("   ❌ Config se solapa con DigitalInput!");
-    overlap = true;
-  }
-  if (EEPROM_DIGITAL_INPUT_OFFSET + sizeof(DigitalInputConfig) > EEPROM_CODES_OFFSET) {
-    Serial.println("   ❌ DigitalInput se solapa con StoredCodes!");
-    overlap = true;
-  }
-  if (EEPROM_CODES_OFFSET + sizeof(StoredCodes) > EEPROM_REMOTE_CODES_OFFSET) {
-    Serial.println("   ❌ StoredCodes se solapa con RemoteCodes!");
-    overlap = true;
-  }
-  if (EEPROM_REMOTE_CODES_OFFSET + sizeof(StoredRemoteCodes) > EEPROM_SIZE) {
-    Serial.println("   ❌ RemoteCodes excede EEPROM!");
-    overlap = true;
-  }
-  if (!overlap) {
-    Serial.println("   ✅ Sin solapamientos - OK");
-  }
+  Serial.printf("   RemoteCodes:   NVS \"%s\" (%d bytes, max %d códigos)\n",
+                REMOTE_CODES_NVS_NS, (int)sizeof(StoredRemoteCodes), MAX_REMOTE_CODES);
+#ifdef ENABLE_BLE
+  Serial.printf("   DeviceKey:     %d - %d (%d bytes)\n",
+                EEPROM_DEVICE_KEY_OFFSET,
+                EEPROM_DEVICE_KEY_OFFSET + (int)sizeof(DeviceKeyConfig),
+                (int)sizeof(DeviceKeyConfig));
+  Serial.printf("   BLEAuth:       %d - %d (%d bytes)\n",
+                EEPROM_BLE_AUTH_OFFSET,
+                EEPROM_BLE_AUTH_OFFSET + (int)sizeof(BLEAuthConfig),
+                (int)sizeof(BLEAuthConfig));
+#endif
+  Serial.printf("   Scratch test:  %d - %d\n", EEPROM_TEST_SCRATCH_OFFSET, EEPROM_TEST_SCRATCH_OFFSET + 2);
+  Serial.printf("   Total EEPROM:  %d bytes\n", EEPROM_TOTAL_SIZE);
   Serial.println("=====================================\n");
   
   loadConfiguration();
@@ -9214,27 +9226,14 @@ void setup() {
   }
    
    ETH.setHostname(deviceName);
-   
-   // Esperar conexión Ethernet
-   Serial.println("🌐 Esperando conexión Ethernet (máx 30s)...");
-   unsigned long startTime = millis();
-   while (!ethConnected && (millis() - startTime < 30000)) {
-     delay(500);
-     Serial.print(".");
-     if ((millis() - startTime) % 5000 == 0) {
-       Serial.printf("\n🕐 Esperando... %lu/%lu ms\n", millis() - startTime, 30000UL);
-     }
-   }
-   Serial.println();
-   
-  if (!ethConnected) {
-    Serial.println("❌ No se pudo obtener IP por DHCP");
-    Serial.println("🏠 Iniciando MODO AUTÓNOMO con AP de configuración...");
-    setupAPMode();
-  } else {
-    Serial.printf("✅ Ethernet conectado: %s\n", ip.toString().c_str());
-    setupWebServer();
-  }
+
+  // Arranque NO bloqueante: la red conecta en segundo plano (evento GOT_IP).
+  // El servidor web arranca ya (escucha en todas las interfaces) y la lógica
+  // de accesos queda operativa de inmediato. Si tras AP_FALLBACK_TIMEOUT_MS
+  // no hay Ethernet, el loop() levanta el AP de emergencia.
+  setupWebServer();
+  Serial.println("🌐 Ethernet conectando en segundo plano...");
+  Serial.printf("🌐 Sin red en %d s → AP de emergencia\n", AP_FALLBACK_TIMEOUT_MS / 1000);
    
   Serial.println("\n🎯 SISTEMA DUAL WIEGAND CON SEGURIDAD COMPLETO LISTO");
   Serial.println("═══════════════════════════════════════════════════════════");
@@ -9247,11 +9246,9 @@ void setup() {
   
   if (ethConnected) {
     Serial.println("🌐 Interfaz web: http://" + ip.toString());
-    Serial.println("📡 MQTT: Conectado y operativo");
   } else {
-    Serial.println("🏠 MODO AUTÓNOMO: Funcionando sin conectividad");
-    Serial.println("📶 AP Config: http://" + ip.toString() + " (SSID: SWATID_CONFIG_*)");
-    Serial.println("✅ Códigos locales: Completamente operativos");
+    Serial.println("🌐 Red: conectando en segundo plano (la IP se mostrará al obtenerla)");
+    Serial.println("✅ Códigos locales: operativos desde ya (sin esperar a la red)");
   }
 
 #ifdef ENABLE_BLE
@@ -9266,7 +9263,22 @@ void setup() {
  // =================== FUNCIÓN LOOP PRINCIPAL MEJORADA ===================
  void loop() {
    unsigned long currentTime = millis();
-   
+
+  // ========== FALLBACK AP DE EMERGENCIA (decisión diferida) ==========
+  // Sustituye a la espera bloqueante de 30 s en setup(): la lógica de accesos
+  // corre desde el primer ciclo y el AP solo se levanta si no llegó Ethernet
+  static bool apFallbackDecided = false;
+  if (!apFallbackDecided) {
+    if (ethConnected) {
+      apFallbackDecided = true;  // Hubo red: no hace falta AP
+    } else if (currentTime > AP_FALLBACK_TIMEOUT_MS) {
+      apFallbackDecided = true;
+      Serial.println("❌ Sin Ethernet tras la ventana de arranque");
+      Serial.println("🏠 Iniciando MODO AUTÓNOMO con AP de configuración...");
+      setupAPMode();
+    }
+  }
+
 #ifdef ENABLE_BLE
   // ========== REINICIO PENDIENTE (para cambios de red BLE) ==========
   if (pendingRestartTime > 0 && currentTime >= pendingRestartTime) {
@@ -9456,16 +9468,16 @@ void setup() {
        publishError(8, "Memoria baja detectada: " + String(ESP.getFreeHeap()) + " bytes");
      }
      
-    // Verificar si MQTT se desconectó mucho tiempo (SOLO si hay conectividad Ethernet)
+    // Aviso de MQTT caído prolongado (SIN reiniciar: un broker inalcanzable
+    // no es un fallo del MCU; los accesos locales siguen operativos y la
+    // reconexión con backoff sigue intentándolo)
     static unsigned long mqttDisconnectedTime = 0;
     if (!mqttClient.connected() && ethConnected) {
       if (mqttDisconnectedTime == 0) {
         mqttDisconnectedTime = currentTime;
       } else if (currentTime - mqttDisconnectedTime > 300000) { // 5 minutos
-        Serial.println("⚠️ MQTT desconectado por mucho tiempo - Reiniciando...");
-        publishError(9, "MQTT desconectado prolongado - Reiniciando sistema");
-        delay(1000);
-        ESP.restart();
+        Serial.printf("⚠️ MQTT sin conexión desde hace %lu min (accesos locales operativos)\n",
+                      (currentTime - mqttDisconnectedTime) / 60000UL);
       }
     } else {
       mqttDisconnectedTime = 0;
@@ -10194,20 +10206,34 @@ void handleRemoteCodesDeleteAll() {
 }
 
 // =================== FUNCIONES PARA CÓDIGOS REMOTOS ===================
+// Persistencia en NVS (namespace REMOTE_CODES_NVS_NS, definido junto a la
+// estructura StoredRemoteCodes al inicio del fichero).
 
 void loadStoredRemoteCodes() {
   if (storedRemoteCodes == nullptr) {
     initializeStoredRemoteCodes();
   }
-  
+
   if (storedRemoteCodes == nullptr) {
     Serial.println("❌ Error: No se pudo inicializar storedRemoteCodes");
     return;
   }
-  
-  EEPROM.get(EEPROM_REMOTE_CODES_OFFSET, *storedRemoteCodes);
-  
-  if (storedRemoteCodes->validMarker != 0xDEADBEEF || storedRemoteCodes->version != 1) {
+
+  bool loaded = false;
+  if (remoteCodesPrefs.begin(REMOTE_CODES_NVS_NS, true)) {
+    size_t len = remoteCodesPrefs.getBytesLength(REMOTE_CODES_NVS_KEY);
+    if (len == sizeof(StoredRemoteCodes)) {
+      loaded = remoteCodesPrefs.getBytes(REMOTE_CODES_NVS_KEY, storedRemoteCodes,
+                                         sizeof(StoredRemoteCodes)) == sizeof(StoredRemoteCodes);
+    } else if (len > 0) {
+      Serial.printf("⚠️ Códigos remotos NVS con tamaño inesperado (%d ≠ %d) - se reinicializan\n",
+                    (int)len, (int)sizeof(StoredRemoteCodes));
+    }
+    remoteCodesPrefs.end();
+  }
+
+  if (!loaded || storedRemoteCodes->validMarker != 0xDEADBEEF ||
+      storedRemoteCodes->version != 1 || storedRemoteCodes->count > MAX_REMOTE_CODES) {
     Serial.println("📦 Inicializando códigos remotos por primera vez");
     storedRemoteCodes->validMarker = 0xDEADBEEF;
     storedRemoteCodes->version = 1;
@@ -10215,7 +10241,7 @@ void loadStoredRemoteCodes() {
     memset(storedRemoteCodes->codes, 0, sizeof(storedRemoteCodes->codes));
     saveStoredRemoteCodes();
   }
-  
+
   Serial.printf("📦 Códigos remotos cargados: %d/%d\n", storedRemoteCodes->count, MAX_REMOTE_CODES);
 }
 
@@ -10224,10 +10250,19 @@ void saveStoredRemoteCodes() {
     Serial.println("❌ Error: storedRemoteCodes no inicializado");
     return;
   }
-  
-  EEPROM.put(EEPROM_REMOTE_CODES_OFFSET, *storedRemoteCodes);
-  EEPROM.commit();
-  Serial.printf("💾 Códigos remotos guardados: %d códigos\n", storedRemoteCodes->count);
+
+  bool saved = false;
+  if (remoteCodesPrefs.begin(REMOTE_CODES_NVS_NS, false)) {
+    saved = remoteCodesPrefs.putBytes(REMOTE_CODES_NVS_KEY, storedRemoteCodes,
+                                      sizeof(StoredRemoteCodes)) == sizeof(StoredRemoteCodes);
+    remoteCodesPrefs.end();
+  }
+
+  if (saved) {
+    Serial.printf("💾 Códigos remotos guardados en NVS: %d códigos\n", storedRemoteCodes->count);
+  } else {
+    Serial.println("❌ Error guardando códigos remotos en NVS (sin espacio o NVS corrupta)");
+  }
 }
 
 bool addRemoteCode(const char* type, const char* value, uint8_t keyboardId, uint8_t relay, const TimeSlot* timeSlots, uint8_t timeSlotsCount) {
