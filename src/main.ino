@@ -37,12 +37,28 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <EEPROM.h>
-#include <Preferences.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <Update.h>
 #include <HTTPClient.h>
 #include <esp_ota_ops.h>
+
+// =================== MÓDULOS PROPIOS (Fase 0.75 - estructura) ===================
+#include "target_features.h"   // Feature flags por target (A2 / A2v3)
+#include "hw_config.h"         // Pines y constantes de placa
+#include "eeprom_layout.h"     // Estructuras persistentes + mapa EEPROM/NVS
+#include "net_manager.h"       // Estado agregado de conectividad (ETH > WiFi)
+#include "wifi_manager.h"      // WiFi de gestión (AP de emergencia; Fase 1: AP/STA)
+#include "gsm_modem.h"         // Módem 4G (stub; Fase 3 en A2v3)
+#include "remote_codes.h"      // Caché de códigos remotos (NVS)
+#include "local_codes.h"       // Códigos de acceso locales (EEPROM)
+#include "digital_inputs.h"    // Entradas digitales DI1/DI2
+#include "web_common.h"        // CSS compartido + helpers del portal web
+#include "rtc_time.h"          // RTC DS3231 (A2v3): hora propia mantenida
+#include "status_display.h"    // Pantalla OLED de estado (A2v3)
+#if A2_BOARD_A2V3
+#include <SPI.h>               // Bus del W5500
+#endif
 
 // =================== BLE (Solo si está habilitado) ===================
 #ifdef ENABLE_BLE
@@ -85,18 +101,18 @@
  bool releActive[3] = {false, false, false};
  
 // =================== INFORMACIÓN DEL FIRMWARE ===================
-#ifdef ENABLE_BLE
-#define FIRMWARE_VERSION_MAJOR 4
-#define FIRMWARE_VERSION_MINOR 1
-#define FIRMWARE_VERSION_PATCH 1
-const char* firmwareVersion = "v4.1.1";
-const char* firmwareFullVersion = "v4.1.1-BLE";
-#else
-#define FIRMWARE_VERSION_MAJOR 3
+#define FIRMWARE_VERSION_MAJOR 5
 #define FIRMWARE_VERSION_MINOR 0
-#define FIRMWARE_VERSION_PATCH 3
-const char* firmwareVersion = "v3.0.3";
-const char* firmwareFullVersion = "v3.0.3-EEPROM";
+#define FIRMWARE_VERSION_PATCH 0
+const char* firmwareVersion = "v5.0.0";
+#if defined(ENABLE_BLE)
+const char* firmwareFullVersion = "v5.0.0-BLE";
+#elif A2_BOARD_A2V3
+const char* firmwareFullVersion = "v5.0.0-S3";
+#elif A2_FEATURE_GSM_MODEM
+const char* firmwareFullVersion = "v5.0.0-4G";
+#else
+const char* firmwareFullVersion = "v5.0.0";
 #endif
 #define FIRMWARE_VERSION_BUILD __DATE__ " " __TIME__
 const char* firmwareBuild = FIRMWARE_VERSION_BUILD;
@@ -121,99 +137,11 @@ int maxFailedAttempts = 3;                    // Máximo intentos antes del bloq
 unsigned long lastFailedAttempt = 0;          // Último intento fallido
 const unsigned long failedAttemptTimeout = 300000;  // Reset contador tras 5 minutos
  
-// =================== ALMACENAMIENTO DE CÓDIGOS ===================
-#define MAX_CODES 50    // Ajustado para caber en 4KB EEPROM
+// Estructuras persistentes (Config, StoredCodes, códigos remotos, DI, BLE):
+// ver eeprom_layout.h — única fuente del mapa EEPROM/NVS
+Config config;
 
-// =================== ESTRUCTURAS DEL MODO TORNO ===================
-struct TurnstileConfig {
-  bool enabled;           // true = modo torno, false = modo normal
-  uint8_t keyboard1_relay; // Relé asignado al teclado 1 (1 o 2)
-  uint8_t keyboard2_relay; // Relé asignado al teclado 2 (1 o 2)
-  uint8_t reserved[5];    // Reservado para futuras extensiones
-};
-
-// Zona EEPROM 1800-3199 reservada (antiguos códigos remotos; desde v0.5 de
-// saneamiento los códigos remotos se persisten en NVS, namespace "a2acc_rc",
-// porque la estructura no cabe en la EEPROM de 4 KB junto a las zonas BLE)
-#define EEPROM_REMOTE_CODES_OFFSET 1800
-
-// Estructura de configuración
-struct Config {
-  char deviceName[32];
-  char fixedSerial[32];        // SERIAL FIJO
-  bool useDhcp;
-  uint8_t ip[4];
-  uint8_t gateway[4];
-  uint8_t subnet[4];
-  uint8_t dns[4];
-  float releDuration;
-  char webPassword[32];
-  bool localAccessBlocked;     // Estado de bloqueo
-  bool keyboardReadingEnabled; // Control de lectura de teclados
-  unsigned long blockDuration; // Duración del bloqueo
-  int maxFailedAttempts;       // Máximo intentos
-  TurnstileConfig turnstile;   // Configuración del modo torno
-  uint32_t configValid;
-};
- Config config;
- 
- #define EEPROM_CODES_OFFSET 512
 #define TURNSTILE_TIMEOUT 5000   // 5 segundos timeout para respuestas MQTT
-#define TURNSTILE_CONFIG_MARKER 0x544F524E  // "TORN" en ASCII - Marcador para modo torno
- 
-// Estructuras de almacenamiento de códigos
-struct CodeEntry {
-  char type[5];
-  char value[17];
-  uint8_t keyboard_id; // ID del teclado (0=ambos, 1=teclado1, 2=teclado2)
-  uint8_t relay;
-  uint8_t reserved;    // Reservado para futuras extensiones
-};
- 
-struct StoredCodes {
-  uint32_t validMarker;
-  uint32_t version;               // 1 = formato antiguo, 2 = formato nuevo
-  bool localValidationFirst;
-  uint16_t count;  // Cambiado a uint16_t para soportar 500 códigos
-  CodeEntry codes[MAX_CODES];
-};
-
-// =================== ESTRUCTURAS PARA CÓDIGOS REMOTOS ===================
-// Estructura para franjas horarias
-struct TimeSlot {
-  uint8_t start_hour;    // Hora de inicio (0-23)
-  uint8_t start_minute;  // Minuto de inicio (0-59)
-  uint8_t end_hour;      // Hora de fin (0-23)
-  uint8_t end_minute;    // Minuto de fin (0-59)
-  uint8_t days_of_week;  // Días de la semana (bitmask: 1=Lunes, 2=Martes, 4=Miércoles, 8=Jueves, 16=Viernes, 32=Sábado, 64=Domingo)
-  uint8_t reserved[3];   // Reservado para alineación
-};
-
-// Estructura para códigos remotos
-struct RemoteCodeEntry {
-  char type[5];          // "PIN" o "TAG"
-  char value[17];        // Valor del código
-  uint8_t keyboard_id;   // Teclado asociado (0=ambos, 1=teclado1, 2=teclado2)
-  uint8_t relay;         // Relé a activar (1 o 2)
-  uint8_t time_slots_count; // Número de franjas horarias (máximo 4)
-  TimeSlot time_slots[4]; // Franjas horarias
-  uint8_t reserved;      // Reservado para alineación
-};
-
-// Estructura para almacenamiento de códigos remotos
-#define MAX_REMOTE_CODES 40
-struct StoredRemoteCodes {
-  uint32_t validMarker;
-  uint32_t version;
-  uint16_t count;
-  RemoteCodeEntry codes[MAX_REMOTE_CODES];
-};
-
-// Persistencia de códigos remotos en NVS (no caben en la EEPROM de 4 KB
-// junto a las zonas BLE 3200/3400). Namespace según convención v5 (a2acc_*).
-#define REMOTE_CODES_NVS_NS  "a2acc_rc"
-#define REMOTE_CODES_NVS_KEY "codes"
-Preferences remoteCodesPrefs;
 
 // =================== ESTRUCTURAS DEL MODO TORNO ===================
 struct PendingRequest {
@@ -225,9 +153,7 @@ struct PendingRequest {
   uint8_t relay_to_open;  // Relé que se abrirá si se aprueba
 };
 
-// Usar punteros para evitar stack overflow
-StoredCodes* storedCodes = nullptr;
-StoredRemoteCodes* storedRemoteCodes = nullptr;
+// (storedCodes vive en local_codes.cpp; storedRemoteCodes en remote_codes.cpp)
  TurnstileConfig turnstileConfig;
  PendingRequest pendingRequest;
 
@@ -263,109 +189,17 @@ unsigned long lastTimeSync = 0;
 bool timeSynced = false;
 char currentTimeString[32] = "";
  
- // =================== CONFIGURACIÓN DE PINES ===================
- // Pines de relés
- const int RELE1_PIN = 15;
- const int RELE2_PIN = 2;
+ // =================== HARDWARE ===================
+ // Pines y constantes de placa: ver hw_config.h
  float releDuration = 2.0;
- 
- // Configuración dual Wiegand
- #define WIEGAND1_D0 33
- #define WIEGAND1_D1 14
- #define WIEGAND2_D0 4
- #define WIEGAND2_D1 16
- 
- // Configuración RS485 (compatibilidad)
- #define RS485_RX2 35
- #define RS485_TX2 32
- #define RS485_BAUD 9600
- HardwareSerial RS485_Serial(2);
- 
- // Configuración Ethernet LAN8720
- #define ETH_PHY_ADDR 0
- #define ETH_PHY_MDC 23
- #define ETH_PHY_MDIO 18
-#define ETH_PHY_POWER_PIN 5
-#define ETH_PHY_TYPE ETH_PHY_LAN8720
-#define ETH_CLK_MODE ETH_CLOCK_GPIO17_OUT
+ HardwareSerial RS485_Serial(RS485_UART_NUM);  // UART2 en A2 clásico, UART1 en A2v3
 
-// =================== CONFIGURACIÓN DE ENTRADAS DIGITALES ===================
-// Pines de entradas digitales (input-only pins)
-const int DI1_PIN = 36;  // GPIO36 - Entrada digital 1
-const int DI2_PIN = 39;  // GPIO39 - Entrada digital 2
-
-// Estructura para configuración de entradas digitales en EEPROM
-// IMPORTANTE: Estructura empaquetada para evitar problemas de alineamiento
-#pragma pack(push, 1)
-struct DigitalInputConfig {
-  uint32_t validMarker;    // Marcador de validación: 0xD1D1D1D1
-  uint8_t di1_enabled;     // DI1 habilitada/deshabilitada (0=no, 1=sí)
-  uint8_t di1_relay;       // Relé asignado a DI1 (1 o 2)
-  uint8_t di1_inverse;     // Modo inverso DI1 (0=normal, 1=inverso)
-  uint8_t di1_reserved;    // Reservado
-  uint32_t di1_duration_ms; // Duración en milisegundos (evita float)
-  uint8_t di2_enabled;     // DI2 habilitada/deshabilitada (0=no, 1=sí)
-  uint8_t di2_relay;       // Relé asignado a DI2 (1 o 2)
-  uint8_t di2_inverse;     // Modo inverso DI2 (0=normal, 1=inverso)
-  uint8_t di2_reserved;    // Reservado
-  uint32_t di2_duration_ms; // Duración en milisegundos (evita float)
-  uint32_t checksum;       // Checksum para verificar integridad
-};
-#pragma pack(pop)
-
-// Estructura para estado en tiempo real de entradas digitales
-struct DigitalInputState {
-  bool lastState;          // Último estado leído (LOW/HIGH)
-  bool currentState;       // Estado actual
-  bool relayActivated;     // Relé activado por esta entrada
-  unsigned long activationTime; // Momento de activación
-  bool waitingForLow;      // Esperando que el pulso baje
-};
-
-// Definiciones para EEPROM de entradas digitales
-#define DIGITAL_INPUT_CONFIG_MARKER 0xD1D1D1D1  // Marcador más distintivo
-// DI Config justo después de Config (que termina ~200 bytes)
-#define EEPROM_DIGITAL_INPUT_OFFSET 256
-
-// =================== MAPA EEPROM (verificado en compilación) ===================
-#define EEPROM_TOTAL_SIZE 4096
-// 2 bytes de scratch para el test de arranque: fuera de todas las estructuras
-// (la última zona usada es BLEAuthConfig, que termina en ~3883)
-#define EEPROM_TEST_SCRATCH_OFFSET 4090
-
-static_assert(sizeof(Config) <= EEPROM_DIGITAL_INPUT_OFFSET,
-              "Config se solapa con DigitalInputConfig");
-static_assert(EEPROM_DIGITAL_INPUT_OFFSET + sizeof(DigitalInputConfig) <= EEPROM_CODES_OFFSET,
-              "DigitalInputConfig se solapa con StoredCodes");
-static_assert(EEPROM_CODES_OFFSET + sizeof(StoredCodes) <= EEPROM_REMOTE_CODES_OFFSET,
-              "StoredCodes invade la zona reservada 1800+");
-static_assert(EEPROM_TEST_SCRATCH_OFFSET + 2 <= EEPROM_TOTAL_SIZE,
-              "Scratch de test fuera de la EEPROM");
+// (ver digital_inputs.h)
 
 // =================== CONFIGURACIÓN BLE (v4.0) ===================
+// Estructuras persistentes BLE (DeviceKeyConfig, BLEAuthConfig) y sus
+// offsets/tamaños: ver eeprom_layout.h
 #ifdef ENABLE_BLE
-#define BLE_AUTH_CONFIG_MARKER 0xB1E4C0DE  // Marcador para config BLE (hex válido)
-#define EEPROM_BLE_AUTH_OFFSET 3400        // Offset en EEPROM para BLE config
-#define BLE_KEY_SIZE 64                    // Tamaño de clave en bytes
-#define BLE_MAX_USERS 5                    // Máximo usuarios vinculados
-
-// =================== SEGURIDAD MQTT v4.1 ===================
-// Clave maestra del dispositivo para derivación segura de claves de usuario
-#define DEVICE_KEY_CONFIG_MARKER 0xDE41CE41  // Marcador para config de claves
-#define EEPROM_DEVICE_KEY_OFFSET 3200        // Offset en EEPROM para clave maestra
-#define DEVICE_MASTER_KEY_SIZE 32            // 32 bytes = 256 bits para HKDF
-
-// Estructura para clave maestra del dispositivo
-#pragma pack(push, 1)
-struct DeviceKeyConfig {
-  uint32_t validMarker;                      // Marcador: 0xDEV1CE41
-  uint8_t master_key[DEVICE_MASTER_KEY_SIZE]; // Clave maestra (32 bytes)
-  uint8_t key_version;                       // Versión de la clave (para rotación)
-  uint32_t generation_time;                  // Timestamp de generación
-  uint32_t checksum;                         // Checksum para integridad
-};
-#pragma pack(pop)
-
 DeviceKeyConfig deviceKeyConfig;
 
 // Permisos BLE
@@ -374,27 +208,6 @@ DeviceKeyConfig deviceKeyConfig;
 #define BLE_PERM_ADD_CODES      0x04  // Añadir códigos
 #define BLE_PERM_NETWORK_CONFIG 0x08  // Configuración de red
 #define BLE_PERM_ADMIN          0xFF  // Todos los permisos
-
-// Estructura para autenticación BLE
-#pragma pack(push, 1)
-struct BLEAuthConfig {
-  uint32_t validMarker;                    // Marcador: 0xBLE4C0DE
-  uint8_t superadmin_key[BLE_KEY_SIZE];    // Clave del superadmin (64 bytes)
-  uint8_t user_keys[BLE_MAX_USERS][BLE_KEY_SIZE]; // Claves de usuarios (5 x 64 bytes)
-  uint8_t user_enabled[BLE_MAX_USERS];     // Estado de cada usuario (0=deshabilitado)
-  uint8_t user_permissions[BLE_MAX_USERS]; // Permisos por usuario
-  char user_names[BLE_MAX_USERS][16];      // Nombres de usuarios
-  uint8_t superadmin_registered;           // 1 si hay superadmin registrado
-  uint32_t checksum;                       // Checksum para integridad
-};
-#pragma pack(pop)
-
-static_assert(EEPROM_DEVICE_KEY_OFFSET >= EEPROM_REMOTE_CODES_OFFSET,
-              "DeviceKeyConfig invade StoredCodes");
-static_assert(EEPROM_DEVICE_KEY_OFFSET + sizeof(DeviceKeyConfig) <= EEPROM_BLE_AUTH_OFFSET,
-              "DeviceKeyConfig se solapa con BLEAuthConfig");
-static_assert(EEPROM_BLE_AUTH_OFFSET + sizeof(BLEAuthConfig) <= EEPROM_TEST_SCRATCH_OFFSET,
-              "BLEAuthConfig invade el scratch de test / fin de EEPROM");
 
 BLEAuthConfig bleAuthConfig;
 bool bleAuthenticated = false;
@@ -468,32 +281,17 @@ void handleBLEStatus();
 #endif // ENABLE_BLE
 
 // Función para calcular checksum de la configuración DI
-uint32_t calculateDIChecksum(const DigitalInputConfig& cfg) {
-  uint32_t sum = 0;
-  sum += cfg.di1_enabled;
-  sum += cfg.di1_relay << 8;
-  sum += cfg.di1_inverse << 16;
-  sum += cfg.di1_duration_ms;
-  sum += cfg.di2_enabled;
-  sum += cfg.di2_relay << 8;
-  sum += cfg.di2_inverse << 16;
-  sum += cfg.di2_duration_ms;
-  return sum ^ 0x55AA55AA;  // XOR con patrón distintivo
-}
+// (ver digital_inputs.h)
 
 // Variables globales para entradas digitales
-DigitalInputConfig digitalInputConfig;
-DigitalInputState di1State = {false, false, false, 0, false};
-DigitalInputState di2State = {false, false, false, 0, false};
+// (ver digital_inputs.h)
 
 // Todas las configuraciones usan EEPROM para almacenamiento persistente
  
 // =================== SERVIDOR WEB Y CONECTIVIDAD ===================
 WebServer server(80);
 IPAddress ip;
-bool ethConnected = false;
-bool apModeActive = false;              // AP de emergencia activo
-#define AP_FALLBACK_TIMEOUT_MS 30000    // Sin ETH tras 30 s de arranque → AP
+bool ethConnected = false;   // Estado ETH legacy (net_manager es la fuente agregada)
 
 // Declaraciones de funciones del servidor web
 void handleRoot();
@@ -555,15 +353,7 @@ void logTurnstileCommunication(const String& action, const String& topic, const 
 void processRemoteValidationResponse(const JsonDocument& doc);
 
 // Declaraciones de funciones para códigos remotos
-void loadStoredRemoteCodes();
-void saveStoredRemoteCodes();
-bool addRemoteCode(const char* type, const char* value, uint8_t keyboardId, uint8_t relay, const TimeSlot* timeSlots, uint8_t timeSlotsCount);
-bool deleteRemoteCode(const char* type, const char* value);
-void deleteAllRemoteCodes();
-bool isRemoteCodeStored(const char* type, const char* value, uint8_t keyboardId, uint8_t* relay);
-bool isTimeSlotValid(const TimeSlot& timeSlot);
-bool isCurrentTimeInTimeSlots(const TimeSlot* timeSlots, uint8_t timeSlotsCount);
-String getDaysOfWeekString(uint8_t days_of_week);
+// (gestión de códigos remotos: ver remote_codes.h)
 void handleRemoteCodes();
 void handleRemoteCodesAdd();
 void handleRemoteCodesDelete();
@@ -619,8 +409,8 @@ char lastTime[32] = "";
  
  // =================== CONFIGURACIÓN NTP ===================
  const char* ntpServer = "pool.ntp.org";
- const long gmtOffset_sec = 3600;
- const int daylightOffset_sec = 3600;
+ const long gmtOffset_sec = TIME_GMT_OFFSET_SEC;
+ const int daylightOffset_sec = TIME_DST_OFFSET_SEC;
  
  // =================== DECLARACIONES DE FUNCIONES ===================
  void saveConfiguration();
@@ -634,7 +424,7 @@ char lastTime[32] = "";
  void controlRele();
  void controlReleWithDuration(float duration, int relay = 1);
  void processKey(uint8_t key, int keyboardId);
- void setupAPMode();
+ // (AP de emergencia: ver wifi_manager.h)
  void validateCode(const String& code, const String& type, int keyboardId);
  void setupWebServer();
  void publishResponse(int responseType, unsigned long originalMessageId, String responseInfo, int relay = 0);
@@ -702,6 +492,7 @@ void WiFiEvent(arduino_event_id_t event) {
       Serial.print("🌐 ETH Dirección IP: ");
       Serial.println(ip);
       ethConnected = true;
+      netOnEthGotIp();
       configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
       // NO llamar a connectToMqtt() aquí - puede bloquear
       // En su lugar, marcar para conectar en el loop()
@@ -711,11 +502,13 @@ void WiFiEvent(arduino_event_id_t event) {
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       Serial.println("🌐 ETH Desconectado");
       ethConnected = false;
+      netOnEthDown();
       mqttConnectionPending = false;
       break;
     case ARDUINO_EVENT_ETH_STOP:
       Serial.println("🌐 ETH Detenido");
       ethConnected = false;
+      netOnEthDown();
       mqttConnectionPending = false;
        break;
      default:
@@ -775,13 +568,12 @@ String getTimeString() {
 }
  
 // =================== CONECTIVIDAD MQTT ROBUSTA ===================
-// Timeout de conexión MQTT (en segundos)
-#define MQTT_CONNECT_TIMEOUT_SEC 5
+// (timeout MQTT_CONNECT_TIMEOUT_SEC definido en hw_config.h)
 
 void connectToMqtt() {
-  // Verificar que tenemos conexión Ethernet
-  if (!ethConnected) {
-    Serial.println("📡 MQTT: Sin conexión Ethernet, saltando");
+  // Verificar conectividad agregada (ETH hoy; ETH o WiFi STA desde Fase 1)
+  if (!netHasConnectivity()) {
+    Serial.println("📡 MQTT: Sin conectividad de red, saltando");
     return;
   }
   
@@ -1074,6 +866,9 @@ void connectToMqtt() {
         currentTimeString[sizeof(currentTimeString) - 1] = '\0';
          lastTimeSync = millis();
          timeSynced = true;
+
+         // A2v3: fijar también el reloj del sistema y el DS3231 (no-op sin RTC)
+         rtcSetFromLocalString(timeString);
          
          Serial.printf("🕐 Hora sincronizada remotamente: %s\n", timeString.c_str());
          publishResponse(0, receivedMessageId, "time synchronized to " + timeString);
@@ -1088,8 +883,9 @@ void connectToMqtt() {
            message += "\"serial\":\"" + fixedSerialNumber + "\",";
            message += "\"event_type\":\"TIME_SYNC\",";
            message += "\"time_string\":\"" + timeString + "\",";
-           message += "\"source\":\"MQTT\"";
-           message += "}";
+           message +=
+             "\"source\":\"MQTT\""
+             "}";
            
            mqttClient.publish(topic.c_str(), message.c_str());
            Serial.printf("📡 Evento de sincronización de tiempo publicado\n");
@@ -1661,6 +1457,96 @@ void connectToMqtt() {
       }
       break;
 #endif // ENABLE_BLE
+
+    case 7:  // Gestión de red (WiFi AP/STA y GSM)
+      if (doc.containsKey("message_info")) {
+        String netAction = doc["message_info"]["action"].as<String>();
+        JsonVariantConst info = doc["message_info"];
+
+        if (netAction == "get_wifi") {
+          publishResponse(0, receivedMessageId, wifiStatusJson());
+
+        } else if (netAction == "set_wifi") {
+          String result = "wifi updated:";
+          if (info.containsKey("ap_mode")) {
+            uint32_t to = info.containsKey("ap_timeout_s")
+                              ? info["ap_timeout_s"].as<uint32_t>() : 0;
+            if (wifiSetApMode(info["ap_mode"].as<uint8_t>(), to ? to : WIFI_AP_WINDOW_S_DEFAULT))
+              result += " ap_mode";
+            else result += " ap_mode_INVALID";
+          }
+          if (info.containsKey("ap_pass")) {
+            if (wifiSetApPass(info["ap_pass"].as<String>())) result += " ap_pass";
+            else result += " ap_pass_INVALID(min8)";
+          }
+          if (info.containsKey("sta_ssid")) {
+            if (wifiStaConnectTo(info["sta_ssid"].as<String>(),
+                                 info["sta_pass"].as<String>()))
+              result += " sta";
+            else result += " sta_INVALID";
+          }
+          if (info.containsKey("sta_enabled")) {
+            wifiStaSetEnabled(info["sta_enabled"].as<bool>());
+            result += " sta_enabled";
+          }
+          if (info.containsKey("forget_sta") && info["forget_sta"].as<bool>()) {
+            wifiStaForget();
+            result += " sta_forgotten";
+          }
+          publishResponse(0, receivedMessageId, result);
+
+        } else if (netAction == "ap_start") {
+          wifiApStartNow(info["seconds"].as<uint32_t>());
+          publishResponse(0, receivedMessageId, "ap started");
+
+        } else if (netAction == "ap_stop") {
+          wifiApStopNow();
+          publishResponse(0, receivedMessageId, "ap stopped");
+
+        } else if (netAction == "wifi_scan") {
+          wifiScanStart();
+          publishResponse(0, receivedMessageId, "scan started, request get_wifi_scan in a few seconds");
+
+        } else if (netAction == "get_wifi_scan") {
+#if A2_FEATURE_WIFI_MGMT
+          publishResponse(0, receivedMessageId, wifiScanJson());
+#else
+          publishResponse(1, receivedMessageId, "wifi not available");
+#endif
+
+        } else if (netAction == "get_gsm") {
+          publishResponse(0, receivedMessageId, gsmStatusJson());
+
+        } else if (netAction == "set_gsm") {
+          String result = "gsm updated:";
+          if (info.containsKey("enabled")) {
+            gsmSetEnabled(info["enabled"].as<bool>());
+            result += " enabled";
+          }
+          if (info.containsKey("pin")) {
+            // PIN de solo escritura; un intento por valor (política PUK)
+            if (gsmSetPin(info["pin"].as<String>())) result += " pin";
+            else result += " pin_INVALID";
+          }
+          if (info.containsKey("apn")) {
+            gsmSetApn(info["apn_mode"] | 0, info["apn"].as<String>(),
+                      info["apn_user"].as<String>(), info["apn_pass"].as<String>());
+            result += " apn";
+          }
+          publishResponse(0, receivedMessageId, result);
+
+        } else if (netAction == "gsm_rescan") {
+          gsmModemRescan();
+          publishResponse(0, receivedMessageId, "gsm rescan started");
+
+        } else if (netAction == "get_rtc") {
+          publishResponse(0, receivedMessageId, rtcStatusJson());
+
+        } else {
+          publishResponse(1, receivedMessageId, "unknown network action: " + netAction);
+        }
+      }
+      break;
   }
 }
 
@@ -3085,175 +2971,11 @@ void processRemoteValidationResponse(const JsonDocument& doc) {
 // =================== FUNCIONES DE ENTRADAS DIGITALES ===================
 
 // Cargar configuración de entradas digitales desde EEPROM
-void loadDigitalInputConfig() {
-  Serial.println("🔄 Cargando configuración DI desde EEPROM...");
-  
-  EEPROM.get(EEPROM_DIGITAL_INPUT_OFFSET, digitalInputConfig);
-  
-  // Verificar marcador de validación
-  if (digitalInputConfig.validMarker != DIGITAL_INPUT_CONFIG_MARKER) {
-    Serial.println("🔧 Inicializando configuración DI por primera vez...");
-    digitalInputConfig.validMarker = DIGITAL_INPUT_CONFIG_MARKER;
-    digitalInputConfig.di1_enabled = 0;
-    digitalInputConfig.di1_relay = 1;
-    digitalInputConfig.di1_inverse = 0;
-    digitalInputConfig.di1_duration_ms = 2000;
-    digitalInputConfig.di2_enabled = 0;
-    digitalInputConfig.di2_relay = 2;
-    digitalInputConfig.di2_inverse = 0;
-    digitalInputConfig.di2_duration_ms = 2000;
-    digitalInputConfig.checksum = 0;
-    
-    saveDigitalInputConfig();
-    Serial.println("✅ Configuración DI inicializada correctamente");
-  } else {
-    Serial.printf("💾 Configuración DI cargada: DI1=%s, DI2=%s\n",
-                  digitalInputConfig.di1_enabled ? "ON" : "OFF",
-                  digitalInputConfig.di2_enabled ? "ON" : "OFF");
-  }
-}
-
-// Guardar configuración de entradas digitales en EEPROM
-void saveDigitalInputConfig() {
-  digitalInputConfig.validMarker = DIGITAL_INPUT_CONFIG_MARKER;
-  
-  // Guardar en EEPROM (mismo estilo que saveStoredCodes original)
-  EEPROM.put(EEPROM_DIGITAL_INPUT_OFFSET, digitalInputConfig);
-  
-  if (!EEPROM.commit()) {
-    Serial.println("❌ [DI] Error: Fallo al hacer commit en EEPROM");
-    return;
-  }
-  
-  // Verificar integridad después de guardar
-  DigitalInputConfig verify;
-  EEPROM.get(EEPROM_DIGITAL_INPUT_OFFSET, verify);
-  
-  if (verify.validMarker != DIGITAL_INPUT_CONFIG_MARKER) {
-    Serial.println("❌ [DI] Error: Verificación de integridad falló");
-    return;
-  }
-  
-  Serial.printf("💾 [DI] Configuración guardada: DI1=%s, DI2=%s\n",
-                digitalInputConfig.di1_enabled ? "ON" : "OFF",
-                digitalInputConfig.di2_enabled ? "ON" : "OFF");
-}
-
-// Procesar entrada digital con modo Normal o Inverso
-void processDigitalInput(int inputNumber, DigitalInputState &state, uint8_t enabled, uint8_t relay, uint32_t duration_ms, uint8_t inverse) {
-  if (!enabled) {
-    // Si está deshabilitada y el relé estaba activo por esta entrada en modo inverso, desactivarlo
-    if (state.relayActivated && inverse) {
-      int relayPin = (relay == 1) ? RELE1_PIN : RELE2_PIN;
-      digitalWrite(relayPin, LOW);
-      state.relayActivated = false;
-      Serial.printf("🔴 [DI%d] Entrada deshabilitada → Relé %d desactivado\n", inputNumber, relay);
-    }
-    return;
-  }
-  
-  // Leer estado actual del pin
-  int pin = (inputNumber == 1) ? DI1_PIN : DI2_PIN;
-  state.currentState = digitalRead(pin);
-  
-  float duration_sec = duration_ms / 1000.0f;
-  
-  // MODO NORMAL: HIGH activa el relé por duración configurada
-  if (!inverse) {
-    // Detectar flanco de subida (LOW → HIGH)
-    if (!state.lastState && state.currentState && !state.waitingForLow) {
-      Serial.printf("📍 [DI%d] Modo NORMAL - HIGH detectado → Activando Relé %d por %dms (%.1fs)\n", 
-                    inputNumber, relay, duration_ms, duration_sec);
-      
-      // Activar relé con la duración especificada (en segundos)
-      controlReleWithDuration(duration_sec, relay);
-      
-      // Actualizar estado
-      state.relayActivated = true;
-      state.activationTime = millis();
-      state.waitingForLow = true;
-      
-      // Publicar evento MQTT
-      publishDigitalInputEvent(inputNumber, relay, duration_ms);
-    }
-    
-    // Detectar flanco de bajada (HIGH → LOW)
-    if (state.lastState && !state.currentState) {
-      Serial.printf("📍 [DI%d] Modo NORMAL - LOW detectado → Sistema listo para nuevo pulso\n", inputNumber);
-      state.waitingForLow = false;
-    }
-  }
-  // MODO INVERSO: Relé siempre activo, HIGH lo desactiva
-  else {
-    int relayPin = (relay == 1) ? RELE1_PIN : RELE2_PIN;
-    
-    // Estado LOW → Relé debe estar activo
-    if (!state.currentState) {
-      if (!state.relayActivated) {
-        Serial.printf("🔵 [DI%d] Modo INVERSO - LOW detectado → Activando Relé %d (permanente)\n", 
-                      inputNumber, relay);
-        digitalWrite(relayPin, HIGH);
-        state.relayActivated = true;
-        state.waitingForLow = false;
-        
-        // Publicar evento MQTT solo en cambios de estado
-        if (state.lastState != state.currentState) {
-          publishDigitalInputEvent(inputNumber, relay, 0xFFFFFFFF);  // Indica modo permanente
-        }
-      }
-    }
-    // Estado HIGH → Relé debe estar desactivado
-    else {
-      if (state.relayActivated || !state.waitingForLow) {
-        Serial.printf("🔴 [DI%d] Modo INVERSO - HIGH detectado → Desactivando Relé %d\n", 
-                      inputNumber, relay);
-        digitalWrite(relayPin, LOW);
-        state.relayActivated = false;
-        state.waitingForLow = true;
-        
-        // Publicar evento MQTT solo en cambios de estado
-        if (state.lastState != state.currentState) {
-          publishDigitalInputEvent(inputNumber, relay, 0);  // 0 indica desactivación
-        }
-      }
-    }
-  }
-  
-  // Actualizar último estado para la próxima lectura
-  state.lastState = state.currentState;
-}
-
-// Publicar evento de entrada digital vía MQTT
-void publishDigitalInputEvent(int inputNumber, int relay, uint32_t duration_ms) {
-  if (!mqttClient.connected()) return;
-  
-  DynamicJsonDocument doc(256);
-  doc["timestamp"] = getTimestamp();
-  doc["event"] = "digital_input_trigger";
-  doc["input"] = inputNumber;
-  doc["gpio"] = (inputNumber == 1) ? DI1_PIN : DI2_PIN;
-  doc["relay"] = relay;
-  doc["duration_ms"] = duration_ms;
-  doc["duration"] = duration_ms / 1000.0f;  // También en segundos para compatibilidad
-  doc["message_id"] = String(messageId++);
-  
-  String output;
-  serializeJson(doc, output);
-  String topic = "swatidhome/" + fixedSerialNumber + "/digital_input";
-  
-  bool published = mqttClient.publish(topic.c_str(), output.c_str());
-  if (!published) {
-    Serial.printf("❌ [DI%d] Error publicando evento MQTT\n", inputNumber);
-  } else {
-    Serial.printf("✅ [DI%d] Evento publicado a MQTT\n", inputNumber);
-  }
-}
+// (ver digital_inputs.h)
 
 // =================== HANDLERS DE CONFIGURACIÓN DEL MODO TORNO ===================
 void handleTurnstileConfig() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   if (server.hasArg("turnstile_mode") && server.hasArg("keyboard1_relay") && server.hasArg("keyboard2_relay")) {
     String turnstile_mode = server.arg("turnstile_mode");
@@ -3322,9 +3044,7 @@ void handleTurnstileConfig() {
 }
 
 void handleTurnstileReset() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   if (isTurnstileModeEnabled() && pendingRequest.active) {
     String keyboardName = (pendingRequest.keyboard_id == 1) ? "Teclado 1" : "Teclado 2";
@@ -3350,9 +3070,7 @@ void handleTurnstileReset() {
 }
 
 void handleExportCodes() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("📊 Exportando códigos locales a CSV");
   
@@ -3380,9 +3098,7 @@ void handleExportCodes() {
 }
 
 void handleExportRemoteCodes() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("📊 Exportando códigos remotos a CSV");
   
@@ -3422,9 +3138,7 @@ void handleExportRemoteCodes() {
 }
 
 void handleImportCodes() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("📥 Procesando importación de códigos desde CSV");
   
@@ -3554,9 +3268,7 @@ void handleImportCodes() {
 String csvUploadContent = "";
 
 void handleFileUpload() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   // Verificar si hay un archivo en el upload
   HTTPUpload& upload = server.upload();
@@ -3782,9 +3494,7 @@ void processCSVImport(String csvContent) {
 }
 
 void handleBulkImport() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("📥 Procesando importación masiva de códigos desde CSV");
   
@@ -3940,21 +3650,15 @@ void processCSVImportWithResponse(String csvContent) {
   Serial.printf("📊 Errores: %d\n", errorCount);
   
   // Generar respuesta detallada
-  String response = "<html><head><meta charset='UTF-8'>";
-  response += "<style>body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5;}";
-  response += ".container{background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
-  response += ".success{color:#28a745;}.error{color:#dc3545;}.info{color:#17a2b8;}";
-  response += "h1{color:#333;border-bottom:2px solid #007bff;padding-bottom:10px;}";
-  response += "button{background:#007bff;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin:10px 5px;}";
-  response += "button:hover{background:#0056b3;}";
-  response += ".summary{background:#e9ecef;padding:15px;border-radius:5px;margin:15px 0;}";
-  response += "</style></head><body>";
-  response += "<div class='container'>";
-  response += "<h1>📥 Resultado de Importación CSV</h1>";
+  String response = webPageBegin("Importación CSV - Controladora A2");
+  response +=
+    "<div class='container'>"
+    "<h1>📥 Resultado de Importación CSV</h1>";
   
   if (importedCount > 0) {
-    response += "<div class='summary'>";
-    response += "<h2 class='success'>✅ Importación Exitosa</h2>";
+    response +=
+      "<div class='summary'>"
+      "<h2 class='success'>✅ Importación Exitosa</h2>";
     response += "<p><strong>Total de códigos importados:</strong> <span class='success'>" + String(importedCount) + "</span></p>";
     response += "<p><strong>TAGs importados:</strong> <span class='info'>" + String(tagCount) + "</span></p>";
     response += "<p><strong>PINs importados:</strong> <span class='info'>" + String(pinCount) + "</span></p>";
@@ -3969,25 +3673,25 @@ void processCSVImportWithResponse(String csvContent) {
   }
   
   if (importedCount == 0 && errorCount == 0) {
-    response += "<div class='summary'>";
-    response += "<h3 class='error'>❌ No se procesaron códigos</h3>";
-    response += "<p>El archivo CSV no contenía datos válidos para importar.</p>";
-    response += "</div>";
+    response +=
+      "<div class='summary'>"
+      "<h3 class='error'>❌ No se procesaron códigos</h3>"
+      "<p>El archivo CSV no contenía datos válidos para importar.</p>"
+      "</div>";
   }
   
-  response += "<div style='text-align:center;margin-top:20px;'>";
-  response += "<a href='/codes'><button>📋 Volver a Códigos</button></a>";
-  response += "<a href='/codes/template'><button>📄 Descargar Plantilla</button></a>";
-  response += "</div>";
-  response += "</div></body></html>";
+  response +=
+    "<div style='text-align:center;margin-top:20px;'>"
+    "<a href='/codes'><button>📋 Volver a Códigos</button></a>"
+    "<a href='/codes/template'><button>📄 Descargar Plantilla</button></a>"
+    "</div>"
+    "</div></body></html>";
   
   server.send(200, "text/html", response);
 }
 
 void handleCSVTemplate() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("📄 Generando plantilla CSV");
   
@@ -4010,9 +3714,7 @@ void handleCSVTemplate() {
 
 // =================== LECTURA DE TAGS EN TIEMPO REAL ===================
 void handleStartTagReading() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("📖 Iniciando modo de lectura de tags");
   
@@ -4058,9 +3760,7 @@ void handleStartTagReading() {
 }
 
 void handleStopTagReading() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("📖 Deteniendo modo de lectura de tags");
   
@@ -4074,9 +3774,7 @@ void handleStopTagReading() {
 }
 
 void handleReadTagsStatus() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   // Crear JSON con estado actual
   DynamicJsonDocument doc(2048);
@@ -4098,9 +3796,7 @@ void handleReadTagsStatus() {
 }
 
 void handleExportReadTags() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("📊 Exportando tags leídos a CSV");
   
@@ -4148,9 +3844,7 @@ void handleExportReadTags() {
 }
 
 void handleLoadReadTags() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("💾 Cargando tags leídos a memoria");
   
@@ -4279,49 +3973,20 @@ void handleTagReading(const String& code, int keyboardId) {
 }
 
 void handleTimeSync() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("🕐 Accediendo a sincronización de hora");
   
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<title>Sincronización de Tiempo - SWATID-A2</title>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<style>";
-  html += "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }";
-  html += ".container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }";
-  html += "h1 { color: #2c3e50; text-align: center; margin-bottom: 30px; }";
-  html += ".time-display { background: #ecf0f1; padding: 15px; border-radius: 8px; margin: 15px 0; }";
-  html += ".time-display h3 { margin: 0 0 10px 0; color: #34495e; }";
-  html += ".time-display p { margin: 5px 0; font-size: 16px; }";
-  html += ".device-time { color: #e74c3c; font-weight: bold; }";
-  html += ".browser-time { color: #27ae60; font-weight: bold; }";
-  html += ".status { padding: 10px; border-radius: 5px; margin: 10px 0; }";
-  html += ".status.synced { background: #d5f4e6; color: #27ae60; border: 1px solid #27ae60; }";
-  html += ".status.not-synced { background: #fadbd8; color: #e74c3c; border: 1px solid #e74c3c; }";
-  html += ".button-group { text-align: center; margin: 30px 0; }";
-  html += "button { background: #3498db; color: white; border: none; padding: 12px 24px; border-radius: 5px; cursor: pointer; font-size: 16px; margin: 0 10px; }";
-  html += "button:hover { background: #2980b9; }";
-  html += "button.sync { background: #f39c12; }";
-  html += "button.sync:hover { background: #e67e22; }";
-  html += "button.save { background: #27ae60; }";
-  html += "button.save:hover { background: #229954; }";
-  html += "button.back { background: #95a5a6; }";
-  html += "button.back:hover { background: #7f8c8d; }";
-  html += ".hidden { display: none; }";
-  html += ".form-group { margin: 20px 0; }";
-  html += "input[type='text'] { width: 100%; padding: 10px; border: 1px solid #bdc3c7; border-radius: 5px; font-size: 16px; }";
-  html += "</style>";
-  html += "</head><body>";
+  String html = webPageBegin("Sincronización de Tiempo - SWATID-A2");
   
-  html += "<div class='container'>";
-  html += "<h1>🕐 Sincronización de Tiempo</h1>";
+  html +=
+    "<div class='container'>"
+    "<h1>🕐 Sincronización de Tiempo</h1>";
   
   // Mostrar hora actual del dispositivo
-  html += "<div class='time-display'>";
-  html += "<h3>📱 Hora del Dispositivo</h3>";
+  html +=
+    "<div class='time-display'>"
+    "<h3>📱 Hora del Dispositivo</h3>";
   html += "<p class='device-time'>" + String(currentTimeString) + "</p>";
   html += "<p><strong>Estado:</strong> " + String(timeSynced ? "✅ Sincronizado" : "❌ No sincronizado") + "</p>";
   if (timeSynced) {
@@ -4330,71 +3995,79 @@ void handleTimeSync() {
   html += "</div>";
   
   // Mostrar hora del navegador
-  html += "<div class='time-display'>";
-  html += "<h3>🌐 Hora del Navegador</h3>";
-  html += "<p class='browser-time' id='browserTime'>Cargando...</p>";
-  html += "<p><strong>Zona horaria:</strong> <span id='timezone'></span></p>";
-  html += "</div>";
+  html +=
+    "<div class='time-display'>"
+    "<h3>🌐 Hora del Navegador</h3>"
+    "<p class='browser-time' id='browserTime'>Cargando...</p>"
+    "<p><strong>Zona horaria:</strong> <span id='timezone'></span></p>"
+    "</div>";
   
   // Formulario oculto para sincronización
-  html += "<div id='syncForm' class='hidden'>";
-  html += "<form action='/time/update' method='post' id='timeForm'>";
-  html += "<div class='form-group'>";
-  html += "<label for='currentTime'>Hora a sincronizar:</label>";
-  html += "<input type='text' id='currentTime' name='currentTime' readonly>";
-  html += "</div>";
-  html += "</form>";
-  html += "</div>";
+  html +=
+    "<div id='syncForm' class='hidden'>"
+    "<form action='/time/update' method='post' id='timeForm'>"
+    "<div class='form-group'>"
+    "<label for='currentTime'>Hora a sincronizar:</label>"
+    "<input type='text' id='currentTime' name='currentTime' readonly>"
+    "</div>"
+    "</form>"
+    "</div>";
   
   // Botones de acción
-  html += "<div class='button-group'>";
-  html += "<button class='sync' onclick='syncTime()'>🔄 Sincronizar con Navegador</button>";
-  html += "<button class='save' onclick='saveTime()' id='saveBtn' disabled>💾 Guardar Cambios</button>";
-  html += "<button class='back' onclick='window.location.href=\"/\"'>🏠 Volver al Inicio</button>";
-  html += "</div>";
+  html +=
+    "<div class='button-group'>"
+    "<button class='sync' onclick='syncTime()'>🔄 Sincronizar con Navegador</button>"
+    "<button class='save' onclick='saveTime()' id='saveBtn' disabled>💾 Guardar Cambios</button>"
+    "<button class='back' onclick='window.location.href=\"/\"'>🏠 Volver al Inicio</button>"
+    "</div>";
   
   html += "</div>";
   
   // JavaScript mejorado
-  html += "<script>";
-  html += "let browserTimeString = '';";
-  html += "let isTimeSynced = false;";
+  html +=
+    "<script>"
+    "let browserTimeString = '';"
+    "let isTimeSynced = false;";
   
-  html += "function updateBrowserTime() {";
-  html += "  const now = new Date();";
-  html += "  const year = now.getFullYear();";
-  html += "  const month = String(now.getMonth() + 1).padStart(2, '0');";
-  html += "  const day = String(now.getDate()).padStart(2, '0');";
-  html += "  const hours = String(now.getHours()).padStart(2, '0');";
-  html += "  const minutes = String(now.getMinutes()).padStart(2, '0');";
-  html += "  const seconds = String(now.getSeconds()).padStart(2, '0');";
-  html += "  browserTimeString = year + '-' + month + '-' + day + ' ' + hours + ':' + minutes + ':' + seconds;";
-  html += "  document.getElementById('browserTime').textContent = browserTimeString;";
-  html += "  document.getElementById('timezone').textContent = Intl.DateTimeFormat().resolvedOptions().timeZone;";
-  html += "}";
+  html +=
+    "function updateBrowserTime() {"
+    "  const now = new Date();"
+    "  const year = now.getFullYear();"
+    "  const month = String(now.getMonth() + 1).padStart(2, '0');"
+    "  const day = String(now.getDate()).padStart(2, '0');"
+    "  const hours = String(now.getHours()).padStart(2, '0');"
+    "  const minutes = String(now.getMinutes()).padStart(2, '0');"
+    "  const seconds = String(now.getSeconds()).padStart(2, '0');"
+    "  browserTimeString = year + '-' + month + '-' + day + ' ' + hours + ':' + minutes + ':' + seconds;"
+    "  document.getElementById('browserTime').textContent = browserTimeString;"
+    "  document.getElementById('timezone').textContent = Intl.DateTimeFormat().resolvedOptions().timeZone;"
+    "}";
   
-  html += "function syncTime() {";
-  html += "  updateBrowserTime();";
-  html += "  document.getElementById('currentTime').value = browserTimeString;";
-  html += "  document.getElementById('saveBtn').disabled = false;";
-  html += "  isTimeSynced = true;";
-  html += "  alert('✅ Hora sincronizada con el navegador: ' + browserTimeString);";
-  html += "}";
+  html +=
+    "function syncTime() {"
+    "  updateBrowserTime();"
+    "  document.getElementById('currentTime').value = browserTimeString;"
+    "  document.getElementById('saveBtn').disabled = false;"
+    "  isTimeSynced = true;"
+    "  alert('✅ Hora sincronizada con el navegador: ' + browserTimeString);"
+    "}";
   
-  html += "function saveTime() {";
-  html += "  if (!isTimeSynced) {";
-  html += "    alert('❌ Primero debe sincronizar la hora con el navegador');";
-  html += "    return;";
-  html += "  }";
-  html += "  if (confirm('¿Está seguro de que desea guardar la hora ' + browserTimeString + ' en el dispositivo?')) {";
-  html += "    document.getElementById('timeForm').submit();";
-  html += "  }";
-  html += "}";
+  html +=
+    "function saveTime() {"
+    "  if (!isTimeSynced) {"
+    "    alert('❌ Primero debe sincronizar la hora con el navegador');"
+    "    return;"
+    "  }"
+    "  if (confirm('¿Está seguro de que desea guardar la hora ' + browserTimeString + ' en el dispositivo?')) {"
+    "    document.getElementById('timeForm').submit();"
+    "  }"
+    "}";
   
-  html += "// Actualizar hora del navegador cada segundo";
-  html += "setInterval(updateBrowserTime, 1000);";
-  html += "updateBrowserTime(); // Inicializar";
-  html += "</script>";
+  html +=
+    "// Actualizar hora del navegador cada segundo"
+    "setInterval(updateBrowserTime, 1000);"
+    "updateBrowserTime(); // Inicializar"
+    "</script>";
   
   html += "</body></html>";
   
@@ -4402,9 +4075,7 @@ void handleTimeSync() {
 }
 
 void handleTimeUpdate() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   if (!server.hasArg("currentTime") || server.arg("currentTime").length() == 0) {
     server.send(400, "text/html", 
@@ -4433,62 +4104,49 @@ void handleTimeUpdate() {
     message += "\"serial\":\"" + fixedSerialNumber + "\",";
     message += "\"event_type\":\"TIME_SYNC\",";
     message += "\"time_string\":\"" + timeString + "\",";
-    message += "\"source\":\"WEB\"";
-    message += "}";
+    message +=
+      "\"source\":\"WEB\""
+      "}";
     
     mqttClient.publish(topic.c_str(), message.c_str());
     Serial.printf("📡 Evento de sincronización de tiempo publicado\n");
   }
   
   // Respuesta de confirmación mejorada
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<title>Hora Actualizada - SWATID-A2</title>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<style>";
-  html += "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }";
-  html += ".container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }";
-  html += "h1 { color: #27ae60; margin-bottom: 30px; }";
-  html += ".success-icon { font-size: 48px; color: #27ae60; margin-bottom: 20px; }";
-  html += ".info-box { background: #ecf0f1; padding: 20px; border-radius: 8px; margin: 20px 0; }";
-  html += ".info-box h3 { margin: 0 0 15px 0; color: #2c3e50; }";
-  html += ".info-box p { margin: 10px 0; font-size: 16px; }";
-  html += ".time-display { font-size: 18px; font-weight: bold; color: #e74c3c; }";
-  html += "button { background: #3498db; color: white; border: none; padding: 12px 24px; border-radius: 5px; cursor: pointer; font-size: 16px; margin: 10px; }";
-  html += "button:hover { background: #2980b9; }";
-  html += "button.sync { background: #f39c12; }";
-  html += "button.sync:hover { background: #e67e22; }";
-  html += "button.home { background: #95a5a6; }";
-  html += "button.home:hover { background: #7f8c8d; }";
-  html += "</style>";
-  html += "</head><body>";
+  String html = webPageBegin("Hora Actualizada - SWATID-A2");
   
-  html += "<div class='container'>";
-  html += "<div class='success-icon'>✅</div>";
-  html += "<h1>Hora Actualizada Exitosamente</h1>";
+  html +=
+    "<div class='container'>"
+    "<div class='success-icon'>✅</div>"
+    "<h1>Hora Actualizada Exitosamente</h1>";
   
-  html += "<div class='info-box'>";
-  html += "<h3>📱 Información de Sincronización</h3>";
-  html += "<p><strong>Nueva hora del dispositivo:</strong></p>";
+  html +=
+    "<div class='info-box'>"
+    "<h3>📱 Información de Sincronización</h3>"
+    "<p><strong>Nueva hora del dispositivo:</strong></p>";
   html += "<p class='time-display'>" + timeString + "</p>";
-  html += "<p><strong>Estado:</strong> ✅ Sincronizado</p>";
-  html += "<p><strong>Última sincronización:</strong> Ahora</p>";
-  html += "<p><strong>Fuente:</strong> Navegador Web</p>";
-  html += "</div>";
+  html +=
+    "<p><strong>Estado:</strong> ✅ Sincronizado</p>"
+    "<p><strong>Última sincronización:</strong> Ahora</p>"
+    "<p><strong>Fuente:</strong> Navegador Web</p>"
+    "</div>";
   
-  html += "<div class='info-box'>";
-  html += "<h3>🔄 Próximos Pasos</h3>";
-  html += "<p>La hora ha sido actualizada correctamente en el dispositivo.</p>";
-  html += "<p>Puede verificar la sincronización en la página principal o volver a sincronizar si es necesario.</p>";
-  html += "</div>";
+  html +=
+    "<div class='info-box'>"
+    "<h3>🔄 Próximos Pasos</h3>"
+    "<p>La hora ha sido actualizada correctamente en el dispositivo.</p>"
+    "<p>Puede verificar la sincronización en la página principal o volver a sincronizar si es necesario.</p>"
+    "</div>";
   
-  html += "<div>";
-  html += "<button class='sync' onclick='window.location.href=\"/time/sync\"'>🔄 Sincronizar Otra Vez</button>";
-  html += "<button class='home' onclick='window.location.href=\"/\"'>🏠 Volver al Inicio</button>";
-  html += "</div>";
+  html +=
+    "<div>"
+    "<button class='sync' onclick='window.location.href=\"/time/sync\"'>🔄 Sincronizar Otra Vez</button>"
+    "<button class='home' onclick='window.location.href=\"/\"'>🏠 Volver al Inicio</button>"
+    "</div>";
   
-  html += "</div>";
-  html += "</body></html>";
+  html +=
+    "</div>"
+    "</body></html>";
   
   server.send(200, "text/html", html);
   
@@ -4497,9 +4155,7 @@ void handleTimeUpdate() {
 
 // =================== MANEJADORES DE SEGURIDAD ===================
 void handleSecurityBlockAccess() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   localAccessBlocked = true;
   blockStartTime = millis();
@@ -4509,13 +4165,8 @@ void handleSecurityBlockAccess() {
   publishError(4, "Acceso local bloqueado desde web");
   
   server.send(200, "text/html", 
-    "<html><head><title>Acceso Bloqueado</title>"
-    "<style>body{font-family:Arial,sans-serif;max-width:600px;margin:50px auto;padding:20px;background:#f5f5f5;}"
-    "h1{color:#d32f2f;text-align:center;border-bottom:2px solid #d32f2f;padding-bottom:10px;}"
-    "p{background:white;padding:15px;border-radius:5px;margin:10px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1);}"
-    "button{background:#2196f3;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:16px;}"
-    "button:hover{background:#1976d2;}</style></head>"
-    "<body><h1>Acceso Local Bloqueado</h1>"
+    webPageBegin("Acceso Bloqueado") +
+    "<h1>Acceso Local Bloqueado</h1>"
     "<p>El acceso local ha sido bloqueado correctamente.</p>"
     "<p><strong>Estado:</strong> Bloqueado temporalmente</p>"
     "<p><strong>Duración:</strong> " + String(blockDuration/1000) + " segundos</p>"
@@ -4524,9 +4175,7 @@ void handleSecurityBlockAccess() {
 }
 
 void handleSecurityUnblockAccess() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   localAccessBlocked = false;
   failedAttempts = 0;
@@ -4537,13 +4186,8 @@ void handleSecurityUnblockAccess() {
   publishError(4, "Acceso local desbloqueado desde web");
   
   server.send(200, "text/html", 
-    "<html><head><title>Acceso Desbloqueado</title>"
-    "<style>body{font-family:Arial,sans-serif;max-width:600px;margin:50px auto;padding:20px;background:#f5f5f5;}"
-    "h1{color:#388e3c;text-align:center;border-bottom:2px solid #388e3c;padding-bottom:10px;}"
-    "p{background:white;padding:15px;border-radius:5px;margin:10px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1);}"
-    "button{background:#2196f3;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:16px;}"
-    "button:hover{background:#1976d2;}</style></head>"
-    "<body><h1>Acceso Local Desbloqueado</h1>"
+    webPageBegin("Acceso Desbloqueado") +
+    "<h1>Acceso Local Desbloqueado</h1>"
     "<p>El acceso local ha sido desbloqueado correctamente.</p>"
     "<p><strong>Estado:</strong> Acceso permitido</p>"
     "<p><strong>Intentos fallidos:</strong> Reseteados a 0</p>"
@@ -4552,9 +4196,7 @@ void handleSecurityUnblockAccess() {
 }
 
 void handleSecurityDisableKeyboards() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   keyboardReadingEnabled = false;
   saveConfiguration();
@@ -4563,13 +4205,8 @@ void handleSecurityDisableKeyboards() {
   publishError(4, "Lectura de teclados deshabilitada desde web");
   
   server.send(200, "text/html", 
-    "<html><head><title>Teclados Deshabilitados</title>"
-    "<style>body{font-family:Arial,sans-serif;max-width:600px;margin:50px auto;padding:20px;background:#f5f5f5;}"
-    "h1{color:#f57c00;text-align:center;border-bottom:2px solid #f57c00;padding-bottom:10px;}"
-    "p{background:white;padding:15px;border-radius:5px;margin:10px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1);}"
-    "button{background:#2196f3;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:16px;}"
-    "button:hover{background:#1976d2;}</style></head>"
-    "<body><h1>Lectura de Teclados Deshabilitada</h1>"
+    webPageBegin("Teclados Deshabilitados") +
+    "<h1>Lectura de Teclados Deshabilitada</h1>"
     "<p>La lectura de teclados ha sido deshabilitada correctamente.</p>"
     "<p><strong>Estado:</strong> Teclados bloqueados</p>"
     "<p><strong>Efecto:</strong> Los códigos no serán procesados</p>"
@@ -4578,9 +4215,7 @@ void handleSecurityDisableKeyboards() {
 }
 
 void handleSecurityEnableKeyboards() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   keyboardReadingEnabled = true;
   saveConfiguration();
@@ -4589,13 +4224,8 @@ void handleSecurityEnableKeyboards() {
   publishError(4, "Lectura de teclados habilitada desde web");
   
   server.send(200, "text/html", 
-    "<html><head><title>Teclados Habilitados</title>"
-    "<style>body{font-family:Arial,sans-serif;max-width:600px;margin:50px auto;padding:20px;background:#f5f5f5;}"
-    "h1{color:#388e3c;text-align:center;border-bottom:2px solid #388e3c;padding-bottom:10px;}"
-    "p{background:white;padding:15px;border-radius:5px;margin:10px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1);}"
-    "button{background:#2196f3;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:16px;}"
-    "button:hover{background:#1976d2;}</style></head>"
-    "<body><h1>Lectura de Teclados Habilitada</h1>"
+    webPageBegin("Teclados Habilitados") +
+    "<h1>Lectura de Teclados Habilitada</h1>"
     "<p>La lectura de teclados ha sido habilitada correctamente.</p>"
     "<p><strong>Estado:</strong> Teclados activos</p>"
     "<p><strong>Efecto:</strong> Los códigos serán procesados normalmente</p>"
@@ -4607,39 +4237,10 @@ void handleSecurityEnableKeyboards() {
 
 // Handler para la página principal de entradas digitales
 void handleDigitalInputs() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
-  String html = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Entradas Digitales - SWAT ID</title>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body { font-family: Arial, sans-serif; max-width: 1000px; margin: 20px auto; padding: 20px; background: #f5f5f5; }
-    h1 { color: #2196f3; text-align: center; border-bottom: 3px solid #2196f3; padding-bottom: 15px; }
-    h3 { color: #333; margin-top: 25px; }
-    .status-panel { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-    .input-config { background: #f5f5f5; padding: 20px; margin: 15px 0; border-radius: 8px; border: 2px solid #ddd; }
-    .input-config.enabled { border-color: #4CAF50; background: #f1f8f4; }
-    .status-indicator { display: inline-block; width: 14px; height: 14px; border-radius: 50%; margin-right: 8px; }
-    .status-low { background: #ccc; }
-    .status-high { background: #4CAF50; box-shadow: 0 0 6px #4CAF50; }
-    .info-panel { background: #e3f2fd; padding: 15px; margin: 15px 0; border-radius: 8px; border-left: 4px solid #2196f3; }
-    label { display: block; margin: 10px 0 5px 0; font-weight: bold; }
-    input[type="number"], select { width: 100%; padding: 10px; margin: 5px 0 15px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-    button { background: #4CAF50; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin: 10px 5px; }
-    button:hover { background: #45a049; }
-    .btn-back { background: #2196f3; }
-    .btn-back:hover { background: #0b7dda; }
-    .form-group { margin: 15px 0; }
-    .checkbox-label { display: inline-block; margin-left: 10px; }
-  </style>
-</head>
-<body>
+  String html = webPageBegin("Entradas Digitales - SWAT ID");
+  html += R"rawliteral(
   <h1>⚡ Entradas Digitales</h1>
   
   <div class="status-panel">
@@ -4828,9 +4429,7 @@ void handleDigitalInputs() {
 
 // API: Obtener estado actual de las entradas digitales
 void handleDigitalInputsStatus() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   DynamicJsonDocument doc(256);
   doc["di1_state"] = di1State.currentState;
@@ -4847,9 +4446,7 @@ void handleDigitalInputsStatus() {
 
 // API: Obtener configuración actual
 void handleDigitalInputsConfig() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   DynamicJsonDocument doc(256);
   doc["di1_enabled"] = digitalInputConfig.di1_enabled;
@@ -4868,9 +4465,7 @@ void handleDigitalInputsConfig() {
 
 // Handler para guardar configuración de entrada digital
 void handleSaveDigitalInput() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   int inputNumber = server.arg("input").toInt();
   Serial.printf("📝 [DI] Guardando configuración para entrada %d\n", inputNumber);
@@ -4926,231 +4521,7 @@ void handleSaveDigitalInput() {
 }
 
 // =================== GESTIÓN DE CÓDIGOS ALMACENADOS ===================
-void loadStoredCodes() {
-  Serial.println("🔄 Cargando códigos desde EEPROM...");
-  
-  if (storedCodes == nullptr) {
-    initializeStoredCodes();
-  }
-  
-  if (storedCodes == nullptr) {
-    Serial.println("❌ Error: No se pudo inicializar storedCodes");
-    return;
-  }
-  
-  EEPROM.get(EEPROM_CODES_OFFSET, *storedCodes);
-  
-  // Verificar marcador de validación
-  if (storedCodes->validMarker != 0xCAFEBABE) {
-    Serial.println("🔧 Inicializando códigos por primera vez...");
-    storedCodes->validMarker = 0xCAFEBABE;
-    storedCodes->version = 2;
-    storedCodes->localValidationFirst = true;
-    storedCodes->count = 0;
-    memset(storedCodes->codes, 0, sizeof(storedCodes->codes));
-    saveStoredCodes();
-    Serial.println("✅ Estructura de códigos inicializada correctamente");
-  } else {
-    if (storedCodes->count > MAX_CODES) {
-      Serial.printf("⚠️ Contador inválido (%d > %d). Corrigiendo...\n", storedCodes->count, MAX_CODES);
-      storedCodes->count = 0;
-      saveStoredCodes();
-    }
-    Serial.printf("💾 Códigos cargados: %d códigos (versión %d)\n", 
-                  storedCodes->count, storedCodes->version);
-  }
-}
- 
-void saveStoredCodes() {
-  Serial.println("💾 saveStoredCodes() - INICIO");
-  
-  if (storedCodes == nullptr) {
-    Serial.println("❌ Error: storedCodes no inicializado");
-    return;
-  }
-  
-  Serial.printf("💾 Datos a guardar: validMarker=0x%08X, count=%d, version=%d\n",
-                storedCodes->validMarker, storedCodes->count, storedCodes->version);
-  
-  if (storedCodes->validMarker != 0xCAFEBABE) {
-    Serial.println("❌ Error: Marcador de validación inválido antes de guardar");
-    Serial.println("💾 Intentando corregir marcador...");
-    storedCodes->validMarker = 0xCAFEBABE;
-  }
-  
-  if (storedCodes->count > MAX_CODES) {
-    Serial.printf("❌ Error: Contador de códigos inválido (%d > %d)\n", storedCodes->count, MAX_CODES);
-    return;
-  }
-  
-  // Mostrar qué códigos se van a guardar
-  Serial.printf("💾 Guardando %d códigos:\n", storedCodes->count);
-  for (int i = 0; i < storedCodes->count && i < 5; i++) {
-    Serial.printf("   [%d] %s '%s' kb=%d relay=%d\n", i,
-                  storedCodes->codes[i].type, storedCodes->codes[i].value,
-                  storedCodes->codes[i].keyboard_id, storedCodes->codes[i].relay);
-  }
-  if (storedCodes->count > 5) {
-    Serial.printf("   ... y %d códigos más\n", storedCodes->count - 5);
-  }
-  
-  // Calcular tamaño a guardar
-  size_t dataSize = sizeof(StoredCodes);
-  Serial.printf("💾 Tamaño de estructura: %d bytes, EEPROM offset: %d\n", 
-                dataSize, EEPROM_CODES_OFFSET);
-  
-  // Guardar en EEPROM
-  EEPROM.put(EEPROM_CODES_OFFSET, *storedCodes);
-  Serial.println("💾 EEPROM.put() completado, ejecutando commit()...");
-  
-  bool commitResult = EEPROM.commit();
-  if (!commitResult) {
-    Serial.println("❌ Error CRÍTICO: EEPROM.commit() retornó FALSE");
-    return;
-  }
-  Serial.println("💾 EEPROM.commit() exitoso");
-  
-  // Verificar integridad después de guardar
-  StoredCodes testCodes;
-  EEPROM.get(EEPROM_CODES_OFFSET, testCodes);
-  
-  Serial.printf("💾 Verificación: validMarker=0x%08X (esperado 0xCAFEBABE), count=%d (esperado %d)\n",
-                testCodes.validMarker, testCodes.count, storedCodes->count);
-  
-  if (testCodes.validMarker != 0xCAFEBABE) {
-    Serial.println("❌ Error: Marcador de validación no coincide después de guardar");
-    return;
-  }
-  
-  if (testCodes.count != storedCodes->count) {
-    Serial.printf("❌ Error: Contador no coincide después de guardar (%d != %d)\n", 
-                  testCodes.count, storedCodes->count);
-    return;
-  }
-  
-  // Verificar primer y último código
-  if (storedCodes->count > 0) {
-    int lastIdx = storedCodes->count - 1;
-    if (strcmp(testCodes.codes[lastIdx].value, storedCodes->codes[lastIdx].value) != 0) {
-      Serial.printf("❌ Error: Último código no coincide! '%s' != '%s'\n",
-                    testCodes.codes[lastIdx].value, storedCodes->codes[lastIdx].value);
-      return;
-    }
-    Serial.printf("💾 ✓ Último código verificado: '%s'\n", testCodes.codes[lastIdx].value);
-  }
-  
-  Serial.printf("💾 ✅ Códigos guardados correctamente en EEPROM: %d códigos (versión %d)\n", 
-                storedCodes->count, storedCodes->version);
-}
- 
-bool addCode(const char* type, const char* value, int keyboardId, int relay) {
-  Serial.println("═══════════════════════════════════════════");
-  Serial.println("📝 addCode() - INICIO");
-  Serial.printf("📝 Parámetros: type='%s', value='%s', keyboard=%d, relay=%d\n", 
-                type, value, keyboardId, relay);
-  
-  // Verificar puntero
-  if (storedCodes == nullptr) {
-    Serial.println("❌ Error CRÍTICO: storedCodes es nullptr!");
-    return false;
-  }
-  
-  Serial.printf("📝 Estado actual: count=%d, validMarker=0x%08X, version=%d\n",
-                storedCodes->count, storedCodes->validMarker, storedCodes->version);
-  
-  if (storedCodes->count >= MAX_CODES) {
-    Serial.printf("❌ Error: Máximo de códigos alcanzado (%d/%d)\n", storedCodes->count, MAX_CODES);
-    return false;
-  }
-
-  // Validar parámetros
-  if (keyboardId < 0 || keyboardId > 2) {
-    Serial.printf("❌ Error: keyboardId inválido (%d). Debe ser 0 (ambos), 1 o 2\n", keyboardId);
-    return false;
-  }
-  if (relay < 1 || relay > 2) {
-    Serial.printf("❌ Error: relay inválido (%d). Debe ser 1 o 2\n", relay);
-    return false;
-  }
-  
-  // Validar value
-  if (value == nullptr || strlen(value) == 0) {
-    Serial.println("❌ Error: value es NULL o vacío");
-    return false;
-  }
-  if (strlen(value) > 16) {
-    Serial.printf("❌ Error: value demasiado largo (%d > 16)\n", strlen(value));
-    return false;
-  }
-
-  // Verificar duplicados exactos
-  Serial.printf("📝 Buscando duplicados entre %d códigos existentes...\n", storedCodes->count);
-  for (int i = 0; i < storedCodes->count; i++) {
-    if (strcmp(storedCodes->codes[i].type, type) == 0 &&
-        strcmp(storedCodes->codes[i].value, value) == 0 &&
-        storedCodes->codes[i].keyboard_id == keyboardId) {
-      Serial.printf("⚠️ Duplicado encontrado en posición %d\n", i);
-      return false;
-    }
-  }
-  Serial.println("📝 No hay duplicados, procediendo a guardar...");
-
-  // Guardar en el slot correspondiente
-  int idx = storedCodes->count;
-  Serial.printf("📝 Guardando en slot %d...\n", idx);
-  
-  // Copiar datos del código
-  strncpy(storedCodes->codes[idx].type, type, sizeof(storedCodes->codes[idx].type) - 1);
-  storedCodes->codes[idx].type[sizeof(storedCodes->codes[idx].type) - 1] = '\0';
-
-  strncpy(storedCodes->codes[idx].value, value, sizeof(storedCodes->codes[idx].value) - 1);
-  storedCodes->codes[idx].value[sizeof(storedCodes->codes[idx].value) - 1] = '\0';
-
-  storedCodes->codes[idx].keyboard_id = keyboardId;
-  storedCodes->codes[idx].relay = relay;
-  storedCodes->codes[idx].reserved = 0;
-  storedCodes->count++;
-  storedCodes->version = 2;
-
-  Serial.printf("📝 Datos en memoria: type='%s', value='%s', kb=%d, relay=%d\n",
-                storedCodes->codes[idx].type, storedCodes->codes[idx].value,
-                storedCodes->codes[idx].keyboard_id, storedCodes->codes[idx].relay);
-  Serial.printf("📝 Nuevo count=%d, llamando saveStoredCodes()...\n", storedCodes->count);
-
-  // Guardar en EEPROM
-  saveStoredCodes();
-  
-  // Verificar que se guardó leyendo de nuevo
-  StoredCodes verification;
-  EEPROM.get(EEPROM_CODES_OFFSET, verification);
-  
-  Serial.printf("📝 Verificación post-guardado: count=%d, validMarker=0x%08X\n",
-                verification.count, verification.validMarker);
-  
-  if (verification.validMarker == 0xCAFEBABE && verification.count == storedCodes->count) {
-    // Verificar que el código está en la posición correcta
-    if (strcmp(verification.codes[idx].value, value) == 0) {
-      Serial.println("✅ ÉXITO: Código guardado y verificado en EEPROM");
-      Serial.println("═══════════════════════════════════════════");
-      return true;
-    } else {
-      Serial.printf("❌ Error: Código en EEPROM no coincide! Esperado='%s', Leído='%s'\n",
-                    value, verification.codes[idx].value);
-    }
-  } else {
-    Serial.println("❌ Error: Verificación de EEPROM falló");
-    Serial.printf("❌ validMarker: esperado=0xCAFEBABE, leído=0x%08X\n", verification.validMarker);
-    Serial.printf("❌ count: esperado=%d, leído=%d\n", storedCodes->count, verification.count);
-  }
-  
-  Serial.println("═══════════════════════════════════════════");
-  return false;
-}
-
-// Sobrecarga para compatibilidad (keyboardId = 0)
-bool addCode(const char* type, const char* value, int relay) {
-  return addCode(type, value, 0, relay);
-}
+// (ver local_codes.h)
 
 // Función de diagnóstico eliminada para reducir tamaño del firmware
 
@@ -5348,9 +4719,7 @@ bool downloadAndUpdate(const String& downloadUrl) {
 }
 
 void handleOTAUpload() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   HTTPUpload& upload = server.upload();
   
@@ -5406,8 +4775,9 @@ void handleOTAUpload() {
         message += "\"serial\":\"" + fixedSerialNumber + "\",";
         message += "\"event_type\":\"OTA_UPDATE_SUCCESS\",";
         message += "\"new_version\":\"" + String(firmwareVersion) + "\",";
-        message += "\"source\":\"WEB_UPLOAD\"";
-        message += "}";
+        message +=
+          "\"source\":\"WEB_UPLOAD\""
+          "}";
         
         mqttClient.publish(topic.c_str(), message.c_str());
         Serial.println("📡 Evento de actualización OTA publicado");
@@ -5429,9 +4799,7 @@ void handleOTAUpload() {
 }
 
 void handleOTAConfig() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   bool configChanged = false;
   
@@ -5476,9 +4844,7 @@ void handleOTAConfig() {
 }
 
 void handleOTACheck() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   checkForUpdates();
   
@@ -5525,145 +4891,128 @@ void performRollback() {
 // =================== PÁGINA DE CONFIGURACIÓN OTA ===================
 
 void handleOTAPage() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<title>Configuración OTA - SWATID-A2</title>";
-  html += "<style>";
-  html += "body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#f5f5f5;}";
-  html += ".container{max-width:800px;margin:auto;background:#fff;padding:20px;border-radius:8px;box-shadow:0 0 10px rgba(0,0,0,0.1);}";
-  html += "h1,h2{color:#333;}";
-  html += ".form-group{margin-bottom:15px;}";
-  html += "label{display:block;margin-bottom:5px;font-weight:bold;}";
-  html += "input[type='text'],input[type='url'],input[type='number'],input[type='file']{width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;}";
-  html += "input[type='checkbox']{margin-right:5px;}";
-  html += "button{background:#007bff;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;margin-right:10px;}";
-  html += "button:hover{background:#0056b3;}";
-  html += ".btn-warning{background:#ffc107;color:#212529;}";
-  html += ".btn-warning:hover{background:#e0a800;}";
-  html += ".btn-success{background:#28a745;}";
-  html += ".btn-success:hover{background:#218838;}";
-  html += ".btn-danger{background:#dc3545;}";
-  html += ".btn-danger:hover{background:#c82333;}";
-  html += ".status-info{background:#e8f5e8;padding:15px;margin:15px 0;border-radius:5px;border-left:4px solid #28a745;}";
-  html += ".progress-container{margin:20px 0;}";
-  html += ".progress-bar{width:100%;height:20px;background:#f0f0f0;border-radius:10px;overflow:hidden;}";
-  html += ".progress-fill{height:100%;background:#007bff;transition:width 0.3s ease;}";
-  html += "</style></head><body>";
+  String html = webPageBegin("Configuración OTA - SWATID-A2");
   
-  html += "<div class='container'>";
-  html += "<h1>🔄 Configuración de Actualización OTA</h1>";
+  html +=
+    "<div class='container'>"
+    "<h1>🔄 Configuración de Actualización OTA</h1>";
   
   // Información actual del dispositivo
-  html += "<div class='status-info'>";
-  html += "<h2>📱 Información del Dispositivo</h2>";
-  html += "<p><strong>Versión Actual:</strong> " + String(firmwareVersion) + "</p>";
+  html +=
+    "<div class='status-info'>"
+    "<h2>📱 Información del Dispositivo</h2>";
+  html += "<p><strong>Versión Actual:</strong> " + String(firmwareFullVersion) + " (" HW_BOARD_NAME ")</p>";
   html += "<p><strong>Fecha de Compilación:</strong> " + String(firmwareBuild) + "</p>";
   html += "<p><strong>MAC Address:</strong> " + ETH.macAddress() + "</p>";
   html += "<p><strong>Serial Number:</strong> " + fixedSerialNumber + "</p>";
-  html += "<p><strong>Modelo:</strong> SWATID-A2</p>";
-  html += "</div>";
+  html +=
+    "<p><strong>Modelo:</strong> SWATID-A2</p>"
+    "</div>";
   
   // Actualización manual
-  html += "<h2>📤 Actualización Manual</h2>";
-  html += "<p>Subir archivo de firmware (.bin) para actualización manual:</p>";
+  html +=
+    "<h2>📤 Actualización Manual</h2>"
+    "<p>Subir archivo de firmware (.bin) para actualización manual:</p>";
   
-  html += "<form id='uploadForm' enctype='multipart/form-data'>";
-  html += "<div class='form-group'>";
-  html += "<label for='firmwareFile'>Archivo de Firmware (.bin):</label>";
-  html += "<input type='file' id='firmwareFile' name='firmwareFile' accept='.bin' required>";
-  html += "</div>";
-  html += "<button type='submit' class='btn-success'>Subir y Actualizar</button>";
-  html += "</form>";
+  html +=
+    "<form id='uploadForm' enctype='multipart/form-data'>"
+    "<div class='form-group'>"
+    "<label for='firmwareFile'>Archivo de Firmware (.bin):</label>"
+    "<input type='file' id='firmwareFile' name='firmwareFile' accept='.bin' required>"
+    "</div>"
+    "<button type='submit' class='btn-success'>Subir y Actualizar</button>"
+    "</form>";
   
   // Progreso de actualización
-  html += "<div id='uploadProgress' class='progress-container' style='display:none;'>";
-  html += "<div class='progress-bar'>";
-  html += "<div id='progressBar' class='progress-fill' style='width:0%;'></div>";
-  html += "</div>";
-  html += "<p id='progressText'>Preparando actualización...</p>";
-  html += "</div>";
+  html +=
+    "<div id='uploadProgress' class='progress-container' style='display:none;'>"
+    "<div class='progress-bar'>"
+    "<div id='progressBar' class='progress-fill' style='width:0%;'></div>"
+    "</div>"
+    "<p id='progressText'>Preparando actualización...</p>"
+    "</div>";
   
   // Información de seguridad
-  html += "<h2>⚠️ Información de Seguridad</h2>";
-  html += "<div class='status-info'>";
-  html += "<p><strong>Importante:</strong></p>";
-  html += "<ul>";
-  html += "<li>Solo suba archivos .bin compilados para ESP32</li>";
-  html += "<li>El archivo debe ser de un firmware válido para SWATID-A2</li>";
-  html += "<li>La actualización reiniciará el dispositivo automáticamente</li>";
-  html += "<li>Mantenga una copia de seguridad del firmware actual</li>";
-  html += "</ul>";
-  html += "</div>";
+  html +=
+    "<h2>⚠️ Información de Seguridad</h2>"
+    "<div class='status-info'>"
+    "<p><strong>Importante:</strong></p>"
+    "<ul>"
+    "<li>Solo suba archivos .bin compilados para ESP32</li>"
+    "<li>El archivo debe ser de un firmware válido para SWATID-A2</li>"
+    "<li>La actualización reiniciará el dispositivo automáticamente</li>"
+    "<li>Mantenga una copia de seguridad del firmware actual</li>"
+    "</ul>"
+    "</div>";
   
-  html += "<div style='margin-top:30px;text-align:center;'>";
-  html += "<a href='/'><button>🏠 Volver al Inicio</button></a>";
-  html += "</div>";
+  html +=
+    "<div style='margin-top:30px;text-align:center;'>"
+    "<a href='/'><button>🏠 Volver al Inicio</button></a>"
+    "</div>";
   
   html += "</div>";
   
   // JavaScript
-  html += "<script>";
-  html += "document.getElementById('uploadForm').addEventListener('submit', function(e) {";
-  html += "  e.preventDefault();";
-  html += "  const fileInput = document.getElementById('firmwareFile');";
-  html += "  const file = fileInput.files[0];";
-  html += "  if (!file) {";
-  html += "    alert('Por favor, seleccione un archivo');";
-  html += "    return;";
-  html += "  }";
-  html += "  if (!file.name.endsWith('.bin')) {";
-  html += "    alert('Solo archivos .bin permitidos');";
-  html += "    return;";
-  html += "  }";
-  html += "  if (file.size > 4 * 1024 * 1024) {";
-  html += "    alert('Archivo demasiado grande (máximo 4MB)');";
-  html += "    return;";
-  html += "  }";
-  html += "  if (!confirm('¿Está seguro de que desea actualizar el firmware? Esta acción reiniciará el dispositivo.')) {";
-  html += "    return;";
-  html += "  }";
-  html += "  document.getElementById('uploadProgress').style.display = 'block';";
-  html += "  document.getElementById('progressText').textContent = 'Subiendo archivo...';";
-  html += "  const formData = new FormData();";
-  html += "  formData.append('firmwareFile', file);";
-  html += "  const xhr = new XMLHttpRequest();";
-  html += "  xhr.upload.addEventListener('progress', function(e) {";
-  html += "    if (e.lengthComputable) {";
-  html += "      const percentComplete = (e.loaded / e.total) * 100;";
-  html += "      document.getElementById('progressBar').style.width = percentComplete + '%';";
-  html += "      document.getElementById('progressText').textContent = 'Subiendo: ' + Math.round(percentComplete) + '%';";
-  html += "    }";
-  html += "  });";
-  html += "  xhr.addEventListener('load', function() {";
-  html += "    if (xhr.status === 200) {";
-  html += "      document.getElementById('progressText').textContent = 'Actualización completada. Reiniciando...';";
-  html += "      document.getElementById('progressBar').style.width = '100%';";
-  html += "      setTimeout(() => {";
-  html += "        window.location.href = '/';";
-  html += "      }, 5000);";
-  html += "    } else {";
-  html += "      document.getElementById('uploadProgress').style.display = 'none';";
-  html += "      alert('Error en la actualización (HTTP ' + xhr.status + '): ' + xhr.responseText);";
-  html += "    }";
-  html += "  });";
-  html += "  xhr.addEventListener('error', function() {";
-  html += "    document.getElementById('uploadProgress').style.display = 'none';";
-  html += "    alert('Error de conexión. Verifique que el dispositivo esté conectado.');";
-  html += "  });";
-  html += "  xhr.addEventListener('timeout', function() {";
-  html += "    document.getElementById('uploadProgress').style.display = 'none';";
-  html += "    alert('Tiempo de espera agotado. El archivo puede ser demasiado grande.');";
-  html += "  });";
-  html += "  xhr.open('POST', '/ota/upload');";
-  html += "  xhr.timeout = 120000;";
-  html += "  xhr.send(formData);";
-  html += "});";
-  html += "</script>";
+  html +=
+    "<script>"
+    "document.getElementById('uploadForm').addEventListener('submit', function(e) {"
+    "  e.preventDefault();"
+    "  const fileInput = document.getElementById('firmwareFile');"
+    "  const file = fileInput.files[0];"
+    "  if (!file) {"
+    "    alert('Por favor, seleccione un archivo');"
+    "    return;"
+    "  }"
+    "  if (!file.name.endsWith('.bin')) {"
+    "    alert('Solo archivos .bin permitidos');"
+    "    return;"
+    "  }"
+    "  if (file.size > 4 * 1024 * 1024) {"
+    "    alert('Archivo demasiado grande (máximo 4MB)');"
+    "    return;"
+    "  }"
+    "  if (!confirm('¿Está seguro de que desea actualizar el firmware? Esta acción reiniciará el dispositivo.')) {"
+    "    return;"
+    "  }"
+    "  document.getElementById('uploadProgress').style.display = 'block';"
+    "  document.getElementById('progressText').textContent = 'Subiendo archivo...';"
+    "  const formData = new FormData();"
+    "  formData.append('firmwareFile', file);"
+    "  const xhr = new XMLHttpRequest();"
+    "  xhr.upload.addEventListener('progress', function(e) {"
+    "    if (e.lengthComputable) {"
+    "      const percentComplete = (e.loaded / e.total) * 100;"
+    "      document.getElementById('progressBar').style.width = percentComplete + '%';"
+    "      document.getElementById('progressText').textContent = 'Subiendo: ' + Math.round(percentComplete) + '%';"
+    "    }"
+    "  });"
+    "  xhr.addEventListener('load', function() {"
+    "    if (xhr.status === 200) {"
+    "      document.getElementById('progressText').textContent = 'Actualización completada. Reiniciando...';"
+    "      document.getElementById('progressBar').style.width = '100%';"
+    "      setTimeout(() => {"
+    "        window.location.href = '/';"
+    "      }, 5000);"
+    "    } else {"
+    "      document.getElementById('uploadProgress').style.display = 'none';"
+    "      alert('Error en la actualización (HTTP ' + xhr.status + '): ' + xhr.responseText);"
+    "    }"
+    "  });"
+    "  xhr.addEventListener('error', function() {"
+    "    document.getElementById('uploadProgress').style.display = 'none';"
+    "    alert('Error de conexión. Verifique que el dispositivo esté conectado.');"
+    "  });"
+    "  xhr.addEventListener('timeout', function() {"
+    "    document.getElementById('uploadProgress').style.display = 'none';"
+    "    alert('Tiempo de espera agotado. El archivo puede ser demasiado grande.');"
+    "  });"
+    "  xhr.open('POST', '/ota/upload');"
+    "  xhr.timeout = 120000;"
+    "  xhr.send(formData);"
+    "});"
+    "</script>";
   
   html += "</body></html>";
   
@@ -5671,9 +5020,7 @@ void handleOTAPage() {
 }
 
 void handleOTAStatus() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   DynamicJsonDocument status(512);
   status["current_version"] = firmwareVersion;
@@ -5698,64 +5045,23 @@ void handleOTAStatus() {
 
 // Página principal de configuración BLE
 void handleBLEPage() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
-  String html = R"=====(
-<!DOCTYPE HTML><html lang='es'>
-<head>
-  <meta charset='UTF-8'>
-  <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <title>Configuración BLE - SWATID</title>
-  <link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css'>
-  <style>
-    body{font-family:Arial,sans-serif;margin:0;padding:0;background:#f4f4f4;}
-    header{background:#35424a;color:#fff;padding:20px 0;text-align:center;}
-    main{padding:20px;}
-    .container{max-width:800px;margin:auto;background:#fff;padding:20px;border-radius:8px;box-shadow:0 0 10px rgba(0,0,0,0.1);}
-    h1,h2,h3{color:#333;}
-    .ble-status{padding:15px;margin:15px 0;border-radius:5px;border-left:4px solid #007bff;background:#e7f3ff;}
-    .ble-enabled{border-left-color:#28a745;background:#e8f5e8;}
-    .ble-warning{border-left-color:#ffc107;background:#fff3cd;}
-    .user-card{background:#f8f9fa;padding:15px;margin:10px 0;border-radius:5px;border:1px solid #dee2e6;}
-    .user-card.superadmin{border-color:#dc3545;background:#fff5f5;}
-    .user-card.active{border-color:#28a745;background:#f0fff0;}
-    .user-card.inactive{opacity:0.6;}
-    .btn{display:inline-block;padding:10px 20px;margin:5px;border:none;border-radius:5px;cursor:pointer;font-size:14px;text-decoration:none;}
-    .btn-danger{background:#dc3545;color:white;}
-    .btn-warning{background:#ffc107;color:#333;}
-    .btn-primary{background:#007bff;color:white;}
-    .btn-secondary{background:#6c757d;color:white;}
-    .btn:hover{opacity:0.8;}
-    table{width:100%;border-collapse:collapse;margin:15px 0;}
-    th,td{padding:12px;text-align:left;border-bottom:1px solid #ddd;}
-    th{background:#f8f9fa;}
-    .badge{padding:3px 8px;border-radius:3px;font-size:12px;}
-    .badge-success{background:#28a745;color:white;}
-    .badge-danger{background:#dc3545;color:white;}
-    .badge-warning{background:#ffc107;color:#333;}
-    .permissions{font-size:12px;color:#666;}
-    .confirm-box{background:#fff3cd;padding:15px;border-radius:5px;margin:15px 0;display:none;}
-    nav{background:#2c3e50;padding:10px;}
-    nav a{color:white;margin:0 10px;text-decoration:none;}
-    nav a:hover{text-decoration:underline;}
-  </style>
-</head>
-<body>
+  String html = webPageBegin("Configuración BLE - SWATID");
+  html += R"=====(
   <header>
-    <h1><i class='fas fa-bluetooth-b'></i> Configuración BLE</h1>
+    <h1>Configuración BLE</h1>
     <p>Gestión de vinculaciones Bluetooth</p>
   </header>
   <nav>
-    <a href='/'><i class='fas fa-home'></i> Inicio</a>
-    <a href='/codes'><i class='fas fa-key'></i> Códigos</a>
-    <a href='/digital_inputs'><i class='fas fa-sign-in-alt'></i> Entradas</a>
-    <a href='/ota'><i class='fas fa-cloud-download-alt'></i> OTA</a>
+    <a href='/'>Inicio</a>
+    <a href='/codes'>Códigos</a>
+    <a href='/digital_inputs'>Entradas</a>
+    <a href='/ota'>OTA</a>
   </nav>
   <main>
     <div class='container'>
-      <h2><i class='fas fa-info-circle'></i> Estado BLE</h2>
+      <h2>Estado BLE</h2>
       <div id='ble-status' class='ble-status'>
         <p><strong>Nombre del dispositivo:</strong> <span id='ble-name'>)=====";
   html += fixedSerialNumber;
@@ -5766,9 +5072,9 @@ void handleBLEPage() {
   html += R"=====(</span></p>
       </div>
       
-      <h2><i class='fas fa-user-shield'></i> Superadmin</h2>
+      <h2>Superadmin</h2>
       <div class='user-card superadmin'>
-        <h3><i class='fas fa-crown'></i> Superadministrador</h3>
+        <h3>Superadministrador</h3>
         <p><strong>Estado:</strong> )=====";
   html += bleAuthConfig.superadmin_registered ? 
     "<span class='badge badge-success'>Registrado</span>" : 
@@ -5785,12 +5091,12 @@ void handleBLEPage() {
   }
   
   html += R"=====(
-        <p class='permissions'><i class='fas fa-key'></i> Permisos: Todos (0xFF)</p>
+        <p class='permissions'>Permisos: Todos (0xFF)</p>
         <p><small>El superadmin se registra automáticamente cuando el primer dispositivo se vincula con una clave de 64 bytes.</small></p>
-        <button class='btn btn-danger' onclick='confirmClearSuperadmin()'><i class='fas fa-trash'></i> Eliminar Superadmin</button>
+        <button class='btn btn-danger' onclick='confirmClearSuperadmin()'>Eliminar Superadmin</button>
       </div>
       
-      <h2><i class='fas fa-users'></i> Usuarios Vinculados</h2>
+      <h2>Usuarios Vinculados</h2>
       <table>
         <tr>
           <th>#</th>
@@ -5837,7 +5143,7 @@ void handleBLEPage() {
     // Acciones
     html += "<td>";
     if (bleAuthConfig.user_enabled[i]) {
-      html += "<a class='btn btn-danger' href='/ble/clear-user?slot=" + String(i + 1) + "' onclick='return confirm(\"¿Eliminar usuario " + String(i + 1) + "?\")'><i class='fas fa-user-minus'></i></a>";
+      html += "<a class='btn btn-danger' href='/ble/clear-user?slot=" + String(i + 1) + "' onclick='return confirm(\"¿Eliminar usuario " + String(i + 1) + "?\")'></a>";
     }
     html += "</td></tr>";
   }
@@ -5845,28 +5151,28 @@ void handleBLEPage() {
   html += R"=====(
       </table>
       
-      <h2><i class='fas fa-exclamation-triangle'></i> Zona de Peligro</h2>
+      <h2>Zona de Peligro</h2>
       <div class='ble-warning'>
         <p><strong>Atención:</strong> Las siguientes acciones son irreversibles.</p>
-        <button class='btn btn-danger' onclick='confirmClearAll()'><i class='fas fa-trash-alt'></i> Eliminar TODAS las vinculaciones</button>
+        <button class='btn btn-danger' onclick='confirmClearAll()'>Eliminar TODAS las vinculaciones</button>
         <p><small>Esto eliminará el superadmin y todos los usuarios. El próximo dispositivo en conectarse se convertirá en superadmin.</small></p>
       </div>
       
       <div id='confirm-superadmin' class='confirm-box'>
         <p><strong>¿Está seguro de eliminar el Superadmin?</strong></p>
         <p>El próximo dispositivo en enviar una clave se convertirá en el nuevo superadmin.</p>
-        <a class='btn btn-danger' href='/ble/clear-superadmin'><i class='fas fa-check'></i> Confirmar</a>
-        <button class='btn btn-secondary' onclick='hideConfirm("superadmin")'><i class='fas fa-times'></i> Cancelar</button>
+        <a class='btn btn-danger' href='/ble/clear-superadmin'>Confirmar</a>
+        <button class='btn btn-secondary' onclick='hideConfirm("superadmin")'>Cancelar</button>
       </div>
       
       <div id='confirm-all' class='confirm-box'>
         <p><strong>¿Está seguro de eliminar TODAS las vinculaciones?</strong></p>
         <p>Se eliminarán el superadmin y los 5 usuarios.</p>
-        <a class='btn btn-danger' href='/ble/clear-all'><i class='fas fa-check'></i> Confirmar</a>
-        <button class='btn btn-secondary' onclick='hideConfirm("all")'><i class='fas fa-times'></i> Cancelar</button>
+        <a class='btn btn-danger' href='/ble/clear-all'>Confirmar</a>
+        <button class='btn btn-secondary' onclick='hideConfirm("all")'>Cancelar</button>
       </div>
       
-      <h2><i class='fas fa-bug'></i> Información de Debug</h2>
+      <h2>Información de Debug</h2>
       <div class='ble-status' style='font-family:monospace;font-size:12px;'>)=====";
   
   // Debug info
@@ -5915,9 +5221,7 @@ void handleBLEPage() {
 
 // Limpiar todas las vinculaciones BLE
 void handleBLEClearAll() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("🔵 [BLE] Limpiando TODAS las vinculaciones...");
   
@@ -5962,9 +5266,7 @@ void handleBLEClearAll() {
 
 // Limpiar superadmin
 void handleBLEClearSuperadmin() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   Serial.println("🔵 [BLE] Eliminando superadmin...");
   
@@ -6002,9 +5304,7 @@ void handleBLEClearSuperadmin() {
 
 // Limpiar un usuario específico
 void handleBLEClearUser() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   if (!server.hasArg("slot")) {
     server.send(400, "text/plain", "Falta parámetro slot");
@@ -6060,9 +5360,7 @@ void handleBLEClearUser() {
 
 // API para obtener estado BLE
 void handleBLEStatus() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
   
   DynamicJsonDocument doc(1024);
   doc["name"] = fixedSerialNumber;
@@ -6105,68 +5403,7 @@ void handleBLEStatus() {
    return false;
  }
  
-bool isCodeStored(const char* type, const char* value, int keyboardId, int* relay) {
-  for (int i = 0; i < storedCodes->count; i++) {
-    if (strcmp(storedCodes->codes[i].type, type) == 0 &&
-        strcmp(storedCodes->codes[i].value, value) == 0) {
-      
-      if (storedCodes->version == 1) {
-        // Formato antiguo: válido en cualquier teclado
-        if (relay != nullptr) *relay = storedCodes->codes[i].relay;
-        return true;
-      } else {
-        // Formato nuevo: verificar teclado
-        if (storedCodes->codes[i].keyboard_id == 0 || 
-            storedCodes->codes[i].keyboard_id == keyboardId) {
-          if (relay != nullptr) *relay = storedCodes->codes[i].relay;
-          return true;
-        }
-      }
-    }
-  }
-  return false;
-}
-
-// Sobrecarga para compatibilidad
-bool isCodeStored(const char* type, const char* value, int* relay) {
-  return isCodeStored(type, value, 0, relay);
-}
- 
- bool isCodeStored(const char* type, const char* value) {
-   return isCodeStored(type, value, nullptr);
- }
- 
- // =================== CONFIGURACIÓN MODO AP - MEJORADO ===================
- void setupAPMode() {
-   Serial.println("🔧 === MODO AP DE EMERGENCIA ===");
-   String macSuffix = fixedSerialNumber.substring(fixedSerialNumber.length() - 6);
-   String apSSID = "SWATID_CONFIG_" + macSuffix;
-   String apPassword = "12345678";
-
-   WiFi.mode(WIFI_AP);
-   WiFi.softAP(apSSID.c_str(), apPassword.c_str());
-
-   IPAddress apIP(192, 168, 4, 1);
-   IPAddress apGateway(192, 168, 4, 1);
-   IPAddress apSubnet(255, 255, 255, 0);
-   WiFi.softAPConfig(apIP, apGateway, apSubnet);
-
-   Serial.printf("📶 SSID: %s\n", apSSID.c_str());
-   Serial.printf("📶 Password: %s\n", apPassword.c_str());
-   Serial.printf("📶 IP: %s\n", apIP.toString().c_str());
-   Serial.println("📶 Conectar a esta red WiFi para configurar");
-
-   ip = apIP; // Actualizar IP global
-   apModeActive = true;
-   // El servidor web ya está arrancado desde setup() (escucha en todas las
-   // interfaces), no hay que reiniciarlo aquí
-
-   // Iniciar mDNS para acceso fácil
-  if (MDNS.begin(deviceName)) {
-    Serial.printf("📶 mDNS: http://%s.local\n", deviceName);
-     MDNS.addService("http", "tcp", 80);
-   }
- }
+// (ver local_codes.h)
  
  // =================== SERVIDOR WEB ===================
  void setupWebServer() {
@@ -6226,8 +5463,12 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
   server.on("/api/ble/status", HTTP_GET, handleBLEStatus);
 #endif
 
+  // =================== RUTAS DE RED (wifi_manager / gsm_modem) ===================
+  wifiRegisterWebRoutes();   // /wifi, /api/wifi/*
+  gsmRegisterWebRoutes();    // /api/gsm/* (solo targets con GSM)
+
   server.onNotFound(handleNotFound);
-   
+
    server.begin();
    Serial.println("🌐 Servidor web iniciado");
    
@@ -6239,60 +5480,23 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
  // =================== MANEJADORES WEB ===================
  // =================== MANEJADORES WEB ===================
  void handleRoot() {
-   if (!server.authenticate(admin_user, admin_password)) {
-     return server.requestAuthentication();
-   }
+   if (!webAuth()) return;
  
-   String html = "<!DOCTYPE HTML><html lang='es'>";
-   html += "<head><meta charset='UTF-8'>";
-   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-   html += "<title>Controladora A2 - SWATID</title>";
-   html += "<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css'>";
-   html += "<style>";
-   html += "body{font-family:Arial,sans-serif;margin:0;padding:0;background:#f4f4f4;}";
-   html += "header{background:#35424a;color:#fff;padding:20px 0;text-align:center;}";
-   html += "main{padding:20px;}";
-   html += ".container{max-width:1000px;margin:auto;background:#fff;padding:20px;border-radius:8px;box-shadow:0 0 10px rgba(0,0,0,0.1);}";
-   html += "h1,h2{color:#333;}";
-   html += ".security-status{background:#fff3cd;padding:15px;margin:15px 0;border-radius:5px;border-left:4px solid #ffc107;}";
-   html += ".security-blocked{background:#f8d7da;border-left-color:#dc3545;}";
-   html += ".dual-status{background:#e8f5e8;padding:15px;margin:15px 0;border-radius:5px;border-left:4px solid #28a745;}";
-   html += ".form-group{margin-bottom:15px;}";
-   html += "label{display:block;margin-bottom:5px;font-weight:bold;}";
-   html += "input,select{width:100%;padding:10px;border:1px solid #ccc;border-radius:4px;}";
-   html += "button{padding:10px 15px;border:none;border-radius:4px;cursor:pointer;background:#4CAF50;color:white;font-size:16px;margin:5px;}";
-   html += "button:hover{background:#45a049;}";
-   html += ".btn-danger{background:#dc3545;}";
-   html += ".btn-warning{background:#ffc107;color:#000;}";
-   html += ".btn-info{background:#17a2b8;}";
-   html += ".export-section{margin:20px 0;padding:15px;background:#f8f9fa;border:1px solid #dee2e6;border-radius:5px;text-align:center;}";
-   html += ".time-sync-section{margin:20px 0;padding:15px;background:#e8f4fd;border:1px solid #bee5eb;border-radius:5px;}";
-   html += "table{width:100%;border-collapse:collapse;margin-top:20px;}";
-   html += "th,td{border:1px solid #ddd;padding:8px;text-align:center;}";
-   html += "th{background-color:#f2f2f2;}";
-   html += ".actions a{margin-right:10px;text-decoration:none;}";
-   html += ".icon{margin-right:5px;}";
-  html += ".readonly{background-color:#e9ecef;color:#6c757d;}";
-  html += ".security-controls{margin-top:20px;padding:15px;background:#f8f9fa;border-radius:8px;border:1px solid #dee2e6;}";
-  html += ".security-controls h3{margin-top:0;color:#495057;}";
-  html += ".security-controls button{margin:5px;padding:10px 15px;border:none;border-radius:5px;cursor:pointer;font-size:14px;}";
-  html += ".btn-success{background-color:#28a745;color:white;}";
-  html += ".btn-warning{background-color:#ffc107;color:#212529;}";
-  html += ".btn-success:hover{background-color:#218838;}";
-  html += ".btn-warning:hover{background-color:#e0a800;}";
-  html += "</style></head><body>";
+   String html = webPageBegin("Controladora A2 - SWATID");
  
-   html += "<header><h1><i class='fas fa-keyboard icon'></i>Controladora A2 - SWATID</h1>";
+   html += "<header><h1>Controladora A2 - SWATID</h1>";
    html += "<p>Device: <strong>" + String(deviceName) + "</strong> | Serial: <strong>" + fixedSerialNumber + "</strong></p>";
-   html += "<p>IP: " + ip.toString() + " | Firmware: <strong>" + firmwareVersion + "</strong> | Build: <strong>" + firmwareBuild + "</strong></p></header>";
+   html += "<p>Hardware: <strong>" HW_BOARD_NAME "</strong> | Firmware: <strong>" + String(firmwareFullVersion) + "</strong> | Build: " + firmwareBuild + "</p>";
+   html += "<p>IP: " + ip.toString() + "</p></header>";
  
    html += "<main><div class='container'>";
  
    // Estado de seguridad
    html += "<div class='security-status" + String(localAccessBlocked ? " security-blocked" : "") + "'>";
-   html += "<h2><i class='fas fa-shield-alt icon'></i>Estado de Seguridad</h2>";
-   html += "<table>";
-   html += "<tr><th>Parámetro</th><th>Valor</th></tr>";
+   html +=
+     "<h2>Estado de Seguridad</h2>"
+     "<table>"
+     "<tr><th>Parámetro</th><th>Valor</th></tr>";
   html += "<tr><td>Acceso Local</td><td>" + String(localAccessBlocked ? "🔒 BLOQUEADO" : "🔓 Permitido") + "</td></tr>";
   html += "<tr><td>Lectura Teclados</td><td>" + String(keyboardReadingEnabled ? "🔓 Habilitada" : "🔒 Deshabilitada") + "</td></tr>";
   html += "<tr><td>Intentos fallidos</td><td>" + String(failedAttempts) + "/" + String(maxFailedAttempts) + "</td></tr>";
@@ -6305,40 +5509,45 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
   html += "</table>";
   
   // Botones de control de seguridad
-  html += "<div class='security-controls'>";
-  html += "<h3><i class='fas fa-cogs icon'></i>Controles de Seguridad</h3>";
+  html +=
+    "<div class='security-controls'>"
+    "<h3>Controles de Seguridad</h3>";
   
   // Botones de bloqueo de acceso local
   if (localAccessBlocked) {
-    html += "<a href='/security/unblock-access'><button class='btn-success'><i class='fas fa-unlock icon'></i>Desbloquear Acceso Local</button></a>";
+    html += "<a href='/security/unblock-access'><button class='btn-success'>Desbloquear Acceso Local</button></a>";
   } else {
-    html += "<a href='/security/block-access'><button class='btn-warning'><i class='fas fa-lock icon'></i>Bloquear Acceso Local</button></a>";
+    html += "<a href='/security/block-access'><button class='btn-warning'>Bloquear Acceso Local</button></a>";
   }
   
   // Botones de control de lectura de teclados
   if (keyboardReadingEnabled) {
-    html += "<a href='/security/disable-keyboards'><button class='btn-warning'><i class='fas fa-keyboard icon'></i>Deshabilitar Lectura Teclados</button></a>";
+    html += "<a href='/security/disable-keyboards'><button class='btn-warning'>Deshabilitar Lectura Teclados</button></a>";
   } else {
-    html += "<a href='/security/enable-keyboards'><button class='btn-success'><i class='fas fa-keyboard icon'></i>Habilitar Lectura Teclados</button></a>";
+    html += "<a href='/security/enable-keyboards'><button class='btn-success'>Habilitar Lectura Teclados</button></a>";
   }
   
-  html += "</div>";
-  html += "</div>";
+  html +=
+    "</div>"
+    "</div>";
  
    // Estado de teclados duales
-   html += "<div class='dual-status'>";
-   html += "<h2><i class='fas fa-keyboard icon'></i>Estado de Teclados Wiegand Duales</h2>";
-   html += "<table>";
-   html += "<tr><th>Teclado</th><th>Pines GPIO</th><th>Estado</th><th>Función</th></tr>";
+   html +=
+     "<div class='dual-status'>"
+     "<h2>Estado de Teclados Wiegand Duales</h2>"
+     "<table>"
+     "<tr><th>Teclado</th><th>Pines GPIO</th><th>Estado</th><th>Función</th></tr>";
    html += "<tr><td>Teclado 1</td><td>" + String(WIEGAND1_D0) + "/" + String(WIEGAND1_D1) + "</td><td style='color:green'>✅ Activo</td><td>Principal</td></tr>";
    html += "<tr><td>Teclado 2</td><td>" + String(WIEGAND2_D0) + "/" + String(WIEGAND2_D1) + "</td><td style='color:green'>✅ Activo</td><td>Secundario</td></tr>";
-   html += "</table>";
-   html += "<p><strong>💡 Sistema Dual Operativo:</strong> Ambos teclados funcionan simultáneamente</p>";
-   html += "</div>";
+   html +=
+     "</table>"
+     "<p><strong>💡 Sistema Dual Operativo:</strong> Ambos teclados funcionan simultáneamente</p>"
+     "</div>";
  
    // Formulario de configuración
-   html += "<h2><i class='fas fa-cogs icon'></i>Configuración del Dispositivo</h2>";
-   html += "<form action='/save' method='post'>";
+   html +=
+     "<h2>Configuración del Dispositivo</h2>"
+     "<form action='/save' method='post'>";
  
    html += "<div class='form-group'><label for='deviceName'>Nombre del dispositivo (editable):</label>";
     html += "<input type='text' id='deviceName' name='deviceName' value='" + String(deviceName) + "'></div>";
@@ -6352,6 +5561,16 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
   html += "<div class='form-group'><label for='useDhcp'>Usar DHCP:</label><select id='useDhcp' name='useDhcp' onchange='toggleIpFields()'>";
   html += useDhcp ? "<option value='1' selected>Sí</option><option value='0'>No</option>" : "<option value='1'>Sí</option><option value='0' selected>No</option>";
   html += "</select></div>";
+
+  // Con DHCP: mostrar la IP y puerta de enlace realmente asignadas (solo lectura)
+  {
+    String curGw = ethConnected ? ETH.gatewayIP().toString()
+                                : (wifiStaConnected() ? WiFi.gatewayIP().toString() : String("--"));
+    html += "<div id='dhcpInfo' style='display:" + String(useDhcp ? "block" : "none") + "'>";
+    html += "<div class='form-group'><label>IP asignada (DHCP):</label><input type='text' value='" + ip.toString() + "' class='readonly' readonly></div>";
+    html += "<div class='form-group'><label>Puerta de enlace:</label><input type='text' value='" + curGw + "' class='readonly' readonly></div>";
+    html += "</div>";
+  }
 
   html += "<div class='form-group'><label for='validationMode'>Modo de Validación:</label><select id='validationMode' name='validationMode'>";
   html += storedCodes->localValidationFirst ? 
@@ -6367,95 +5586,116 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
    html += "<div class='form-group'><label for='staticDns'>DNS:</label><input type='text' id='staticDns' name='staticDns' value='" + staticDns.toString() + "'></div>";
    html += "</div>";
  
-  html += "<button type='submit'><i class='fas fa-save icon'></i>Guardar configuración</button>";
-  html += "</form>";
+  html +=
+    "<button type='submit'>Guardar configuración</button>"
+    "</form>";
   
   // Sección de sincronización de tiempo
-  html += "<div class='time-sync-section'>";
-  html += "<h3><i class='fas fa-clock icon'></i>Sincronización de Tiempo</h3>";
+  html +=
+    "<div class='time-sync-section'>"
+    "<h3>Sincronización de Tiempo</h3>";
    html += "<p><strong>Hora actual:</strong> " + String(currentTimeString) + "</p>";
   html += "<p><strong>Estado:</strong> " + String(timeSynced ? "✅ Sincronizado" : "❌ No sincronizado") + "</p>";
-  html += "<a href='/time/sync'><button class='btn-info'><i class='fas fa-sync icon'></i>Sincronizar Hora</button></a>";
-  html += "</div>";
+  html +=
+    "<a href='/time/sync'><button class='btn-info'>Sincronizar Hora</button></a>"
+    "</div>";
  
    // Cambio de contraseña
-   html += "<h2><i class='fas fa-lock icon'></i>Cambiar contraseña</h2>";
-   html += "<form action='/changepass' method='post'>";
-   html += "<div class='form-group'><label for='newPassword'>Nueva contraseña:</label>";
-   html += "<input type='password' id='newPassword' name='newPassword'></div>";
-   html += "<button type='submit'><i class='fas fa-key icon'></i>Cambiar contraseña</button>";
-   html += "</form>";
+   html +=
+     "<h2>Cambiar contraseña</h2>"
+     "<form action='/changepass' method='post'>"
+     "<div class='form-group'><label for='newPassword'>Nueva contraseña:</label>"
+     "<input type='password' id='newPassword' name='newPassword'></div>"
+     "<button type='submit'>Cambiar contraseña</button>"
+     "</form>";
 
    // Configuración del Modo Torno
-   html += "<h2><i class='fas fa-sync-alt icon'></i>Configuración del Modo Torno</h2>";
-   html += "<div class='dual-status'>";
-   html += "<p><strong>🔄 Modo Torno:</strong> Permite control bidireccional donde cada teclado controla un relé específico.</p>";
+   html +=
+     "<h2>Configuración del Modo Torno</h2>"
+     "<div class='dual-status'>"
+     "<p><strong>🔄 Modo Torno:</strong> Permite control bidireccional donde cada teclado controla un relé específico.</p>";
    html += "<p><strong>Estado actual:</strong> " + String(isTurnstileModeEnabled() ? "✓ ACTIVO" : "○ INACTIVO") + "</p>";
    if (isTurnstileModeEnabled()) {
-     html += "<p><strong>Mapeo actual:</strong></p>";
-     html += "<ul>";
+     html +=
+       "<p><strong>Mapeo actual:</strong></p>"
+       "<ul>";
      html += "<li>Teclado 1 (GPIO 33/14) → Relé " + String(config.turnstile.keyboard1_relay) + "</li>";
      html += "<li>Teclado 2 (GPIO 4/16) → Relé " + String(config.turnstile.keyboard2_relay) + "</li>";
      html += "</ul>";
    }
    html += "</div>";
    
-   html += "<form action='/turnstile/config' method='post'>";
-   html += "<div class='form-group'>";
-   html += "<label for='turnstile_mode'>Modo de Operación:</label>";
-   html += "<select name='turnstile_mode' id='turnstile_mode'>";
+   html +=
+     "<form action='/turnstile/config' method='post'>"
+     "<div class='form-group'>"
+     "<label for='turnstile_mode'>Modo de Operación:</label>"
+     "<select name='turnstile_mode' id='turnstile_mode'>";
    html += "<option value='normal'" + String(!isTurnstileModeEnabled() ? " selected" : "") + ">1️⃣ Modo Normal</option>";
    html += "<option value='turnstile'" + String(isTurnstileModeEnabled() ? " selected" : "") + ">2️⃣ Modo Torno</option>";
-   html += "</select>";
-   html += "</div>";
+   html +=
+     "</select>"
+     "</div>";
    
-   html += "<div class='form-group'>";
-   html += "<label for='keyboard1_relay'>Teclado 1 (GPIO 33/14) → Relé:</label>";
-   html += "<select name='keyboard1_relay' id='keyboard1_relay'>";
+   html +=
+     "<div class='form-group'>"
+     "<label for='keyboard1_relay'>Teclado 1 (GPIO 33/14) → Relé:</label>"
+     "<select name='keyboard1_relay' id='keyboard1_relay'>";
    html += "<option value='1'" + String(config.turnstile.keyboard1_relay == 1 ? " selected" : "") + ">Relé 1</option>";
    html += "<option value='2'" + String(config.turnstile.keyboard1_relay == 2 ? " selected" : "") + ">Relé 2</option>";
-   html += "</select>";
-   html += "</div>";
+   html +=
+     "</select>"
+     "</div>";
    
-   html += "<div class='form-group'>";
-   html += "<label for='keyboard2_relay'>Teclado 2 (GPIO 4/16) → Relé:</label>";
-   html += "<select name='keyboard2_relay' id='keyboard2_relay'>";
+   html +=
+     "<div class='form-group'>"
+     "<label for='keyboard2_relay'>Teclado 2 (GPIO 4/16) → Relé:</label>"
+     "<select name='keyboard2_relay' id='keyboard2_relay'>";
    html += "<option value='1'" + String(config.turnstile.keyboard2_relay == 1 ? " selected" : "") + ">Relé 1</option>";
    html += "<option value='2'" + String(config.turnstile.keyboard2_relay == 2 ? " selected" : "") + ">Relé 2</option>";
-   html += "</select>";
-   html += "</div>";
+   html +=
+     "</select>"
+     "</div>";
    
-   html += "<button type='submit'><i class='fas fa-save icon'></i>Guardar Configuración del Torno</button>";
-   html += "</form>";
+   html +=
+     "<button type='submit'>Guardar Configuración del Torno</button>"
+     "</form>";
    
    // Estado de solicitud pendiente
    if (isTurnstileModeEnabled() && pendingRequest.active) {
-     html += "<div class='security-status'>";
-     html += "<h3><i class='fas fa-clock icon'></i>Solicitud Pendiente</h3>";
+     html +=
+       "<div class='security-status'>"
+       "<h3>Solicitud Pendiente</h3>";
      html += "<p><strong>Código:</strong> " + String(pendingRequest.code) + " (" + String(pendingRequest.type) + ")</p>";
      html += "<p><strong>Teclado:</strong> " + String(pendingRequest.keyboard_id == 1 ? "Teclado 1" : "Teclado 2") + "</p>";
      html += "<p><strong>Relé a abrir:</strong> " + String(pendingRequest.relay_to_open) + "</p>";
      html += "<p><strong>Tiempo transcurrido:</strong> " + String((millis() - pendingRequest.timestamp) / 1000) + "s / 30s</p>";
-     html += "<a href='/turnstile/reset'><button class='btn-warning'><i class='fas fa-times icon'></i>Cancelar Solicitud</button></a>";
-     html += "</div>";
+     html +=
+       "<a href='/turnstile/reset'><button class='btn-warning'>Cancelar Solicitud</button></a>"
+       "</div>";
    }
 
   // Acciones rápidas
-  html += "<h2><i class='fas fa-bolt icon'></i>Acciones</h2><div class='actions'>";
- html += "<a href='/rele?relay=1'><button><i class='fas fa-door-open icon'></i>Relé 1 ON</button></a>";
- html += "<a href='/rele?relay=2'><button><i class='fas fa-door-open icon'></i>Relé 2 ON</button></a>";
- html += "<a href='/codes'><button class='btn-info'><i class='fas fa-database icon'></i>Gestión de Códigos</button></a>";
- html += "<a href='/remote-codes'><button class='btn-info'><i class='fas fa-cloud icon'></i>Códigos Remotos</button></a>";
- html += "<a href='/digital_inputs'><button class='btn-info'><i class='fas fa-plug icon'></i>Entradas Digitales</button></a>";
-#ifdef ENABLE_BLE
- html += "<a href='/ble'><button class='btn-info'><i class='fas fa-bluetooth-b icon'></i>Config BLE</button></a>";
+  html +=
+    "<h2>Acciones</h2><div class='actions'>"
+    "<a href='/rele?relay=1'><button>Relé 1 ON</button></a>"
+    "<a href='/rele?relay=2'><button>Relé 2 ON</button></a>"
+    "<a href='/codes'><button class='btn-info'>Gestión de Códigos</button></a>"
+    "<a href='/remote-codes'><button class='btn-info'>Códigos Remotos</button></a>"
+    "<a href='/digital_inputs'><button class='btn-info'>Entradas Digitales</button></a>"
+    "<a href='/wifi'><button class='btn-info'>📶 Red WiFi</button></a>";
+#if A2_FEATURE_GSM_MODEM
+  html += "<a href='/gsm'><button class='btn-info'>📡 Módem 4G</button></a>";
 #endif
- html += "<a href='/reboot'><button class='btn-warning'><i class='fas fa-sync-alt icon'></i>Reiniciar</button></a>";
- html += "<a href='/reset'><button class='btn-danger'><i class='fas fa-exclamation-triangle icon'></i>Resetear</button></a>";
-  html += "</div>";
+#ifdef ENABLE_BLE
+ html += "<a href='/ble'><button class='btn-info'>Config BLE</button></a>";
+#endif
+ html +=
+   "<a href='/reboot'><button class='btn-warning'>Reiniciar</button></a>"
+   "<a href='/reset'><button class='btn-danger'>Resetear</button></a>"
+   "</div>";
  
    // Último acceso con información de teclado
-   html += "<h2><i class='fas fa-history icon'></i>Último acceso</h2><table><tr><th>Tipo</th><th>Código</th><th>Hora</th><th>Teclado</th></tr>";
+   html += "<h2>Último acceso</h2><table><tr><th>Tipo</th><th>Código</th><th>Hora</th><th>Teclado</th></tr>";
    if (strlen(lastCode) > 0) {
       html += "<tr><td>" + String(lastType) + "</td><td>" + String(lastCode) + "</td><td>" + String(lastTime) + "</td><td>" + String(lastKeyboardId) + "</td></tr>";
    } else {
@@ -6464,9 +5704,10 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
    html += "</table>";
  
    // Estado de conexión
-   html += "<h2><i class='fas fa-network-wired icon'></i>Estado de Conexión</h2>";
-   html += "<table>";
-   html += "<tr><th>Elemento</th><th>Estado</th></tr>";
+   html +=
+     "<h2>Estado de Conexión</h2>"
+     "<table>"
+     "<tr><th>Elemento</th><th>Estado</th></tr>";
    html += "<tr><td>Red (Ethernet)</td><td>" + String(ethConnected ? "Conectado" : "Desconectado") + "</td></tr>";
  
    String mqttStatus = "Pendiente";
@@ -6485,10 +5726,11 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
   html += "</table>";
 
   // =================== SECCIÓN OTA ===================
-  html += "<div class='security-status'>";
-  html += "<h2><i class='fas fa-download icon'></i>Actualización de Firmware</h2>";
-  html += "<table>";
-  html += "<tr><th>Parámetro</th><th>Valor</th></tr>";
+  html +=
+    "<div class='security-status'>"
+    "<h2>Actualización de Firmware</h2>"
+    "<table>"
+    "<tr><th>Parámetro</th><th>Valor</th></tr>";
   html += "<tr><td>Versión Actual</td><td><strong>" + String(firmwareVersion) + "</strong></td></tr>";
   html += "<tr><td>Fecha de Compilación</td><td>" + String(firmwareBuild) + "</td></tr>";
   html += "<tr><td>Actualización Automática</td><td>" + String(otaConfig.autoUpdateEnabled ? "✅ Habilitada" : "❌ Deshabilitada") + "</td></tr>";
@@ -6497,50 +5739,53 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
   html += "<tr><td>Última Verificación</td><td>" + String(otaConfig.lastCheck > 0 ? "Hace " + String((millis() - otaConfig.lastCheck) / 3600000) + " horas" : "Nunca") + "</td></tr>";
   html += "</table>";
   
-  html += "<div style='margin-top: 15px;'>";
-  html += "<a href='/ota'><button class='btn btn-primary'>Configurar Actualizaciones</button></a>";
-  html += "<button onclick='checkForUpdates()' class='btn btn-warning' style='margin-left: 10px;'>Verificar Ahora</button>";
-  html += "</div>";
-  html += "</div>";
+  html +=
+    "<div style='margin-top: 15px;'>"
+    "<a href='/ota'><button class='btn btn-primary'>Configurar Actualizaciones</button></a>"
+    "<button onclick='checkForUpdates()' class='btn btn-warning' style='margin-left: 10px;'>Verificar Ahora</button>"
+    "</div>"
+    "</div>";
 
   html += "</div></main>";
    
    // Pie de página con datos de contacto
-   html += "<footer style='background-color: #2c3e50; color: white; padding: 20px; text-align: center; margin-top: 30px;'>";
-   html += "<div style='max-width: 800px; margin: 0 auto;'>";
-   html += "<h3 style='margin: 0 0 10px 0; color: #ecf0f1;'>Smart World And Things SLU</h3>";
-   html += "<p style='margin: 5px 0; font-size: 14px;'>";
-   html += "<strong>Web:</strong> <a href='https://www.swat-id.com' style='color: #3498db; text-decoration: none;'>www.swat-id.com</a> | ";
-   html += "<strong>Tel:</strong> 633 44 84 27 | ";
-   html += "<strong>Email:</strong> <a href='mailto:info@swat-id.com' style='color: #3498db; text-decoration: none;'>info@swat-id.com</a>";
-   html += "</p>";
-   html += "<p style='margin: 5px 0; font-size: 12px; color: #bdc3c7;'>Controladora A2 - SWATID | Sistema de Control de Acceso Dual Wiegand</p>";
-   html += "</div>";
-   html += "</footer>";
+   html +=
+     "<footer style='background-color: #2c3e50; color: white; padding: 20px; text-align: center; margin-top: 30px;'>"
+     "<div style='max-width: 800px; margin: 0 auto;'>"
+     "<h3 style='margin: 0 0 10px 0; color: #ecf0f1;'>Smart World And Things SLU</h3>"
+     "<p style='margin: 5px 0; font-size: 14px;'>"
+     "<strong>Web:</strong> <a href='https://www.swat-id.com' style='color: #3498db; text-decoration: none;'>www.swat-id.com</a> | "
+     "<strong>Tel:</strong> 633 44 84 27 | "
+     "<strong>Email:</strong> <a href='mailto:info@swat-id.com' style='color: #3498db; text-decoration: none;'>info@swat-id.com</a>"
+     "</p>"
+     "<p style='margin: 5px 0; font-size: 12px; color: #bdc3c7;'>Controladora A2 - SWATID | Sistema de Control de Acceso Dual Wiegand</p>"
+     "</div>"
+     "</footer>";
    
-   html += "<script>";
-   html += "function toggleIpFields(){document.getElementById('staticIpFields').style.display=(document.getElementById('useDhcp').value=='1')?'none':'block';}";
-   html += "function checkForUpdates() {";
-   html += "  fetch('/ota/check')";
-   html += "    .then(response => response.json())";
-   html += "    .then(data => {";
-   html += "      alert('Verificación de actualizaciones completada');";
-   html += "      location.reload();";
-   html += "    })";
-   html += "    .catch(error => {";
-   html += "      alert('Error verificando actualizaciones: ' + error);";
-   html += "    });";
-   html += "}";
-   html += "</script>";
-   html += "</body></html>";
+   html +=
+     "<script>"
+     "function toggleIpFields(){var d=document.getElementById('useDhcp').value=='1';"
+     "document.getElementById('staticIpFields').style.display=d?'none':'block';"
+     "var i=document.getElementById('dhcpInfo');if(i)i.style.display=d?'block':'none';}"
+     "function checkForUpdates() {"
+     "  fetch('/ota/check')"
+     "    .then(response => response.json())"
+     "    .then(data => {"
+     "      alert('Verificación de actualizaciones completada');"
+     "      location.reload();"
+     "    })"
+     "    .catch(error => {"
+     "      alert('Error verificando actualizaciones: ' + error);"
+     "    });"
+     "}"
+     "</script>"
+     "</body></html>";
  
    server.send(200, "text/html", html);
  }
  
  void handleSave() {
-   if (!server.authenticate(admin_user, admin_password)) {
-     return server.requestAuthentication();
-   }
+   if (!webAuth()) return;
    
    if (server.hasArg("deviceName")) {
      String tempName = server.arg("deviceName");
@@ -6593,8 +5838,7 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
  }
  
  void handleRele() {
-   if (!server.authenticate(admin_user, admin_password))
-     return server.requestAuthentication();
+   if (!webAuth()) return;
  
    int relay = server.hasArg("relay") ? server.arg("relay").toInt() : 1;
    if (relay < 1 || relay > 2) relay = 1;
@@ -6612,9 +5856,7 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
  }
  
  void handleReboot() {
-   if (!server.authenticate(admin_user, admin_password)) {
-     return server.requestAuthentication();
-   }
+   if (!webAuth()) return;
    
    server.send(200, "text/html", 
      "<html><body><h1>🔄 Reiniciando sistema dual...</h1>"
@@ -6628,9 +5870,7 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
  }
  
  void handleReset() {
-   if (!server.authenticate(admin_user, admin_password)) {
-     return server.requestAuthentication();
-   }
+   if (!webAuth()) return;
    
    resetToDefault();
    
@@ -6646,9 +5886,7 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
  }
  
  void handleChangePass() {
-   if (!server.authenticate(admin_user, admin_password)) {
-     return server.requestAuthentication();
-   }
+   if (!webAuth()) return;
  
    if (server.hasArg("newPassword")) {
      String newPass = server.arg("newPassword");
@@ -6675,9 +5913,7 @@ bool isCodeStored(const char* type, const char* value, int* relay) {
  }
  
 void handleCodes() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
 
   // Obtener parámetros de paginación y búsqueda
   int page = server.arg("page").toInt();
@@ -6690,32 +5926,9 @@ void handleCodes() {
   int startIndex = (page - 1) * ITEMS_PER_PAGE;
   int endIndex = startIndex + ITEMS_PER_PAGE;
 
-  String html = R"=====(
- <!DOCTYPE html>
- <html>
- <head>
-   <meta charset='UTF-8'>
-   <title>Gestión de Códigos - Controladora A2</title>
-   <link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css'>
-   <style>
-     body { font-family: Arial, sans-serif; margin: 30px; background-color: #f7f9fb; color: #333; }
-     h1, h2 { color: #2c3e50; }
-     .security-info { background: #fff3cd; padding: 15px; border-radius: 5px; margin: 15px 0; border-left: 4px solid #ffc107; }
-     .dual-info { background: #e8f5e8; padding: 15px; border-radius: 5px; margin: 15px 0; border-left: 4px solid #28a745; }
-     form { background: #fff; padding: 20px; border-radius: 10px; margin-bottom: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); max-width: 600px; }
-     label { display: block; margin-top: 15px; font-weight: bold; }
-     input, select { width: 100%; padding: 8px; margin-top: 5px; border-radius: 5px; border: 1px solid #ccc; }
-     button { background-color: #2ecc71; color: white; padding: 10px 15px; border: none; border-radius: 5px; margin-top: 15px; cursor: pointer; }
-     button:hover { background-color: #27ae60; }
-     table { width: 100%; border-collapse: collapse; margin-top: 30px; }
-     th, td { border: 1px solid #ccc; padding: 10px; text-align: center; }
-     th { background-color: #ecf0f1; }
-     a.delete { color: #e74c3c; text-decoration: none; }
-     a.delete:hover { text-decoration: underline; }
-   </style>
- </head>
- <body>
-   <h1><i class='fas fa-keyboard'></i> Gestión de Códigos - Controladora A2</h1>
+  String html = webPageBegin("Gestión de Códigos - Controladora A2");
+  html += R"=====(
+   <h1>Gestión de Códigos - Controladora A2</h1>
  
    <div class='security-info'>
      <strong>🔒 Estado de Seguridad:</strong><br>
@@ -6743,27 +5956,27 @@ void handleCodes() {
 
   <!-- Sección de Importación/Exportación CSV -->
   <div style='background: #fff; padding: 20px; border-radius: 10px; margin: 20px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1);'>
-    <h3><i class='fas fa-file-csv'></i> Gestión de Archivos CSV</h3>
+    <h3>Gestión de Archivos CSV</h3>
     <p><strong>Formato CSV:</strong> Tipo,Codigo,Teclado,Rele,Fecha_Creacion</p>
     <p><strong>Tipos soportados:</strong> PIN (4-6 dígitos), TAG (1-16 caracteres) | <strong>Teclados:</strong> 1, 2 | <strong>Relés:</strong> 1, 2</p>
     
     <div style='display: flex; gap: 15px; align-items: center; flex-wrap: wrap; margin-top: 15px;'>
       <a href='/export/codes' style='text-decoration: none;'>
         <button style='background-color: #28a745; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer;'>
-          <i class='fas fa-download'></i> Exportar a CSV
+          Exportar a CSV
         </button>
       </a>
       
       <a href='/codes/template' style='text-decoration: none;'>
         <button style='background-color: #6c757d; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer;'>
-          <i class='fas fa-file-download'></i> Descargar Plantilla
+          Descargar Plantilla
         </button>
       </a>
       
       <form action='/codes/bulk-import' method='post' enctype='multipart/form-data' style='display: flex; gap: 10px; align-items: center;'>
         <input type='file' name='csvFile' accept='.csv' required style='padding: 8px; border: 1px solid #ccc; border-radius: 4px;'>
         <button type='submit' style='background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer;'>
-          <i class='fas fa-upload'></i> Importar CSV
+          Importar CSV
         </button>
       </form>
     </div>
@@ -6771,7 +5984,7 @@ void handleCodes() {
 
   <!-- Sección de Lectura de Tags en Tiempo Real -->
   <div style='background: #fff; padding: 20px; border-radius: 10px; margin: 20px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1);'>
-    <h3><i class='fas fa-qrcode'></i> Lectura de Tags en Tiempo Real</h3>
+    <h3>Lectura de Tags en Tiempo Real</h3>
     
     <!-- Configuración -->
     <div id='configSection'>
@@ -6812,16 +6025,16 @@ void handleCodes() {
     <!-- Controles -->
     <div style='margin: 20px 0;'>
       <button id='startReading' onclick='startTagReading()' style='background-color: #27ae60; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px;'>
-        <i class='fas fa-play'></i> Iniciar Lectura
+        Iniciar Lectura
       </button>
       <button id='stopReading' onclick='stopTagReading()' disabled style='background-color: #e74c3c; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px;'>
-        <i class='fas fa-stop'></i> Parar Lectura
+        Parar Lectura
       </button>
       <button id='exportReadTags' onclick='exportReadTags()' disabled style='background-color: #3498db; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px;'>
-        <i class='fas fa-download'></i> Exportar CSV
+        Exportar CSV
       </button>
       <button id='loadReadTags' onclick='loadReadTags()' disabled style='background-color: #f39c12; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px;'>
-        <i class='fas fa-upload'></i> Cargar a Memoria
+        Cargar a Memoria
       </button>
     </div>
     
@@ -6839,7 +6052,7 @@ void handleCodes() {
   </div>
 
   <form action='/codes/add' method='post'>
-    <h2><i class='fas fa-plus-circle'></i> Añadir nuevo código</h2>
+    <h2>Añadir nuevo código</h2>
     <label for='type'>Tipo:</label>
     <select name='type'>
       <option value='PIN'>PIN (4-6 dígitos)</option>
@@ -6862,26 +6075,26 @@ void handleCodes() {
       <option value='2'>Relé 2</option>
     </select>
 
-    <button type='submit'><i class='fas fa-plus'></i> Añadir Código</button>
+    <button type='submit'>Añadir Código</button>
   </form>
 
   <!-- Buscador y filtros -->
   <div style='background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 20px 0;'>
-    <h3><i class='fas fa-search'></i> Buscar Códigos</h3>
+    <h3>Buscar Códigos</h3>
     <form method='GET' action='/codes' style='display: flex; gap: 10px; align-items: center; flex-wrap: wrap;'>
       <input type='text' name='search' placeholder='Buscar por código o tipo...' value=')=====";
   html += searchTerm;
   html += R"=====(' style='flex: 1; min-width: 200px; padding: 8px; border: 1px solid #ddd; border-radius: 4px;'>
       <button type='submit' style='background-color: #007bff; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;'>
-        <i class='fas fa-search'></i> Buscar
+        Buscar
       </button>
       <a href='/codes' style='background-color: #6c757d; color: white; padding: 8px 16px; text-decoration: none; border-radius: 4px;'>
-        <i class='fas fa-times'></i> Limpiar
+        Limpiar
       </a>
     </form>
   </div>
 
-   <h2><i class='fas fa-database'></i> Códigos Almacenados ()=====";
+   <h2>Códigos Almacenados ()=====";
    html += String(storedCodes->count) + "/" + String(MAX_CODES);
    html += R"=====()</h2>
   <table>
@@ -6933,7 +6146,7 @@ void handleCodes() {
         html += "<td>⚡ Relé " + String(storedCodes->codes[i].relay) + "</td>";
         html += "<td><a class='delete' href='/codes/delete?type=" + String(storedCodes->codes[i].type);
         html += "&value=" + String(storedCodes->codes[i].value);
-        html += "&keyboard=" + String(storedCodes->codes[i].keyboard_id) + "'><i class='fas fa-trash-alt'></i> Eliminar</a></td>";
+        html += "&keyboard=" + String(storedCodes->codes[i].keyboard_id) + "'>Eliminar</a></td>";
         html += "</tr>";
         displayedCount++;
       }
@@ -6966,7 +6179,7 @@ void handleCodes() {
        if (searchTerm.length() > 0) {
          html += "&search=" + searchTerm;
        }
-       html += "' style='margin: 0 5px; padding: 8px 12px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;'><i class='fas fa-chevron-left'></i> Anterior</a>";
+       html += "' style='margin: 0 5px; padding: 8px 12px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;'>Anterior</a>";
      }
      
      // Números de página
@@ -6991,7 +6204,7 @@ void handleCodes() {
        if (searchTerm.length() > 0) {
          html += "&search=" + searchTerm;
        }
-       html += "' style='margin: 0 5px; padding: 8px 12px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;'>Siguiente <i class='fas fa-chevron-right'></i></a>";
+       html += "' style='margin: 0 5px; padding: 8px 12px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;'>Siguiente </a>";
      }
      
      html += "</div>";
@@ -7006,7 +6219,7 @@ void handleCodes() {
    
    
    
-   <a href='/'><button style='background-color:#3498db'><i class='fas fa-home'></i> Volver al inicio</button></a>
+   <a href='/'><button style='background-color:#3498db'>Volver al inicio</button></a>
    
    <!-- Pie de página con datos de contacto -->
    <footer style='background-color: #2c3e50; color: white; padding: 20px; text-align: center; margin-top: 30px;'>
@@ -7163,9 +6376,7 @@ void handleCodes() {
  }
  
  void handleCodesAdd() {
-   if (!server.authenticate(admin_user, admin_password)) {
-     return server.requestAuthentication();
-   }
+   if (!webAuth()) return;
  
   if (server.hasArg("type") && server.hasArg("value") && server.hasArg("relay") && server.hasArg("keyboard_id")) {
     String type = server.arg("type");
@@ -7213,9 +6424,7 @@ void handleCodes() {
  }
  
  void handleCodesDelete() {
-   if (!server.authenticate(admin_user, admin_password)) {
-     return server.requestAuthentication();
-   }
+   if (!webAuth()) return;
  
   if (server.hasArg("type") && server.hasArg("value")) {
     String type = server.arg("type");
@@ -9149,11 +8358,19 @@ void setup() {
    Serial.printf("   Acceso local: %s\n", localAccessBlocked ? "BLOQUEADO" : "PERMITIDO");
    Serial.printf("   Códigos almacenados: %d/%d\n", storedCodes->count, MAX_CODES);
  
-  // Alimentar PHY LAN8720
+#if !A2_BOARD_A2V3
+  // Alimentar PHY LAN8720 (solo A2 clásico)
   pinMode(ETH_PHY_POWER_PIN, OUTPUT);
   digitalWrite(ETH_PHY_POWER_PIN, HIGH);
    delay(100);
    Serial.println("⚡ PHY LAN8720 alimentado");
+#endif
+
+  // RTC DS3231 (A2v3): sembrar la hora del sistema antes que nada de red,
+  // para que franjas horarias y logs tengan hora aun sin conectividad
+  rtcTimeBegin();
+  // Pantalla de estado SSD1306 (A2v3)
+  statusDisplayBegin();
    
    // Configurar pines de relés
    pinMode(RELE1_PIN, OUTPUT);
@@ -9204,6 +8421,22 @@ void setup() {
    
    // Iniciar Ethernet
   Serial.println("🌐 Inicializando Ethernet...");
+#if A2_BOARD_A2V3
+  // A2v3: W5500 por SPI dedicado (core Arduino 3.x). Pulso de reset previo.
+  pinMode(W5500_RST_PIN, OUTPUT);
+  digitalWrite(W5500_RST_PIN, LOW);
+  delay(50);
+  digitalWrite(W5500_RST_PIN, HIGH);
+  delay(250);
+  SPI.begin(W5500_SCK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN, W5500_CS_PIN);
+  if (!ETH.begin(ETH_PHY_W5500, 1, W5500_CS_PIN, W5500_INT_PIN, W5500_RST_PIN, SPI)) {
+    Serial.println("❌ ETH.begin(W5500) falló - revisar cableado SPI");
+  }
+  if (!useDhcp) {
+    ETH.config(staticIP, staticGateway, staticSubnet, staticDns);
+  }
+#else
+  // A2 clásico: LAN8720 RMII (core Arduino 2.x)
   if (useDhcp) {
     // Compatibilidad con Arduino IDE v3.3.0 y PlatformIO
     // Arduino IDE v3.3.0 usa ETH_PHY_TYPE como primer parámetro
@@ -9224,21 +8457,27 @@ void setup() {
     #endif
     ETH.config(staticIP, staticGateway, staticSubnet, staticDns);
   }
+#endif
    
    ETH.setHostname(deviceName);
 
   // Arranque NO bloqueante: la red conecta en segundo plano (evento GOT_IP).
   // El servidor web arranca ya (escucha en todas las interfaces) y la lógica
-  // de accesos queda operativa de inmediato. Si tras AP_FALLBACK_TIMEOUT_MS
-  // no hay Ethernet, el loop() levanta el AP de emergencia.
+  // de accesos queda operativa de inmediato.
   setupWebServer();
   Serial.println("🌐 Ethernet conectando en segundo plano...");
-  Serial.printf("🌐 Sin red en %d s → AP de emergencia\n", AP_FALLBACK_TIMEOUT_MS / 1000);
+
+  // WiFi de gestión: AP con SSID = serial del equipo, ventana de 60 s
+  // (extensible con clientes conectados) + STA si está configurada en NVS.
+  wifiManagerBegin(fixedSerialNumber);
+
+  // Módem 4G: no-op salvo A2_FEATURE_GSM_MODEM (A2v3 o A2 con socket 4G)
+  gsmModemBegin();
    
   Serial.println("\n🎯 SISTEMA DUAL WIEGAND CON SEGURIDAD COMPLETO LISTO");
   Serial.println("═══════════════════════════════════════════════════════════");
-  Serial.println("✅ Teclado 1 (GPIO33/14): Operativo");
-  Serial.println("✅ Teclado 2 (GPIO4/16):  Operativo");
+  Serial.printf("✅ Teclado 1 (GPIO%d/%d): Operativo\n", WIEGAND1_D0, WIEGAND1_D1);
+  Serial.printf("✅ Teclado 2 (GPIO%d/%d): Operativo\n", WIEGAND2_D0, WIEGAND2_D1);
   Serial.println("🔒 Sistema de seguridad: Activo");
   Serial.println("📡 Serial MQTT fijo: " + fixedSerialNumber);
   Serial.println("💾 Capacidad códigos: " + String(MAX_CODES));
@@ -9264,20 +8503,14 @@ void setup() {
  void loop() {
    unsigned long currentTime = millis();
 
-  // ========== FALLBACK AP DE EMERGENCIA (decisión diferida) ==========
-  // Sustituye a la espera bloqueante de 30 s en setup(): la lógica de accesos
-  // corre desde el primer ciclo y el AP solo se levanta si no llegó Ethernet
-  static bool apFallbackDecided = false;
-  if (!apFallbackDecided) {
-    if (ethConnected) {
-      apFallbackDecided = true;  // Hubo red: no hace falta AP
-    } else if (currentTime > AP_FALLBACK_TIMEOUT_MS) {
-      apFallbackDecided = true;
-      Serial.println("❌ Sin Ethernet tras la ventana de arranque");
-      Serial.println("🏠 Iniciando MODO AUTÓNOMO con AP de configuración...");
-      setupAPMode();
-    }
-  }
+  // ========== GESTIÓN WIFI (AP ventana + STA) Y MÓDEM 4G ==========
+  // No bloqueantes: la caída de cualquier interfaz nunca detiene los accesos
+  wifiManagerLoop();
+  gsmModemLoop();
+
+  // ========== RTC + PANTALLA DE ESTADO (A2v3; no-op en A2) ==========
+  rtcTimeLoop();
+  statusDisplayLoop();
 
 #ifdef ENABLE_BLE
   // ========== REINICIO PENDIENTE (para cambios de red BLE) ==========
@@ -9318,17 +8551,25 @@ void setup() {
   static unsigned long lastReconnectAttempt = 0;
   static int reconnectBackoff = 5000;  // Backoff exponencial inicial 5s
   
+  // Failover/failback de interfaz (ETH↔WiFi desde Fase 1): reconectar MQTT
+  NetIface mqttIface;
+  if (netMqttIfaceChanged(&mqttIface) && mqttIface != NET_IFACE_NONE && mqttClient.connected()) {
+    Serial.printf("🔄 Cambio de interfaz de red (→ %s): reconectando MQTT\n", netIfaceName(mqttIface));
+    mqttClient.disconnect();
+    mqttConnectionPending = true;
+  }
+
   // Procesar conexión pendiente desde callback ETH
-  if (mqttConnectionPending && ethConnected) {
+  if (mqttConnectionPending && netHasConnectivity()) {
     mqttConnectionPending = false;
     Serial.println("📡 Procesando conexión MQTT pendiente...");
     connectToMqtt();
     lastReconnectAttempt = currentTime;
     reconnectBackoff = 5000;  // Reset backoff
   }
-  
+
   // Reconexión MQTT con backoff exponencial
-  if (!mqttClient.connected() && ethConnected && !mqttConnectionPending) {
+  if (!mqttClient.connected() && netHasConnectivity() && !mqttConnectionPending) {
     if (currentTime - lastReconnectAttempt > reconnectBackoff) {
       lastReconnectAttempt = currentTime;
       Serial.printf("🔄 Reconexión MQTT (backoff: %ds)...\n", reconnectBackoff/1000);
@@ -9472,7 +8713,7 @@ void setup() {
     // no es un fallo del MCU; los accesos locales siguen operativos y la
     // reconexión con backoff sigue intentándolo)
     static unsigned long mqttDisconnectedTime = 0;
-    if (!mqttClient.connected() && ethConnected) {
+    if (!mqttClient.connected() && netHasConnectivity()) {
       if (mqttDisconnectedTime == 0) {
         mqttDisconnectedTime = currentTime;
       } else if (currentTime - mqttDisconnectedTime > 300000) { // 5 minutos
@@ -9484,7 +8725,7 @@ void setup() {
     }
     
     // Log de estado de autonomía cuando no hay conectividad
-    if (!ethConnected) {
+    if (!netHasConnectivity()) {
       static unsigned long lastAutonomyLog = 0;
       if (currentTime - lastAutonomyLog > 300000) { // Cada 5 minutos
         lastAutonomyLog = currentTime;
@@ -9762,9 +9003,7 @@ void setup() {
 // =================== HANDLERS WEB PARA CÓDIGOS REMOTOS ===================
 
 void handleRemoteCodes() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
 
   // Obtener parámetros de paginación y búsqueda
   int page = server.arg("page").toInt();
@@ -9777,35 +9016,9 @@ void handleRemoteCodes() {
   int startIndex = (page - 1) * ITEMS_PER_PAGE;
   int endIndex = startIndex + ITEMS_PER_PAGE;
 
-  String html = R"=====(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset='UTF-8'>
-  <title>Códigos Remotos - Controladora A2</title>
-  <link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css'>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 30px; background-color: #f7f9fb; color: #333; }
-    h1, h2 { color: #2c3e50; }
-    .remote-info { background: #e3f2fd; padding: 15px; border-radius: 5px; margin: 15px 0; border-left: 4px solid #2196f3; }
-    .time-info { background: #fff3e0; padding: 15px; border-radius: 5px; margin: 15px 0; border-left: 4px solid #ff9800; }
-    form { background: #fff; padding: 20px; border-radius: 10px; margin-bottom: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); max-width: 800px; }
-    label { display: block; margin-top: 15px; font-weight: bold; }
-    input, select { width: 100%; padding: 8px; margin-top: 5px; border-radius: 5px; border: 1px solid #ccc; }
-    button { background-color: #2196f3; color: white; padding: 10px 15px; border: none; border-radius: 5px; margin-top: 15px; cursor: pointer; }
-    button:hover { background-color: #1976d2; }
-    .btn-danger { background-color: #f44336; }
-    .btn-danger:hover { background-color: #d32f2f; }
-    table { width: 100%; border-collapse: collapse; margin-top: 30px; }
-    th, td { border: 1px solid #ccc; padding: 10px; text-align: center; }
-    th { background-color: #ecf0f1; }
-    a.delete { color: #e74c3c; text-decoration: none; }
-    a.delete:hover { text-decoration: underline; }
-    .time-slot { background: #f5f5f5; padding: 5px; margin: 2px; border-radius: 3px; font-size: 0.9em; }
-  </style>
-</head>
-<body>
-  <h1><i class='fas fa-cloud'></i> Gestión de Códigos Remotos - Controladora A2</h1>
+  String html = webPageBegin("Códigos Remotos - Controladora A2");
+  html += R"=====(
+  <h1>Gestión de Códigos Remotos - Controladora A2</h1>
 
   <div class='remote-info'>
     <strong>🌐 Información de Códigos Remotos:</strong><br>
@@ -9828,11 +9041,11 @@ void handleRemoteCodes() {
   </div>
 
   <div class='export-section'>
-    <a href='/export/remote-codes'><button class='btn-info'><i class='fas fa-download icon'></i>Exportar a CSV</button></a>
+    <a href='/export/remote-codes'><button class='btn-info'>Exportar a CSV</button></a>
   </div>
 
   <form action='/remote-codes/add' method='post'>
-    <h2><i class='fas fa-plus-circle'></i> Añadir nuevo código remoto</h2>
+    <h2>Añadir nuevo código remoto</h2>
     <label for='type'>Tipo:</label>
     <select name='type'>
       <option value='PIN'>PIN (4-6 dígitos)</option>
@@ -9869,26 +9082,26 @@ void handleRemoteCodes() {
       <div id='time_slots_content'></div>
     </div>
 
-    <button type='submit'><i class='fas fa-plus'></i> Añadir Código Remoto</button>
+    <button type='submit'>Añadir Código Remoto</button>
   </form>
 
   <!-- Buscador y filtros -->
   <div style='background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 20px 0;'>
-    <h3><i class='fas fa-search'></i> Buscar Códigos Remotos</h3>
+    <h3>Buscar Códigos Remotos</h3>
     <form method='GET' action='/remote-codes' style='display: flex; gap: 10px; align-items: center; flex-wrap: wrap;'>
       <input type='text' name='search' placeholder='Buscar por código o tipo...' value=')=====";
   html += searchTerm;
   html += R"=====(' style='flex: 1; min-width: 200px; padding: 8px; border: 1px solid #ddd; border-radius: 4px;'>
       <button type='submit' style='background-color: #007bff; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;'>
-        <i class='fas fa-search'></i> Buscar
+        Buscar
       </button>
       <a href='/remote-codes' style='background-color: #6c757d; color: white; padding: 8px 16px; text-decoration: none; border-radius: 4px;'>
-        <i class='fas fa-times'></i> Limpiar
+        Limpiar
       </a>
     </form>
   </div>
 
-  <h2><i class='fas fa-database'></i> Códigos Remotos Almacenados ()=====";
+  <h2>Códigos Remotos Almacenados ()=====";
   html += String(storedRemoteCodes->count) + "/" + String(MAX_REMOTE_CODES);
   html += R"=====()</h2>
   <table>
@@ -9956,7 +9169,7 @@ void handleRemoteCodes() {
         html += "</td>";
         
         html += "<td><a class='delete' href='/remote-codes/delete?type=" + String(storedRemoteCodes->codes[i].type);
-        html += "&value=" + String(storedRemoteCodes->codes[i].value) + "'><i class='fas fa-trash-alt'></i> Eliminar</a></td>";
+        html += "&value=" + String(storedRemoteCodes->codes[i].value) + "'>Eliminar</a></td>";
         html += "</tr>";
         displayedCount++;
       }
@@ -9989,7 +9202,7 @@ void handleRemoteCodes() {
       if (searchTerm.length() > 0) {
         html += "&search=" + searchTerm;
       }
-      html += "' style='margin: 0 5px; padding: 8px 12px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;'><i class='fas fa-chevron-left'></i> Anterior</a>";
+      html += "' style='margin: 0 5px; padding: 8px 12px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;'>Anterior</a>";
     }
     
     // Números de página
@@ -10014,7 +9227,7 @@ void handleRemoteCodes() {
       if (searchTerm.length() > 0) {
         html += "&search=" + searchTerm;
       }
-      html += "' style='margin: 0 5px; padding: 8px 12px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;'>Siguiente <i class='fas fa-chevron-right'></i></a>";
+      html += "' style='margin: 0 5px; padding: 8px 12px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px;'>Siguiente </a>";
     }
     
     html += "</div>";
@@ -10026,9 +9239,9 @@ void handleRemoteCodes() {
   
   html += R"=====(
   <br>
-  <a href='/remote-codes/delete-all'><button class='btn-danger'><i class='fas fa-trash-alt'></i> Eliminar Todos los Códigos Remotos</button></a>
+  <a href='/remote-codes/delete-all'><button class='btn-danger'>Eliminar Todos los Códigos Remotos</button></a>
   <br><br>
-  <a href='/'><button style='background-color:#3498db'><i class='fas fa-home'></i> Volver al inicio</button></a>
+  <a href='/'><button style='background-color:#3498db'>Volver al inicio</button></a>
 
   <!-- Pie de página con datos de contacto -->
   <footer style='background-color: #2c3e50; color: white; padding: 20px; text-align: center; margin-top: 30px;'>
@@ -10085,9 +9298,7 @@ void handleRemoteCodes() {
 }
 
 void handleRemoteCodesAdd() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
 
   if (server.hasArg("type") && server.hasArg("value") && server.hasArg("relay") && server.hasArg("keyboard_id")) {
     String type = server.arg("type");
@@ -10171,9 +9382,7 @@ void handleRemoteCodesAdd() {
 }
 
 void handleRemoteCodesDelete() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
 
   if (server.hasArg("type") && server.hasArg("value")) {
     String type = server.arg("type");
@@ -10194,9 +9403,7 @@ void handleRemoteCodesDelete() {
 }
 
 void handleRemoteCodesDeleteAll() {
-  if (!server.authenticate(admin_user, admin_password)) {
-    return server.requestAuthentication();
-  }
+  if (!webAuth()) return;
 
   deleteAllRemoteCodes();
   Serial.println("🗑️ Todos los códigos remotos eliminados");
@@ -10205,265 +9412,5 @@ void handleRemoteCodesDeleteAll() {
   server.send(303);
 }
 
-// =================== FUNCIONES PARA CÓDIGOS REMOTOS ===================
-// Persistencia en NVS (namespace REMOTE_CODES_NVS_NS, definido junto a la
-// estructura StoredRemoteCodes al inicio del fichero).
-
-void loadStoredRemoteCodes() {
-  if (storedRemoteCodes == nullptr) {
-    initializeStoredRemoteCodes();
-  }
-
-  if (storedRemoteCodes == nullptr) {
-    Serial.println("❌ Error: No se pudo inicializar storedRemoteCodes");
-    return;
-  }
-
-  bool loaded = false;
-  if (remoteCodesPrefs.begin(REMOTE_CODES_NVS_NS, true)) {
-    size_t len = remoteCodesPrefs.getBytesLength(REMOTE_CODES_NVS_KEY);
-    if (len == sizeof(StoredRemoteCodes)) {
-      loaded = remoteCodesPrefs.getBytes(REMOTE_CODES_NVS_KEY, storedRemoteCodes,
-                                         sizeof(StoredRemoteCodes)) == sizeof(StoredRemoteCodes);
-    } else if (len > 0) {
-      Serial.printf("⚠️ Códigos remotos NVS con tamaño inesperado (%d ≠ %d) - se reinicializan\n",
-                    (int)len, (int)sizeof(StoredRemoteCodes));
-    }
-    remoteCodesPrefs.end();
-  }
-
-  if (!loaded || storedRemoteCodes->validMarker != 0xDEADBEEF ||
-      storedRemoteCodes->version != 1 || storedRemoteCodes->count > MAX_REMOTE_CODES) {
-    Serial.println("📦 Inicializando códigos remotos por primera vez");
-    storedRemoteCodes->validMarker = 0xDEADBEEF;
-    storedRemoteCodes->version = 1;
-    storedRemoteCodes->count = 0;
-    memset(storedRemoteCodes->codes, 0, sizeof(storedRemoteCodes->codes));
-    saveStoredRemoteCodes();
-  }
-
-  Serial.printf("📦 Códigos remotos cargados: %d/%d\n", storedRemoteCodes->count, MAX_REMOTE_CODES);
-}
-
-void saveStoredRemoteCodes() {
-  if (storedRemoteCodes == nullptr) {
-    Serial.println("❌ Error: storedRemoteCodes no inicializado");
-    return;
-  }
-
-  bool saved = false;
-  if (remoteCodesPrefs.begin(REMOTE_CODES_NVS_NS, false)) {
-    saved = remoteCodesPrefs.putBytes(REMOTE_CODES_NVS_KEY, storedRemoteCodes,
-                                      sizeof(StoredRemoteCodes)) == sizeof(StoredRemoteCodes);
-    remoteCodesPrefs.end();
-  }
-
-  if (saved) {
-    Serial.printf("💾 Códigos remotos guardados en NVS: %d códigos\n", storedRemoteCodes->count);
-  } else {
-    Serial.println("❌ Error guardando códigos remotos en NVS (sin espacio o NVS corrupta)");
-  }
-}
-
-bool addRemoteCode(const char* type, const char* value, uint8_t keyboardId, uint8_t relay, const TimeSlot* timeSlots, uint8_t timeSlotsCount) {
-  if (storedRemoteCodes->count >= MAX_REMOTE_CODES) {
-    Serial.println("❌ No se puede añadir código remoto: memoria llena");
-    return false;
-  }
-  
-  // Verificar si el código ya existe
-  for (int i = 0; i < storedRemoteCodes->count; i++) {
-    if (strcmp(storedRemoteCodes->codes[i].type, type) == 0 && 
-        strcmp(storedRemoteCodes->codes[i].value, value) == 0) {
-      Serial.printf("⚠️ Código remoto ya existe: %s %s\n", type, value);
-      return false;
-    }
-  }
-  
-  // Añadir nuevo código
-  RemoteCodeEntry* newCode = &storedRemoteCodes->codes[storedRemoteCodes->count];
-  strncpy(newCode->type, type, sizeof(newCode->type) - 1);
-  newCode->type[sizeof(newCode->type) - 1] = '\0';
-  strncpy(newCode->value, value, sizeof(newCode->value) - 1);
-  newCode->value[sizeof(newCode->value) - 1] = '\0';
-  newCode->keyboard_id = keyboardId;
-  newCode->relay = relay;
-  newCode->time_slots_count = min(timeSlotsCount, (uint8_t)4);
-  
-  // Copiar franjas horarias
-  for (int i = 0; i < newCode->time_slots_count; i++) {
-    newCode->time_slots[i] = timeSlots[i];
-  }
-  
-  storedRemoteCodes->count++;
-  saveStoredRemoteCodes();
-  
-  Serial.printf("✅ Código remoto añadido: %s %s (Keypad: %d, Relé: %d, Franjas: %d)\n", 
-                type, value, keyboardId, relay, timeSlotsCount);
-  return true;
-}
-
-bool deleteRemoteCode(const char* type, const char* value) {
-  if (storedRemoteCodes == nullptr) return false;
-  
-  for (int i = 0; i < storedRemoteCodes->count; i++) {
-    if (strcmp(storedRemoteCodes->codes[i].type, type) == 0 && 
-        strcmp(storedRemoteCodes->codes[i].value, value) == 0) {
-      
-      // Mover todos los códigos posteriores una posición hacia atrás
-      for (int j = i; j < storedRemoteCodes->count - 1; j++) {
-        storedRemoteCodes->codes[j] = storedRemoteCodes->codes[j + 1];
-      }
-      
-      storedRemoteCodes->count--;
-      saveStoredRemoteCodes();
-      
-      Serial.printf("✅ Código remoto eliminado: %s %s\n", type, value);
-      return true;
-    }
-  }
-  
-  Serial.printf("❌ Código remoto no encontrado: %s %s\n", type, value);
-  return false;
-}
-
-void deleteAllRemoteCodes() {
-  if (storedRemoteCodes == nullptr) return;
-  
-  storedRemoteCodes->count = 0;
-  memset(storedRemoteCodes->codes, 0, sizeof(storedRemoteCodes->codes));
-  saveStoredRemoteCodes();
-  Serial.println("✅ Todos los códigos remotos eliminados");
-}
-
-bool isRemoteCodeStored(const char* type, const char* value, uint8_t keyboardId, uint8_t* relay) {
-  if (storedRemoteCodes == nullptr) return false;
-  
-  for (int i = 0; i < storedRemoteCodes->count; i++) {
-    RemoteCodeEntry* code = &storedRemoteCodes->codes[i];
-    
-    if (strcmp(code->type, type) == 0 && strcmp(code->value, value) == 0) {
-      // Verificar keypad (0 = ambos, o específico)
-      if (code->keyboard_id == 0 || code->keyboard_id == keyboardId) {
-        // Verificar franjas horarias si existen
-        if (code->time_slots_count > 0) {
-          if (!isCurrentTimeInTimeSlots(code->time_slots, code->time_slots_count)) {
-            Serial.printf("⏰ Código remoto fuera de horario: %s %s\n", type, value);
-            return false;
-          }
-        }
-        
-        if (relay) {
-          *relay = code->relay;
-        }
-        Serial.printf("✅ Código remoto válido: %s %s (Relé: %d)\n", type, value, code->relay);
-        return true;
-      }
-    }
-  }
-  
-  return false;
-}
-
-bool isTimeSlotValid(const TimeSlot& timeSlot) {
-  return (timeSlot.start_hour < 24 && timeSlot.start_minute < 60 &&
-          timeSlot.end_hour < 24 && timeSlot.end_minute < 60 &&
-          timeSlot.days_of_week > 0 && timeSlot.days_of_week <= 127);
-}
-
-// Convierte el bitmask de días de la semana a una cadena legible
-String getDaysOfWeekString(uint8_t days_of_week) {
-  String result = "";
-  const char* dayNames[] = {"Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"};
-  const uint8_t dayBits[] = {1, 2, 4, 8, 16, 32, 64};
-  
-  // Casos especiales
-  if (days_of_week == 127) {
-    return "Todos los días";
-  }
-  if (days_of_week == 31) {
-    return "Lun-Vie";
-  }
-  if (days_of_week == 96) {
-    return "Sáb-Dom";
-  }
-  
-  // Construcción personalizada
-  int dayCount = 0;
-  for (int i = 0; i < 7; i++) {
-    if (days_of_week & dayBits[i]) {
-      if (dayCount > 0) {
-        result += ", ";
-      }
-      result += dayNames[i];
-      dayCount++;
-    }
-  }
-  
-  return result.length() > 0 ? result : "Ninguno";
-}
-
-bool isCurrentTimeInTimeSlots(const TimeSlot* timeSlots, uint8_t timeSlotsCount) {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println("⚠️ No se puede obtener la hora actual para validación");
-    return true; // Si no hay hora, permitir acceso
-  }
-  
-  int currentHour = timeinfo.tm_hour;
-  int currentMinute = timeinfo.tm_min;
-  int currentWeekday = timeinfo.tm_wday; // 0=Domingo, 1=Lunes, ..., 6=Sábado
-  
-  // Convertir domingo (0) a bit 64, lunes (1) a bit 1, etc.
-  uint8_t currentDayBit = (currentWeekday == 0) ? 64 : (1 << (currentWeekday - 1));
-  
-  for (int i = 0; i < timeSlotsCount; i++) {
-    const TimeSlot& slot = timeSlots[i];
-    
-    // Verificar día de la semana
-    if (!(slot.days_of_week & currentDayBit)) {
-      continue;
-    }
-    
-    // Verificar hora
-    int currentTotalMinutes = currentHour * 60 + currentMinute;
-    int startTotalMinutes = slot.start_hour * 60 + slot.start_minute;
-    int endTotalMinutes = slot.end_hour * 60 + slot.end_minute;
-    
-    if (currentTotalMinutes >= startTotalMinutes && currentTotalMinutes <= endTotalMinutes) {
-      return true;
-    }
-  }
-  
-  return false;
-}
-
 // =================== FUNCIONES DE GESTIÓN DE MEMORIA OPTIMIZADA ===================
-void initializeStoredCodes() {
-  if (storedCodes == nullptr) {
-    storedCodes = (StoredCodes*)malloc(sizeof(StoredCodes));
-    if (storedCodes == nullptr) {
-      Serial.println("❌ Error: No se pudo asignar memoria para storedCodes");
-      return;
-    }
-    memset(storedCodes, 0, sizeof(StoredCodes));
-    storedCodes->validMarker = 0xCAFEBABE;
-    storedCodes->version = 2;
-    storedCodes->localValidationFirst = true;
-    storedCodes->count = 0;
-  }
-}
-
-void initializeStoredRemoteCodes() {
-  if (storedRemoteCodes == nullptr) {
-    storedRemoteCodes = (StoredRemoteCodes*)malloc(sizeof(StoredRemoteCodes));
-    if (storedRemoteCodes == nullptr) {
-      Serial.println("❌ Error: No se pudo asignar memoria para storedRemoteCodes");
-      return;
-    }
-    memset(storedRemoteCodes, 0, sizeof(StoredRemoteCodes));
-    storedRemoteCodes->validMarker = 0xDEADBEEF;
-    storedRemoteCodes->version = 1;
-    storedRemoteCodes->count = 0;
-  }
-}
+// (ver local_codes.h)

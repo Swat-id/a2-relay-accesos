@@ -1,0 +1,15 @@
+# KC868-A2v3 (16 MB flash)
+#
+# NVS de 256 KB (la EEPROM emulada del core 3.x es un blob NVS de 4 KB y los
+# 20 KB del default_16MB.csv fallan con el churn de commits — verificado en
+# placa). El NVS se localiza por etiqueta, así que se coloca al final y
+# otadata/app0 se mantienen en los offsets estándar 0xe000/0x10000 que el
+# builder de PlatformIO asume fijos (ESP32_APP_OFFSET y boot_app0.bin).
+#
+# Name,    Type, SubType,  Offset,   Size
+otadata,   data, ota,      0xe000,   0x2000
+app0,      app,  ota_0,    0x10000,  0x640000
+app1,      app,  ota_1,    0x650000, 0x640000
+nvs,       data, nvs,      0xC90000, 0x40000
+spiffs,    data, spiffs,   0xCD0000, 0x320000
+coredump,  data, coredump, 0xFF0000, 0x10000

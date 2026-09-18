@@ -162,7 +162,21 @@ main.ino (o src/main.cpp)
 - [x] M2: parser JSON MQTT 1024→2048
 - [ ] Validación en hardware (plan de pruebas §3 del documento de la fase)
 
+### Fase 0.75 — Modularización *(implementada — ver [FASE-0.75-MODULARIZACION.md](FASE-0.75-MODULARIZACION.md))*
+
+- [x] `include/target_features.h` (flags A2/A2v3) + flags en `platformio.ini`
+- [x] `hw_config.h` (pines placa) y `eeprom_layout.h` (mapa persistencia único)
+- [x] `net_manager` real: `netHasConnectivity`, `netMqttPreferred`, `netMqttIfaceChanged` cableados en MQTT
+- [x] `wifi_manager`: absorbe el AP de emergencia; superficie lista para Fase 1
+- [x] `gsm_modem`: esqueleto FSM/GsmStatus, no-op en A2, `#error` si flag sin implementación
+- [x] `remote_codes`: primer módulo funcional extraído (NVS + validación horaria)
+- [x] Tranche 1 `local_codes` + tranche 2 `digital_inputs`
+- [x] Reformulación HTML: CSS único (`web_common`), sin font-awesome, colapso de literales → `esp32dev` al **91,1 %** (116 KB libres para el WiFi de Fase 1)
+- [ ] Tranches 3–7 de extracción restante (ota → mqtt → accesos → web → ble) — ver hoja de ruta §5
+
 ### Fase 1 — WiFi + net_manager en A2 clásico
+
+**Estado: IMPLEMENTADA** — ver [FASE-1-WIFI-GSM.md](FASE-1-WIFI-GSM.md). Decisiones de producto aplicadas: AP con SSID = serial del equipo, pass `admin1234`, **ventana de 60 s** que se rearma con clientes conectados (en vez de los 120 s de la guía); IP AP 192.168.4.1; gestión también por MQTT (`message_type: 7`). Tareas 1.1–1.7 completas; pendiente validación en hardware. Limitación anotada: prioridad estricta ETH>STA con ambas up llegará con core 3.x (Fase 2).
 
 **Objetivo:** mantenimiento directo por AP; STA opcional; MQTT con failover ETH↔WiFi.
 
@@ -186,6 +200,8 @@ main.ino (o src/main.cpp)
 
 ### Fase 2 — Target A2v3 (build + Ethernet W5500)
 
+**Estado: IMPLEMENTADA en código** — ver [FASE-2-A2V3-LCD-RTC.md](FASE-2-A2V3-LCD-RTC.md). Env `esp32dev_s3` (board `kincony_kc868_a2v3`, core Arduino 3.0.7 vía bootstrap) compila el firmware completo con W5500, GSM, **LCD SSD1306** y **RTC DS3231** (adiciones de producto sobre el plan). `ETH.setDefault()`/`WiFi.STA.setDefault()` cablеados en net_manager (2.3 ✔). Pendiente: validación en placa y fijar pines Wiegand definitivos (provisionales 5/6/38/18).
+
 | # | Tarea | Criterio |
 |---|--------|----------|
 | 2.1 | Env `esp32dev_s3` + `A2_BOARD_A2V3` | Compila |
@@ -194,6 +210,8 @@ main.ino (o src/main.cpp)
 | 2.4 | LCD IP (si se porta UI) | Opcional |
 
 ### Fase 3 — GSM Fase 1 (estado AT, sin PPP MQTT)
+
+**Estado: IMPLEMENTADA en código** (adelantada; ver [FASE-1-WIFI-GSM.md](FASE-1-WIFI-GSM.md) §4) — validable ya en A2 clásico con el nuevo env `esp32dev_4g` (socket 4G, UART1 pines 13/34, sin swap). En el A2v3 usará GPIO10/9 con swap auto (`A2_BOARD_A2V3`). Tareas 3.1–3.3, 3.5 y 3.6 completas; 3.4 parcial (API `/api/gsm/*` sí; página `/gsm` dedicada pendiente). Nota: UART1, no UART2 (ocupada por RS485).
 
 | # | Tarea | Criterio |
 |---|--------|----------|

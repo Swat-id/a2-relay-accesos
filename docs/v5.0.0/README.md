@@ -29,13 +29,18 @@ Dual-target de red sobre el firmware de accesos SWATID-A2 (base v4.1.0):
 | [MATRIZ-HARDWARE-A2-A2V3.md](MATRIZ-HARDWARE-A2-A2V3.md) | Pines y diferencias A2 vs A2v3 relevantes a accesos + red |
 | [AUDITORIA-FIRMWARE-Y-PLAN.md](AUDITORIA-FIRMWARE-Y-PLAN.md) | Auditoría de la baseline v4.1.0 (bugs C1/C2 EEPROM, robustez) y validación del plan |
 | [FASE-0.5-SANEAMIENTO.md](FASE-0.5-SANEAMIENTO.md) | Saneamiento implementado: códigos remotos a NVS, EEPROM segura, arranque no bloqueante, sin reboot por MQTT |
+| [FASE-0.75-MODULARIZACION.md](FASE-0.75-MODULARIZACION.md) | Estructura en ficheros: net_manager/wifi_manager/gsm_modem, hw_config, eeprom_layout, remote_codes; hoja de ruta de extracción |
+| [FASE-1-WIFI-GSM.md](FASE-1-WIFI-GSM.md) | WiFi AP/STA completo (ventana 60 s, web `/wifi`, MQTT type 7) + GSM Fase 1 (FSM AT, PIN, env `esp32dev_4g`) |
+| [FASE-2-A2V3-LCD-RTC.md](FASE-2-A2V3-LCD-RTC.md) | Target A2v3 (`esp32dev_s3`, core 3.0.7, W5500) + pantalla SSD1306 de estado + RTC DS3231 |
 
-## Entornos PIO previstos (ver plan)
+## Entornos PIO (operativos)
 
 ```text
-esp32dev / esp32dev_ble     → A2 clásico (+ WiFi mgmt en Fase 1)
-esp32dev_s3                 → A2v3 + GSM Fase 1 (+ WiFi)
-esp32dev_s3_ble             → A2v3 + GSM + BLE (opcional, si cabe flash)
+esp32dev / esp32dev_ble  → A2 clásico + WiFi mgmt (BLE en el segundo)
+esp32dev_4g              → A2 clásico + WiFi + GSM (SIM en el socket 4G)
+esp32dev_s3              → A2v3: core 3.0.7 + W5500 + GSM + LCD + RTC
+                           (setup: python3 scripts/bootstrap_pio_s3_platform.py)
+esp32dev_s3_ble          → pendiente evaluar en v5.1 (NimBLE vs core 3.x)
 ```
 
 ## Estado
