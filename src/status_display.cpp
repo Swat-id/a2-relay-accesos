@@ -135,9 +135,19 @@ void statusDisplayLoop() {
   line(5, buf);
 
   // fila 6: entradas digitales + MQTT
-  snprintf(buf, sizeof(buf), "D1:%c D2:%c  M:%s",
-           di1State.currentState ? 'H' : 'L',
-           di2State.currentState ? 'H' : 'L',
+  // Pulsador: nivel H/L. Imán de puerta: A (abierta) / C (cerrada) / ? (aún sin estado)
+  char d1, d2;
+  if (digitalInputConfig.di1_type == DI_TYPE_DOOR) {
+    d1 = !di1State.doorKnown ? '?' : (di1State.doorOpen ? 'A' : 'C');
+  } else {
+    d1 = di1State.currentState ? 'H' : 'L';
+  }
+  if (digitalInputConfig.di2_type == DI_TYPE_DOOR) {
+    d2 = !di2State.doorKnown ? '?' : (di2State.doorOpen ? 'A' : 'C');
+  } else {
+    d2 = di2State.currentState ? 'H' : 'L';
+  }
+  snprintf(buf, sizeof(buf), "D1:%c D2:%c  M:%s", d1, d2,
            mqttClient.connected() ? "ok" : "--");
   line(6, buf);
 

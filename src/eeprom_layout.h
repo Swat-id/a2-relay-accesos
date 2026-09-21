@@ -71,21 +71,35 @@ struct Config {
 };
 
 // =================== ENTRADAS DIGITALES (offset 256) =======================
-// Empaquetada para evitar problemas de alineamiento
+// Tipos de entrada (v5.0.2)
+#define DI_TYPE_BUTTON 0   // pulsador: dispara relé (comportamiento clásico)
+#define DI_TYPE_DOOR   1   // imán/contacto de puerta: solo supervisión + MQTT
+#define DI_CONFIG_V2_MARKER 0xD2
+
+// Empaquetada para evitar problemas de alineamiento.
+// COMPATIBILIDAD: los primeros 24 bytes son el layout v1 intacto — el campo
+// diN_type ocupa el antiguo diN_reserved (que siempre valía 0 = pulsador).
+// El bloque v2 va DESPUÉS del layout v1 y se valida con v2_marker: equipos
+// que suben desde v1 migran automáticamente sin perder configuración.
 #pragma pack(push, 1)
 struct DigitalInputConfig {
   uint32_t validMarker;     // DIGITAL_INPUT_CONFIG_MARKER
   uint8_t di1_enabled;
-  uint8_t di1_relay;        // Relé asignado a DI1 (1 o 2)
-  uint8_t di1_inverse;      // Modo inverso (0=normal, 1=inverso)
-  uint8_t di1_reserved;
-  uint32_t di1_duration_ms;
+  uint8_t di1_relay;        // Relé asignado (solo tipo pulsador)
+  uint8_t di1_inverse;      // Modo inverso (solo tipo pulsador)
+  uint8_t di1_type;         // v5.0.2 (ex-reserved): DI_TYPE_BUTTON / DI_TYPE_DOOR
+  uint32_t di1_duration_ms; // Duración pulso (solo tipo pulsador)
   uint8_t di2_enabled;
   uint8_t di2_relay;
   uint8_t di2_inverse;
-  uint8_t di2_reserved;
+  uint8_t di2_type;
   uint32_t di2_duration_ms;
   uint32_t checksum;
+  // ---- bloque v2 (v5.0.2) ----
+  uint8_t di1_open_level;   // imán: nivel eléctrico que significa ABIERTA (0=LOW, 1=HIGH)
+  uint8_t di2_open_level;
+  uint8_t v2_marker;        // DI_CONFIG_V2_MARKER cuando el bloque v2 es válido
+  uint8_t v2_reserved;
 };
 #pragma pack(pop)
 

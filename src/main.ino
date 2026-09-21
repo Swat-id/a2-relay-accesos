@@ -103,16 +103,16 @@
 // =================== INFORMACIÓN DEL FIRMWARE ===================
 #define FIRMWARE_VERSION_MAJOR 5
 #define FIRMWARE_VERSION_MINOR 0
-#define FIRMWARE_VERSION_PATCH 0
-const char* firmwareVersion = "v5.0.0";
+#define FIRMWARE_VERSION_PATCH 2
+const char* firmwareVersion = "v5.0.2";
 #if defined(ENABLE_BLE)
-const char* firmwareFullVersion = "v5.0.0-BLE";
+const char* firmwareFullVersion = "v5.0.2-BLE";
 #elif A2_BOARD_A2V3
-const char* firmwareFullVersion = "v5.0.0-S3";
+const char* firmwareFullVersion = "v5.0.2-S3";
 #elif A2_FEATURE_GSM_MODEM
-const char* firmwareFullVersion = "v5.0.0-4G";
+const char* firmwareFullVersion = "v5.0.2-4G";
 #else
-const char* firmwareFullVersion = "v5.0.0";
+const char* firmwareFullVersion = "v5.0.2";
 #endif
 #define FIRMWARE_VERSION_BUILD __DATE__ " " __TIME__
 const char* firmwareBuild = FIRMWARE_VERSION_BUILD;
@@ -4252,28 +4252,39 @@ void handleDigitalInputs() {
     <h3>📊 Estado en Tiempo Real</h3>
     <p>
       <span class="status-indicator status-low" id="di1-status"></span>
-      <strong>DI1 (GPIO36):</strong> <span id="di1-value">LOW</span>
+      <strong>DI1:</strong> <span id="di1-value">LOW</span>
+      <span id="di1-door" style="font-weight:bold; margin-left: 10px;"></span>
       <span id="di1-waiting" style="color: #ff9800; margin-left: 10px;"></span>
     </p>
     <p>
       <span class="status-indicator status-low" id="di2-status"></span>
-      <strong>DI2 (GPIO39):</strong> <span id="di2-value">LOW</span>
+      <strong>DI2:</strong> <span id="di2-value">LOW</span>
+      <span id="di2-door" style="font-weight:bold; margin-left: 10px;"></span>
       <span id="di2-waiting" style="color: #ff9800; margin-left: 10px;"></span>
     </p>
   </div>
-  
+
   <div class="input-config" id="di1-config">
-    <h3>🔌 Entrada Digital 1 (DI1 - GPIO36)</h3>
+    <h3>🔌 Entrada Digital 1 (DI1)</h3>
     <form action="/save_digital_input" method="POST">
       <input type="hidden" name="input" value="1">
-      
+
       <div class="form-group">
         <label>
           <input type="checkbox" name="di1_enabled" id="di1_enabled" value="1">
           <span class="checkbox-label">Habilitada</span>
         </label>
       </div>
-      
+
+      <div class="form-group">
+        <label>Tipo de entrada:</label>
+        <select name="di1_type" id="di1_type" onchange="diToggle(1)">
+          <option value="0">🔘 Pulsador - activa relé</option>
+          <option value="1">🚪 Imán / estado de puerta - solo supervisión</option>
+        </select>
+      </div>
+
+      <div id="di1-button-fields">
       <div class="form-group">
         <label>Relé a activar:</label>
         <select name="di1_relay" id="di1_relay">
@@ -4281,14 +4292,14 @@ void handleDigitalInputs() {
           <option value="2">Relé 2</option>
         </select>
       </div>
-      
+
       <div class="form-group">
         <label>Duración (segundos):</label>
-        <input type="number" name="di1_duration" id="di1_duration" 
+        <input type="number" name="di1_duration" id="di1_duration"
                min="0.5" max="60" step="0.5" value="2.0">
         <small style="color: #666;">Solo aplica en modo Normal</small>
       </div>
-      
+
       <div class="form-group">
         <label>Modo de Funcionamiento:</label>
         <select name="di1_inverse" id="di1_inverse">
@@ -4300,23 +4311,47 @@ void handleDigitalInputs() {
           Inverso: Relé siempre activo, pulso lo desactiva (seguridad)
         </small>
       </div>
-      
+      </div>
+
+      <div id="di1-door-fields" style="display:none">
+      <div class="form-group">
+        <label>Nivel eléctrico = puerta ABIERTA:</label>
+        <select name="di1_open_level" id="di1_open_level">
+          <option value="0">LOW = abierta (HIGH = cerrada)</option>
+          <option value="1">HIGH = abierta (LOW = cerrada)</option>
+        </select>
+        <small style="color: #666; display: block; margin-top: 5px;">
+          El imán NO activa ningún relé. Cada cambio abierta↔cerrada
+          envía un mensaje MQTT (evento door_contact).
+        </small>
+      </div>
+      </div>
+
       <button type="submit">💾 Guardar Configuración DI1</button>
     </form>
   </div>
-  
+
   <div class="input-config" id="di2-config">
-    <h3>🔌 Entrada Digital 2 (DI2 - GPIO39)</h3>
+    <h3>🔌 Entrada Digital 2 (DI2)</h3>
     <form action="/save_digital_input" method="POST">
       <input type="hidden" name="input" value="2">
-      
+
       <div class="form-group">
         <label>
           <input type="checkbox" name="di2_enabled" id="di2_enabled" value="1">
           <span class="checkbox-label">Habilitada</span>
         </label>
       </div>
-      
+
+      <div class="form-group">
+        <label>Tipo de entrada:</label>
+        <select name="di2_type" id="di2_type" onchange="diToggle(2)">
+          <option value="0">🔘 Pulsador - activa relé</option>
+          <option value="1">🚪 Imán / estado de puerta - solo supervisión</option>
+        </select>
+      </div>
+
+      <div id="di2-button-fields">
       <div class="form-group">
         <label>Relé a activar:</label>
         <select name="di2_relay" id="di2_relay">
@@ -4324,14 +4359,14 @@ void handleDigitalInputs() {
           <option value="2">Relé 2</option>
         </select>
       </div>
-      
+
       <div class="form-group">
         <label>Duración (segundos):</label>
-        <input type="number" name="di2_duration" id="di2_duration" 
+        <input type="number" name="di2_duration" id="di2_duration"
                min="0.5" max="60" step="0.5" value="2.0">
         <small style="color: #666;">Solo aplica en modo Normal</small>
       </div>
-      
+
       <div class="form-group">
         <label>Modo de Funcionamiento:</label>
         <select name="di2_inverse" id="di2_inverse">
@@ -4343,7 +4378,22 @@ void handleDigitalInputs() {
           Inverso: Relé siempre activo, pulso lo desactiva (seguridad)
         </small>
       </div>
-      
+      </div>
+
+      <div id="di2-door-fields" style="display:none">
+      <div class="form-group">
+        <label>Nivel eléctrico = puerta ABIERTA:</label>
+        <select name="di2_open_level" id="di2_open_level">
+          <option value="0">LOW = abierta (HIGH = cerrada)</option>
+          <option value="1">HIGH = abierta (LOW = cerrada)</option>
+        </select>
+        <small style="color: #666; display: block; margin-top: 5px;">
+          El imán NO activa ningún relé. Cada cambio abierta↔cerrada
+          envía un mensaje MQTT (evento door_contact).
+        </small>
+      </div>
+      </div>
+
       <button type="submit">💾 Guardar Configuración DI2</button>
     </form>
   </div>
@@ -4374,6 +4424,17 @@ void handleDigitalInputs() {
       <li>Sistema fail-safe (relé activo, pulso desactiva)</li>
       <li>Control de seguridad (relé enclavado, pulso libera)</li>
     </ul>
+
+    <h4>🚪 Tipo Imán / estado de puerta (v5.0.2):</h4>
+    <ul>
+      <li>Contacto magnético (reed) que supervisa si la puerta está abierta o cerrada</li>
+      <li>Configurable qué nivel eléctrico (HIGH/LOW) significa puerta ABIERTA</li>
+      <li><strong>No activa ningún relé</strong> — solo supervisión</li>
+      <li>Cada cambio de estado envía un mensaje MQTT propio (evento <code>door_contact</code>),
+          distinto del de pulsador — las integraciones existentes no se ven afectadas</li>
+      <li>Al arrancar (o reconectar el broker) se envía el estado actual (reason boot/sync)</li>
+      <li>Filtro antirrebote de 50 ms para imanes con rebote mecánico</li>
+    </ul>
   </div>
   
   <div style="text-align: center; margin: 30px 0;">
@@ -4381,6 +4442,19 @@ void handleDigitalInputs() {
   </div>
   
   <script>
+    // Mostrar campos según el tipo elegido (pulsador / imán)
+    var diToggle = function(n) {
+      var door = document.getElementById('di' + n + '_type').value == '1';
+      document.getElementById('di' + n + '-button-fields').style.display = door ? 'none' : 'block';
+      document.getElementById('di' + n + '-door-fields').style.display = door ? 'block' : 'none';
+    };
+
+    var doorTxt = function(st) {
+      if (st === 'open') return '🚪 Puerta ABIERTA';
+      if (st === 'closed') return '🚪 Puerta CERRADA';
+      return '🚪 Puerta …';
+    };
+
     // Auto-refresh del estado cada 500ms
     setInterval(function() {
       fetch('/api/digital_inputs_status')
@@ -4388,27 +4462,31 @@ void handleDigitalInputs() {
         .then(data => {
           // Actualizar DI1
           document.getElementById('di1-value').textContent = data.di1_state ? 'HIGH' : 'LOW';
-          document.getElementById('di1-status').className = 
+          document.getElementById('di1-status').className =
             'status-indicator ' + (data.di1_state ? 'status-high' : 'status-low');
-          document.getElementById('di1-waiting').textContent = 
-            data.di1_waiting ? '(esperando pulso LOW)' : '';
-          
+          document.getElementById('di1-waiting').textContent =
+            (data.di1_type === 'button' && data.di1_waiting) ? '(esperando pulso LOW)' : '';
+          document.getElementById('di1-door').textContent =
+            (data.di1_type === 'door' && data.di1_enabled) ? doorTxt(data.di1_door_state) : '';
+
           // Actualizar DI2
           document.getElementById('di2-value').textContent = data.di2_state ? 'HIGH' : 'LOW';
-          document.getElementById('di2-status').className = 
+          document.getElementById('di2-status').className =
             'status-indicator ' + (data.di2_state ? 'status-high' : 'status-low');
-          document.getElementById('di2-waiting').textContent = 
-            data.di2_waiting ? '(esperando pulso LOW)' : '';
-          
+          document.getElementById('di2-waiting').textContent =
+            (data.di2_type === 'button' && data.di2_waiting) ? '(esperando pulso LOW)' : '';
+          document.getElementById('di2-door').textContent =
+            (data.di2_type === 'door' && data.di2_enabled) ? doorTxt(data.di2_door_state) : '';
+
           // Actualizar clases de configuración
-          document.getElementById('di1-config').className = 
+          document.getElementById('di1-config').className =
             'input-config' + (data.di1_enabled ? ' enabled' : '');
-          document.getElementById('di2-config').className = 
+          document.getElementById('di2-config').className =
             'input-config' + (data.di2_enabled ? ' enabled' : '');
         })
         .catch(error => console.error('Error:', error));
     }, 500);
-    
+
     // Cargar configuración actual
     fetch('/api/digital_inputs_config')
       .then(response => response.json())
@@ -4417,11 +4495,18 @@ void handleDigitalInputs() {
         document.getElementById('di1_relay').value = data.di1_relay;
         document.getElementById('di1_duration').value = data.di1_duration;
         document.getElementById('di1_inverse').value = data.di1_inverse ? '1' : '0';
-        
+        document.getElementById('di1_type').value = (data.di1_type === 'door') ? '1' : '0';
+        document.getElementById('di1_open_level').value = data.di1_open_level ? '1' : '0';
+
         document.getElementById('di2_enabled').checked = data.di2_enabled;
         document.getElementById('di2_relay').value = data.di2_relay;
         document.getElementById('di2_duration').value = data.di2_duration;
         document.getElementById('di2_inverse').value = data.di2_inverse ? '1' : '0';
+        document.getElementById('di2_type').value = (data.di2_type === 'door') ? '1' : '0';
+        document.getElementById('di2_open_level').value = data.di2_open_level ? '1' : '0';
+
+        diToggle(1);
+        diToggle(2);
       })
       .catch(error => console.error('Error:', error));
   </script>
@@ -4436,14 +4521,25 @@ void handleDigitalInputs() {
 void handleDigitalInputsStatus() {
   if (!webAuth()) return;
   
-  DynamicJsonDocument doc(256);
+  DynamicJsonDocument doc(512);
   doc["di1_state"] = di1State.currentState;
   doc["di2_state"] = di2State.currentState;
   doc["di1_enabled"] = digitalInputConfig.di1_enabled;
   doc["di2_enabled"] = digitalInputConfig.di2_enabled;
   doc["di1_waiting"] = di1State.waitingForLow;
   doc["di2_waiting"] = di2State.waitingForLow;
-  
+  // v5.0.2: campos NUEVOS (los anteriores no cambian — compat integraciones)
+  doc["di1_type"] = (digitalInputConfig.di1_type == DI_TYPE_DOOR) ? "door" : "button";
+  doc["di2_type"] = (digitalInputConfig.di2_type == DI_TYPE_DOOR) ? "door" : "button";
+  if (digitalInputConfig.di1_type == DI_TYPE_DOOR) {
+    doc["di1_door_state"] = !di1State.doorKnown ? "unknown"
+                            : (di1State.doorOpen ? "open" : "closed");
+  }
+  if (digitalInputConfig.di2_type == DI_TYPE_DOOR) {
+    doc["di2_door_state"] = !di2State.doorKnown ? "unknown"
+                            : (di2State.doorOpen ? "open" : "closed");
+  }
+
   String output;
   serializeJson(doc, output);
   server.send(200, "application/json", output);
@@ -4453,7 +4549,7 @@ void handleDigitalInputsStatus() {
 void handleDigitalInputsConfig() {
   if (!webAuth()) return;
   
-  DynamicJsonDocument doc(256);
+  DynamicJsonDocument doc(512);
   doc["di1_enabled"] = digitalInputConfig.di1_enabled;
   doc["di1_relay"] = digitalInputConfig.di1_relay;
   doc["di1_duration"] = digitalInputConfig.di1_duration_ms / 1000.0f;  // Convertir a segundos
@@ -4462,6 +4558,11 @@ void handleDigitalInputsConfig() {
   doc["di2_relay"] = digitalInputConfig.di2_relay;
   doc["di2_duration"] = digitalInputConfig.di2_duration_ms / 1000.0f;  // Convertir a segundos
   doc["di2_inverse"] = digitalInputConfig.di2_inverse;
+  // v5.0.2: tipo y polaridad de puerta (campos nuevos, opcionales)
+  doc["di1_type"] = (digitalInputConfig.di1_type == DI_TYPE_DOOR) ? "door" : "button";
+  doc["di2_type"] = (digitalInputConfig.di2_type == DI_TYPE_DOOR) ? "door" : "button";
+  doc["di1_open_level"] = digitalInputConfig.di1_open_level;
+  doc["di2_open_level"] = digitalInputConfig.di2_open_level;
   
   String output;
   serializeJson(doc, output);
@@ -4480,7 +4581,23 @@ void handleSaveDigitalInput() {
     digitalInputConfig.di1_relay = (uint8_t)server.arg("di1_relay").toInt();
     float di1_sec = server.arg("di1_duration").toFloat();
     digitalInputConfig.di1_inverse = (server.arg("di1_inverse").toInt() == 1) ? 1 : 0;
-    
+    // v5.0.2: campos OPCIONALES (clientes antiguos no los envían → se conserva)
+    if (server.hasArg("di1_type")) {
+      uint8_t t = (server.arg("di1_type").toInt() == 1 ||
+                   server.arg("di1_type") == "door") ? DI_TYPE_DOOR : DI_TYPE_BUTTON;
+      if (t != digitalInputConfig.di1_type) {
+        di1State.doorKnown = false;   // reset del estado lógico al cambiar tipo
+        di1State.needSync = false;
+        di1State.bootDone = false;
+      }
+      digitalInputConfig.di1_type = t;
+    }
+    if (server.hasArg("di1_open_level")) {
+      digitalInputConfig.di1_open_level =
+          (server.arg("di1_open_level").toInt() == 1) ? 1 : 0;
+      di1State.doorKnown = false;     // re-evaluar con la nueva polaridad
+    }
+
     // Validar valores
     if (digitalInputConfig.di1_relay < 1 || digitalInputConfig.di1_relay > 2) {
       digitalInputConfig.di1_relay = 1;
@@ -4489,19 +4606,40 @@ void handleSaveDigitalInput() {
       di1_sec = 2.0f;
     }
     digitalInputConfig.di1_duration_ms = (uint32_t)(di1_sec * 1000);
-    
-    Serial.printf("⚙️ [DI1] Configuración actualizada: %s, Relé %d, %dms (%.1fs), Modo %s\n",
-                  digitalInputConfig.di1_enabled ? "HABILITADA" : "DESHABILITADA",
-                  digitalInputConfig.di1_relay,
-                  digitalInputConfig.di1_duration_ms, di1_sec,
-                  digitalInputConfig.di1_inverse ? "INVERSO" : "NORMAL");
-    
+
+    if (digitalInputConfig.di1_type == DI_TYPE_DOOR) {
+      Serial.printf("⚙️ [DI1] Configuración: %s, IMAN/PUERTA (abierta=%s)\n",
+                    digitalInputConfig.di1_enabled ? "HABILITADA" : "DESHABILITADA",
+                    digitalInputConfig.di1_open_level ? "HIGH" : "LOW");
+    } else {
+      Serial.printf("⚙️ [DI1] Configuración: %s, PULSADOR, Relé %d, %dms (%.1fs), Modo %s\n",
+                    digitalInputConfig.di1_enabled ? "HABILITADA" : "DESHABILITADA",
+                    digitalInputConfig.di1_relay,
+                    digitalInputConfig.di1_duration_ms, di1_sec,
+                    digitalInputConfig.di1_inverse ? "INVERSO" : "NORMAL");
+    }
+
   } else if (inputNumber == 2) {
     digitalInputConfig.di2_enabled = server.hasArg("di2_enabled") ? 1 : 0;
     digitalInputConfig.di2_relay = (uint8_t)server.arg("di2_relay").toInt();
     float di2_sec = server.arg("di2_duration").toFloat();
     digitalInputConfig.di2_inverse = (server.arg("di2_inverse").toInt() == 1) ? 1 : 0;
-    
+    if (server.hasArg("di2_type")) {
+      uint8_t t = (server.arg("di2_type").toInt() == 1 ||
+                   server.arg("di2_type") == "door") ? DI_TYPE_DOOR : DI_TYPE_BUTTON;
+      if (t != digitalInputConfig.di2_type) {
+        di2State.doorKnown = false;
+        di2State.needSync = false;
+        di2State.bootDone = false;
+      }
+      digitalInputConfig.di2_type = t;
+    }
+    if (server.hasArg("di2_open_level")) {
+      digitalInputConfig.di2_open_level =
+          (server.arg("di2_open_level").toInt() == 1) ? 1 : 0;
+      di2State.doorKnown = false;
+    }
+
     // Validar valores
     if (digitalInputConfig.di2_relay < 1 || digitalInputConfig.di2_relay > 2) {
       digitalInputConfig.di2_relay = 2;
@@ -4510,12 +4648,18 @@ void handleSaveDigitalInput() {
       di2_sec = 2.0f;
     }
     digitalInputConfig.di2_duration_ms = (uint32_t)(di2_sec * 1000);
-    
-    Serial.printf("⚙️ [DI2] Configuración actualizada: %s, Relé %d, %dms (%.1fs), Modo %s\n",
-                  digitalInputConfig.di2_enabled ? "HABILITADA" : "DESHABILITADA",
-                  digitalInputConfig.di2_relay,
-                  digitalInputConfig.di2_duration_ms, di2_sec,
-                  digitalInputConfig.di2_inverse ? "INVERSO" : "NORMAL");
+
+    if (digitalInputConfig.di2_type == DI_TYPE_DOOR) {
+      Serial.printf("⚙️ [DI2] Configuración: %s, IMAN/PUERTA (abierta=%s)\n",
+                    digitalInputConfig.di2_enabled ? "HABILITADA" : "DESHABILITADA",
+                    digitalInputConfig.di2_open_level ? "HIGH" : "LOW");
+    } else {
+      Serial.printf("⚙️ [DI2] Configuración: %s, PULSADOR, Relé %d, %dms (%.1fs), Modo %s\n",
+                    digitalInputConfig.di2_enabled ? "HABILITADA" : "DESHABILITADA",
+                    digitalInputConfig.di2_relay,
+                    digitalInputConfig.di2_duration_ms, di2_sec,
+                    digitalInputConfig.di2_inverse ? "INVERSO" : "NORMAL");
+    }
   }
   
   saveDigitalInputConfig();
@@ -8638,12 +8782,8 @@ void setup() {
   processRS485Keypad();
   
   // ========== PROCESAMIENTO DE ENTRADAS DIGITALES ==========
-  processDigitalInput(1, di1State, digitalInputConfig.di1_enabled, 
-                     digitalInputConfig.di1_relay, digitalInputConfig.di1_duration_ms, 
-                     digitalInputConfig.di1_inverse);
-  processDigitalInput(2, di2State, digitalInputConfig.di2_enabled,
-                     digitalInputConfig.di2_relay, digitalInputConfig.di2_duration_ms,
-                     digitalInputConfig.di2_inverse);
+  // Cada entrada según su tipo: pulsador (relé) o imán de puerta (supervisión)
+  digitalInputsLoop();
   
   // ========== VERIFICACIÓN DE TIMEOUT DEL MODO TORNO ==========
   checkPendingRequestTimeout();

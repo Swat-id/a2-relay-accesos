@@ -488,9 +488,35 @@ void gsmModemLoop() {
           s_cmd = CMD_NONE;
           return;
         }
+        // RECUPERACIÓN (v5.0.2): el SIM7600 no se reinicia con el ESP32 — si
+        // el ESP se reinició/reflasheó con los datos 4G activos, el módulo
+        // sigue en modo DATA o CMUX y no atiende AT planos. Intercalar las
+        // secuencias de salida de ambos modos entre rondas de probe:
+        if (s_probeCount == 3 || s_probeCount == 5 || s_probeCount == 8) {
+          // Las secuencias de recuperación van por el mapeo APRENDIDO
+          if (s_probeSwapped != s_st.pin_swap) {
+            s_probeSwapped = s_st.pin_swap;
+            openUart(s_probeSwapped);
+          }
+          if (s_probeCount == 3) {
+            // Salir de modo DATA: escape +++ (guardas de ~1 s cubiertas por
+            // el propio ritmo del probe: el último AT fue hace ≥1,5 s)
+            Serial.println("📡 [GSM] Recuperación: escape de modo DATA (+++)");
+            gsmSerial.print("+++");
+          } else {
+            // Cerrar multiplexado CMUX: trama CLD (3GPP TS 27.010, DLCI 0)
+            Serial.println("📡 [GSM] Recuperación: cierre de CMUX (CLD)");
+            static const uint8_t cmuxCld[] = {0xF9, 0x03, 0xEF, 0x05, 0xC3, 0x01, 0xF2, 0xF9};
+            gsmSerial.write(cmuxCld, sizeof(cmuxCld));
+            gsmSerial.flush();
+          }
+        }
 #if GSM_SWAP_POSSIBLE
-        s_probeSwapped = !s_probeSwapped;
-        openUart(s_probeSwapped);
+        else if (s_probeCount < 3 || s_probeCount > 8) {
+          // Detección de mapeo invertido solo fuera de la fase de recuperación
+          s_probeSwapped = !s_probeSwapped;
+          openUart(s_probeSwapped);
+        }
 #endif
         s_cmd = CMD_NONE;   // el próximo tick reenvía AT
         return;

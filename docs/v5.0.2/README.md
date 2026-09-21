@@ -24,6 +24,7 @@ Cada DI se configura de forma independiente: DI1 puede ser pulsador y DI2 imán 
 | Documento | Descripción |
 |-----------|-------------|
 | [PLAN-ENTRADAS-DIGITALES.md](PLAN-ENTRADAS-DIGITALES.md) | Análisis baseline, modelo de datos, mensajería, UI, fases y checklist |
+| [CONTRATO-MQTT-DI.md](CONTRATO-MQTT-DI.md) | Contrato final trigger/door_contact + validación en placa |
 
 ## Código afectado (previsto)
 
@@ -33,12 +34,31 @@ Cada DI se configura de forma independiente: DI1 puede ser pulsador y DI2 imán 
 
 ## Criterio de hecho
 
-- [ ] Pulsador: mismo JSON y misma lógica Normal/Inverso que hoy
-- [ ] Imán: mensaje en **cada** transición open↔closed; HI/LOW mapeable a abierto/cerrado
-- [ ] Firmware con EEPROM antigua arranca sin reconfigurar (tipo pulsador)
-- [ ] Documentación de contrato MQTT en esta carpeta
-- [ ] Compilan `esp32dev` y `esp32dev_ble` (y S3 si aplica)
+- [x] Pulsador: mismo JSON y misma lógica Normal/Inverso que hoy
+- [x] Imán: mensaje en **cada** transición open↔closed; HI/LOW mapeable a abierto/cerrado (validado en placa vía cambio de polaridad; imán físico pendiente de laboratorio)
+- [x] Firmware con EEPROM antigua arranca sin reconfigurar (migración v1→v2 verificada)
+- [x] Documentación de contrato MQTT en esta carpeta
+- [x] Compilan `esp32dev`, `esp32dev_4g`, `esp32dev_ble` y `esp32dev_s3`
 
 ## Estado
 
-Rama y plan creados; implementación pendiente.
+**Implementada y validada en placa A2v3** (21 Sep 2026, firmware `v5.0.2-S3`):
+migración EEPROM, tipo imán con debounce y sync boot/change/sync, UI web con
+selector de tipo, APIs compatibles y LCD mostrando A/C para puertas. Ver
+[CONTRATO-MQTT-DI.md](CONTRATO-MQTT-DI.md) con la evidencia.
+
+## Corrección adicional en esta rama: recuperación del módem tras reinicio del ESP
+
+**Síntoma:** tras flashear v5.0.2, el 4G quedaba en `absent` (módulo sin responder a AT).
+**Causa raíz (no relacionada con las DI):** el SIM7600 se alimenta del socket y
+NO se reinicia con el ESP32 — si el ESP se reinicia o reflashea con los datos
+4G activos, el módulo permanece en modo **CMUX/PPP**, donde ignora los AT
+"planos" de la FSM. Bug latente desde v5.0.1.
+
+**Fix:** secuencia de recuperación intercalada en el probe (siempre por el
+mapeo TX/RX aprendido): escape `+++` (modo DATA) en la ronda 3 y trama de
+cierre CMUX **CLD** (3GPP TS 27.010) en las rondas 5 y 8.
+
+**Validado en placa:** módulo atascado en CMUX real → `CLD` en ronda 5 →
+`Módulo detectado` → registro → PPP → `Datos 4G conectados (IP 10.162.138.95)`.
+Cualquier reinicio del ESP con datos 4G activos ahora se auto-recupera en ~10 s.
