@@ -6,11 +6,11 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 
 | Campo | Valor |
 |-------|-------|
-| Versión en desarrollo | **5.0.1** — rama `v5.0.1` (verificación SIM / 4G) |
-| Anterior en curso | **5.0.0** — WiFi A2 + GSM/A2v3 |
+| Versión en desarrollo | **5.0.2** — rama `v5.0.2` (DI pulsador + imán de puerta) |
+| Otras ramas v5 | `v5.0.0` base red · `v5.0.1` SIM/4G |
 | Versión estable | **4.1.0-BLE** — rama `v4.1.0` |
 | Fecha | Septiembre 2026 |
-| Estado | `v4.1.0` producción · `v5.0.0` base · `v5.0.1` diagnóstico 4G |
+| Estado | `v4.1.0` producción · `v5.0.1` GSM · `v5.0.2` planificación DI |
 
 ## Estructura del repositorio (desarrollo)
 
@@ -25,7 +25,8 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 │   ├── 00 - docref/             # Referencia, versiones, archivo, sketches, csv
 │   ├── v3.0/ … v4.1.0/          # Documentación por rama Git
 │   ├── v5.0.0/                  # Dual-target WiFi + 4G
-│   └── v5.0.1/                  # Verificación SIM / 4G
+│   ├── v5.0.1/                  # Verificación SIM / 4G
+│   └── v5.0.2/                  # Entradas digitales ampliadas
 └── .cursor/rules/
 ```
 
@@ -38,11 +39,13 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 | `v4.1` | Challenge-Response, HKDF | `esp32dev_ble` | [v4.1/](v4.1/) |
 | `v4.1.0` | Dual-build estable | ambos | [v4.1.0/](v4.1.0/) |
 | `v5.0.0` | WiFi (A2) + GSM/4G (A2v3) | `esp32dev*` + `esp32dev_s3*` | [v5.0.0/](v5.0.0/) |
-| **`v5.0.1`** | Diagnóstico detección SIM / 4G | `esp32dev_4g`, `esp32dev_s3` | [v5.0.1/](v5.0.1/) |
+| `v5.0.1` | Diagnóstico detección SIM / 4G | `esp32dev_4g`, `esp32dev_s3` | [v5.0.1/](v5.0.1/) |
+| **`v5.0.2`** | DI: pulsador + imán de puerta | `esp32dev`, `esp32dev_ble` | [v5.0.2/](v5.0.2/) |
 
 Diferencias entre entornos v4: **[v4.1.0/ENTORNOS_COMPILACION.md](v4.1.0/ENTORNOS_COMPILACION.md)**  
 Plan dual-target v5: **[v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md](v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md)**  
-Verificación SIM/4G: **[v5.0.1/VERIFICACION-SIM-4G.md](v5.0.1/VERIFICACION-SIM-4G.md)**
+Verificación SIM/4G: **[v5.0.1/VERIFICACION-SIM-4G.md](v5.0.1/VERIFICACION-SIM-4G.md)**  
+Plan DI ampliadas: **[v5.0.2/PLAN-ENTRADAS-DIGITALES.md](v5.0.2/PLAN-ENTRADAS-DIGITALES.md)**
 
 ## Documentación de referencia
 
@@ -73,7 +76,7 @@ Verificación SIM/4G: **[v5.0.1/VERIFICACION-SIM-4G.md](v5.0.1/VERIFICACION-SIM-
 ```bash
 pio run -e esp32dev          # A2 sin BLE
 pio run -e esp32dev_ble      # A2 con BLE (v4.1.x / base v5)
-# v5 (cuando existan): pio run -e esp32dev_s3
+# v5: pio run -e esp32dev_s3 / esp32dev_4g
 ```
 
 Manual: [MANUAL_COMPILACION.md](00%20-%20docref/referencia/compilacion/MANUAL_COMPILACION.md)
@@ -88,5 +91,5 @@ Manual: [MANUAL_COMPILACION.md](00%20-%20docref/referencia/compilacion/MANUAL_CO
 
 ---
 
-**Última actualización**: 18 Septiembre 2026  
-**Versión del documento**: 2.2 (rama `v5.0.1` verificación SIM/4G)
+**Última actualización**: 21 Septiembre 2026  
+**Versión del documento**: 2.3 (rama `v5.0.2` entradas digitales)
