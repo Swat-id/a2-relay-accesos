@@ -18,7 +18,7 @@ enum NetIface : uint8_t {
   NET_IFACE_NONE = 0,
   NET_IFACE_ETH,
   NET_IFACE_WIFI_STA,
-  // NET_IFACE_GSM  — Fase 4 (datos por PPP)
+  NET_IFACE_GSM,        // datos 4G por PPP (A2v3)
 };
 
 // --- Eventos de interfaz (llamar desde los handlers de eventos) ---
@@ -26,10 +26,13 @@ void netOnEthGotIp();
 void netOnEthDown();
 void netOnWifiStaGotIp();
 void netOnWifiStaDown();
+void netOnGsmGotIp();
+void netOnGsmDown();
 
 // --- Consulta de estado ---
 bool netEthUp();
 bool netWifiStaUp();
+bool netGsmUp();
 bool netHasConnectivity();
 
 // Interfaz preferida para MQTT/TCP saliente (ETH > WiFi STA > None)

@@ -3,16 +3,19 @@
 #if A2_FEATURE_WIFI_MGMT
 
 #include <WiFi.h>
+#include <ETH.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <PubSubClient.h>
 #include "net_manager.h"
 #include "web_common.h"
 
 // Servicios de main.ino
 extern WebServer server;
 extern char deviceName[32];
+extern PubSubClient mqttClient;
 
 // ---------------------------------------------------------------------------
 // Configuración (NVS namespace "a2acc_wifi")
@@ -330,7 +333,10 @@ String wifiStatusJson() {
   sta["rssi"] = s_staConnected ? WiFi.RSSI() : 0;
 
   doc["eth_up"] = netEthUp();
+  doc["eth_ip"] = netEthUp() ? ETH.localIP().toString() : "";
+  doc["gsm_up"] = netGsmUp();
   doc["mqtt_iface"] = netIfaceName(netMqttPreferred());
+  doc["mqtt_connected"] = mqttClient.connected();
 
   String out;
   serializeJson(doc, out);

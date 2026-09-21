@@ -6,11 +6,11 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 
 | Campo | Valor |
 |-------|-------|
-| Versión en desarrollo | **5.0.0** — rama `v5.0.0` (WiFi A2 + 4G A2v3) |
+| Versión en desarrollo | **5.0.1** — rama `v5.0.1` (verificación SIM / 4G) |
+| Anterior en curso | **5.0.0** — WiFi A2 + GSM/A2v3 |
 | Versión estable | **4.1.0-BLE** — rama `v4.1.0` |
-| Anterior | 4.0.0-BLE |
 | Fecha | Septiembre 2026 |
-| Estado | `v4.1.0` producción · `v5.0.0` planificación |
+| Estado | `v4.1.0` producción · `v5.0.0` base · `v5.0.1` diagnóstico 4G |
 
 ## Estructura del repositorio (desarrollo)
 
@@ -24,7 +24,8 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 │   ├── README.md                # Este índice
 │   ├── 00 - docref/             # Referencia, versiones, archivo, sketches, csv
 │   ├── v3.0/ … v4.1.0/          # Documentación por rama Git
-│   └── v5.0.0/                  # Dual-target WiFi + 4G
+│   ├── v5.0.0/                  # Dual-target WiFi + 4G
+│   └── v5.0.1/                  # Verificación SIM / 4G
 └── .cursor/rules/
 ```
 
@@ -36,10 +37,12 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 | `v4.0` | BLE inicial | `esp32dev_ble` | [v4.0/](v4.0/) |
 | `v4.1` | Challenge-Response, HKDF | `esp32dev_ble` | [v4.1/](v4.1/) |
 | `v4.1.0` | Dual-build estable | ambos | [v4.1.0/](v4.1.0/) |
-| **`v5.0.0`** | WiFi (A2) + GSM/4G (A2v3) | `esp32dev*` + `esp32dev_s3*` | [v5.0.0/](v5.0.0/) |
+| `v5.0.0` | WiFi (A2) + GSM/4G (A2v3) | `esp32dev*` + `esp32dev_s3*` | [v5.0.0/](v5.0.0/) |
+| **`v5.0.1`** | Diagnóstico detección SIM / 4G | `esp32dev_4g`, `esp32dev_s3` | [v5.0.1/](v5.0.1/) |
 
 Diferencias entre entornos v4: **[v4.1.0/ENTORNOS_COMPILACION.md](v4.1.0/ENTORNOS_COMPILACION.md)**  
-Plan dual-target v5: **[v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md](v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md)**
+Plan dual-target v5: **[v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md](v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md)**  
+Verificación SIM/4G: **[v5.0.1/VERIFICACION-SIM-4G.md](v5.0.1/VERIFICACION-SIM-4G.md)**
 
 ## Documentación de referencia
 
@@ -86,4 +89,4 @@ Manual: [MANUAL_COMPILACION.md](00%20-%20docref/referencia/compilacion/MANUAL_CO
 ---
 
 **Última actualización**: 18 Septiembre 2026  
-**Versión del documento**: 2.1 (rama `v5.0.0` + listado)
+**Versión del documento**: 2.2 (rama `v5.0.1` verificación SIM/4G)

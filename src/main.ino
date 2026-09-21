@@ -1528,6 +1528,11 @@ void connectToMqtt() {
             if (gsmSetPin(info["pin"].as<String>())) result += " pin";
             else result += " pin_INVALID";
           }
+          if (info.containsKey("pin_disable")) {
+            // Desbloquear y desactivar el PIN de la SIM permanentemente
+            if (gsmDisableSimPin(info["pin_disable"].as<String>())) result += " pin_disable";
+            else result += " pin_disable_INVALID";
+          }
           if (info.containsKey("apn")) {
             gsmSetApn(info["apn_mode"] | 0, info["apn"].as<String>(),
                       info["apn_user"].as<String>(), info["apn_pass"].as<String>());
@@ -5490,7 +5495,41 @@ void handleBLEStatus() {
    html += "<p>IP: " + ip.toString() + "</p></header>";
  
    html += "<main><div class='container'>";
- 
+
+  // Panel de estado de red en vivo (valida la prioridad ETH > WiFi > 4G)
+  html += R"=====(
+<h2>📶 Estado de Red</h2>
+<table>
+ <tr><th>Interfaz</th><th>Estado</th><th>Detalle</th></tr>
+ <tr><td>Ethernet</td><td id='nEth'>…</td><td id='nEthD'></td></tr>
+ <tr><td>WiFi STA</td><td id='nSta'>…</td><td id='nStaD'></td></tr>
+ <tr><td>AP</td><td id='nAp'>…</td><td id='nApD'></td></tr>
+ <tr><td>4G</td><td id='nGsm'>…</td><td id='nGsmD'></td></tr>
+ <tr><td><strong>MQTT</strong></td><td id='nMq'>…</td><td id='nMqD'></td></tr>
+</table>
+<script>
+var netUpd=function(){
+ fetch('/api/wifi/status').then(r=>r.json()).then(s=>{
+  document.getElementById('nEth').textContent=s.eth_up?'✅ conectado':'❌ sin enlace';
+  document.getElementById('nEthD').textContent=s.eth_ip||'';
+  document.getElementById('nSta').textContent=s.sta.enabled?(s.sta.connected?'✅ conectada':'⏳ conectando'):'—';
+  document.getElementById('nStaD').textContent=s.sta.ssid?(s.sta.ssid+(s.sta.connected?' · '+s.sta.ip:'')):'sin configurar';
+  document.getElementById('nAp').textContent=s.ap.active?'✅ activo':'—';
+  document.getElementById('nApD').textContent=s.ap.active?(s.ap.clients+' clientes · '+s.ap.ip):'';
+  document.getElementById('nMq').textContent=s.mqtt_connected?'✅ conectado':'❌ sin conexión';
+  document.getElementById('nMqD').innerHTML='vía <strong>'+s.mqtt_iface+'</strong>';
+ }).catch(()=>{});
+ fetch('/api/gsm/status').then(r=>r.json()).then(g=>{
+  var t=g.state==='attached'?(g.data_up?'✅ datos OK':'✅ registrado'):g.state;
+  document.getElementById('nGsm').textContent=t;
+  document.getElementById('nGsmD').textContent=(g.operator||'')+
+   (g.csq>=0&&g.csq<=31?' · CSQ '+g.csq:'')+(g.data_ip?' · '+g.data_ip:'');
+ }).catch(()=>{document.getElementById('nGsm').textContent='—';});
+};
+netUpd();setInterval(netUpd,3000);
+</script>
+)=====";
+
    // Estado de seguridad
    html += "<div class='security-status" + String(localAccessBlocked ? " security-blocked" : "") + "'>";
    html +=
