@@ -25,6 +25,7 @@ Cada DI se configura de forma independiente: DI1 puede ser pulsador y DI2 imán 
 |-----------|-------------|
 | [PLAN-ENTRADAS-DIGITALES.md](PLAN-ENTRADAS-DIGITALES.md) | Análisis baseline, modelo de datos, mensajería, UI, fases y checklist |
 | [CONTRATO-MQTT-DI.md](CONTRATO-MQTT-DI.md) | Contrato final trigger/door_contact + validación en placa |
+| [MANUAL-INTEGRACION-MQTT.md](MANUAL-INTEGRACION-MQTT.md) | Manual de integración: TODA la mensajería MQTT (emitida y recibida) — fuente del PDF v1.0 |
 
 ## Código afectado (previsto)
 
