@@ -39,6 +39,7 @@ uint32_t calculateDIChecksum(const DigitalInputConfig& cfg) {
   sum += (uint32_t)cfg.di2_type << 25;
   sum += (uint32_t)cfg.di1_open_level << 26;
   sum += (uint32_t)cfg.di2_open_level << 27;
+  sum += (uint32_t)cfg.bornes_mode << 28;
   return sum ^ 0x55AA55AA;  // XOR con patrón distintivo
 }
 
@@ -63,6 +64,7 @@ void loadDigitalInputConfig() {
     digitalInputConfig.di2_duration_ms = 2000;
     digitalInputConfig.di1_open_level = 0;
     digitalInputConfig.di2_open_level = 0;
+    digitalInputConfig.bornes_mode = DI_BORNES_DIGITAL;
     digitalInputConfig.checksum = 0;
 
     saveDigitalInputConfig();
@@ -79,10 +81,17 @@ void loadDigitalInputConfig() {
     Serial.println("🔧 [DI] Migrando configuración v1 → v2 (tipos pulsador, open_level=LOW)");
     digitalInputConfig.di1_open_level = 0;
     digitalInputConfig.di2_open_level = 0;
+    digitalInputConfig.bornes_mode = DI_BORNES_DIGITAL;
     saveDigitalInputConfig();   // escribe v2_marker y checksum ampliado
   } else {
     if (digitalInputConfig.di1_open_level > 1) digitalInputConfig.di1_open_level = 0;
     if (digitalInputConfig.di2_open_level > 1) digitalInputConfig.di2_open_level = 0;
+    if (digitalInputConfig.bornes_mode > DI_BORNES_TECLADO2_I2C) digitalInputConfig.bornes_mode = DI_BORNES_DIGITAL;
+#if !WIEGAND2_SHARES_DI
+    // Target con teclado 2 en pines propios: el selector de bornes no aplica.
+    // Sanear restos de configuraciones anteriores (DI siempre operativas).
+    digitalInputConfig.bornes_mode = DI_BORNES_DIGITAL;
+#endif
     // Checksum ampliado: si no cuadra, autocorregir sin perder configuración
     if (digitalInputConfig.checksum != calculateDIChecksum(digitalInputConfig)) {
       Serial.println("⚠️ [DI] Checksum no coincide - recalculando (config conservada)");
@@ -183,6 +192,10 @@ static void processDoorInput(int inputNumber, DigitalInputState& state,
 
 // Procesa ambas entradas según el tipo configurado
 void digitalInputsLoop() {
+#if WIEGAND2_SHARES_DI
+  // A2v3: bornes DI1/DI2 cedidos al Teclado Wiegand 2 — sin proceso de DI
+  if (digitalInputConfig.bornes_mode == DI_BORNES_WIEGAND2) return;
+#endif
   if (digitalInputConfig.di1_type == DI_TYPE_DOOR) {
     processDoorInput(1, di1State, digitalInputConfig.di1_enabled,
                      digitalInputConfig.di1_open_level);

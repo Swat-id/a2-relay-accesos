@@ -56,6 +56,7 @@
 #include "web_common.h"        // CSS compartido + helpers del portal web
 #include "rtc_time.h"          // RTC DS3231 (A2v3): hora propia mantenida
 #include "status_display.h"    // Pantalla OLED de estado (A2v3)
+#include "i2c_guard.h"         // Coexistencia bus I2C ↔ Teclado 2 (A2v3)
 #if A2_BOARD_A2V3
 #include <SPI.h>               // Bus del W5500
 #endif
@@ -392,6 +393,12 @@ std::vector<ReadTag> readTags;
  volatile unsigned long wiegand2Bits = 0;
  volatile unsigned long wiegand2BitTime = 0;
  volatile bool wiegand2Complete = false;
+ // Coexistencia con el bus I2C (A2v3, bornes_mode=2 — ver i2c_guard.h):
+ // wiegand2OnI2C: el teclado 2 escucha en SDA/SCL (48/47)
+ // i2cBusyForW2 : hay una transacción I2C del firmware en curso → los ISRs
+ //                del teclado 2 descartan los flancos (son del propio bus)
+ volatile bool wiegand2OnI2C = false;
+ volatile bool i2cBusyForW2 = false;
  
  // =================== VARIABLES DE PIN ===================
 char currentPin1[17] = "";
@@ -1901,21 +1908,119 @@ void connectToMqtt() {
  }
  
  void IRAM_ATTR handleWiegand2D0() {
+   if (i2cBusyForW2) return;   // flanco generado por el propio bus I2C
    wiegand2BitTime = millis();
    if (wiegand2Bits < 32) {
      wiegand2Data = wiegand2Data << 1;
      wiegand2Bits++;
    }
  }
- 
+
  void IRAM_ATTR handleWiegand2D1() {
+   if (i2cBusyForW2) return;   // flanco generado por el propio bus I2C
    wiegand2BitTime = millis();
    if (wiegand2Bits < 32) {
      wiegand2Data = (wiegand2Data << 1) | 1;
      wiegand2Bits++;
    }
  }
- 
+
+// =================== COEXISTENCIA BUS I2C ↔ TECLADO 2 (i2c_guard.h) =========
+// Con bornes_mode=2 el teclado 2 escucha en SDA/SCL: cada transacción I2C del
+// firmware se envuelve en Begin/End para que sus flancos no cuenten como bits,
+// y el bus solo se usa cuando el teclado lleva un rato en silencio.
+void i2cSectionBegin() {
+  if (!wiegand2OnI2C) return;
+  i2cBusyForW2 = true;
+  // Si un flanco real se coló justo antes del bloqueo la trama ya está
+  // incompleta/corrupta: descartarla en vez de procesar basura.
+  noInterrupts();
+  if (wiegand2Bits > 0 && !wiegand2Complete) {
+    wiegand2Data = 0;
+    wiegand2Bits = 0;
+  }
+  interrupts();
+}
+
+void i2cSectionEnd() {
+  if (wiegand2OnI2C) {
+    // Descartar cualquier flanco residual inducido por la transacción
+    noInterrupts();
+    wiegand2Data = 0;
+    wiegand2Bits = 0;
+    interrupts();
+  }
+  i2cBusyForW2 = false;
+}
+
+bool i2cQuietForWiegand() {
+  if (!wiegand2OnI2C) return true;
+  noInterrupts();
+  unsigned long bits = wiegand2Bits;
+  unsigned long last = wiegand2BitTime;
+  interrupts();
+  if (bits > 0) return false;                          // trama en curso
+  // Ventana de silencio amplia: cubre la pausa entre teclas de una persona
+  // tecleando un PIN para que el render LCD no se "coma" la siguiente tecla
+  if (last != 0 && (millis() - last) < 1500) return false;
+  return true;
+}
+
+void wiegand2ReattachIfI2C() {
+#if WIEGAND2_SHARES_DI
+  if (!wiegand2OnI2C) return;
+  attachInterrupt(digitalPinToInterrupt(BOARD_I2C_SDA_PIN), handleWiegand2D0, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BOARD_I2C_SCL_PIN), handleWiegand2D1, FALLING);
+#endif
+}
+
+#if WIEGAND2_SHARES_DI
+// A2v3: aplica en caliente dónde vive el Teclado 2 según bornes_mode:
+//   0 = sin teclado 2 (bornes DI1/DI2 como entradas digitales)
+//   1 = teclado 2 en bornes DI1/DI2 (las DI quedan fuera de servicio)
+//   2 = teclado 2 en el conector I2C (D0→SDA 48, D1→SCL 47) compartido por
+//       flancos con LCD/RTC/24C02; las DI1/DI2 siguen operativas
+void wiegand2ApplyBornesMode(uint8_t mode) {
+  static int attachedD0 = -1, attachedD1 = -1;
+  if (attachedD0 >= 0) { detachInterrupt(digitalPinToInterrupt(attachedD0)); attachedD0 = -1; }
+  if (attachedD1 >= 0) { detachInterrupt(digitalPinToInterrupt(attachedD1)); attachedD1 = -1; }
+  wiegand2OnI2C = false;
+  i2cBusyForW2 = false;
+  noInterrupts();
+  wiegand2Data = 0;
+  wiegand2Bits = 0;
+  interrupts();
+
+  if (mode == DI_BORNES_WIEGAND2) {
+    pinMode(WIEGAND2_D0, INPUT_PULLUP);
+    pinMode(WIEGAND2_D1, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(WIEGAND2_D0), handleWiegand2D0, FALLING);
+    attachInterrupt(digitalPinToInterrupt(WIEGAND2_D1), handleWiegand2D1, FALLING);
+    attachedD0 = WIEGAND2_D0;
+    attachedD1 = WIEGAND2_D1;
+    Serial.printf("🔐 Teclado 2 ACTIVADO en bornes DI1/DI2 (GPIO%d/%d) - entradas digitales fuera de servicio\n",
+                  WIEGAND2_D0, WIEGAND2_D1);
+  } else if (mode == DI_BORNES_TECLADO2_I2C) {
+    pinMode(DI1_PIN, INPUT);
+    pinMode(DI2_PIN, INPUT);
+    // ¡NO tocar pinMode de 48/47!: siguen ruteados al periférico I2C (Wire).
+    // attachInterrupt (core 3.x) solo añade el ISR y habilita la etapa de
+    // entrada del GPIO, que convive con el periférico (verificado en el HAL).
+    wiegand2OnI2C = true;
+    attachInterrupt(digitalPinToInterrupt(BOARD_I2C_SDA_PIN), handleWiegand2D0, FALLING);
+    attachInterrupt(digitalPinToInterrupt(BOARD_I2C_SCL_PIN), handleWiegand2D1, FALLING);
+    attachedD0 = BOARD_I2C_SDA_PIN;
+    attachedD1 = BOARD_I2C_SCL_PIN;
+    Serial.printf("🔐 Teclado 2 ACTIVADO en conector I2C (D0→SDA GPIO%d, D1→SCL GPIO%d) - DI1/DI2 operativas\n",
+                  BOARD_I2C_SDA_PIN, BOARD_I2C_SCL_PIN);
+  } else {
+    pinMode(DI1_PIN, INPUT);
+    pinMode(DI2_PIN, INPUT);
+    Serial.println("🔐 Teclado 2 inactivo - bornes DI1/DI2 en modo entradas digitales");
+  }
+}
+#endif
+
  // =================== PROCESAMIENTO DE DATOS WIEGAND - COMPLETAMENTE REESCRITO ===================
  void processWiegand1Data() {
   unsigned long currentMillis = millis();
@@ -4248,6 +4353,32 @@ void handleDigitalInputs() {
   html += R"rawliteral(
   <h1>⚡ Entradas Digitales</h1>
   
+  <div class="input-config" id="bornes-card" style="display:none">
+    <h3>🔀 Conexión del Teclado Wiegand 2 (A2v3)</h3>
+    <p style="color:#666">Esta placa admite dos ubicaciones para el
+    <strong>segundo teclado Wiegand</strong>: el <strong>conector I2C</strong>
+    (D0 → SDA, D1 → SCL, GND común; recomendado, las entradas DI1/DI2 siguen
+    operativas) o los <strong>bornes DI1/DI2</strong> (D0 → DI1, D1 → DI2;
+    las entradas digitales quedan fuera de servicio). Elegir:</p>
+    <form action="/save_digital_input" method="POST">
+      <div class="form-group">
+        <select name="bornes_mode" id="bornes_mode">
+          <option value="0">🔌 Sin teclado 2 - DI1/DI2 como entradas digitales</option>
+          <option value="2">🔐 Teclado 2 en conector I2C (SDA/SCL) - DI operativas</option>
+          <option value="1">🔐 Teclado 2 en bornes DI1/DI2 - DI fuera de servicio</option>
+        </select>
+      </div>
+      <button type="submit">💾 Aplicar</button>
+    </form>
+    <p id="bornes-aviso" style="display:none; color:#b36b00"><strong>
+    Teclado 2 en bornes DI1/DI2:</strong> las entradas digitales están fuera de
+    servicio en esta placa (configuración inferior deshabilitada).</p>
+    <p id="bornes-aviso2" style="display:none; color:#1a7a1a"><strong>
+    Teclado 2 en conector I2C:</strong> D0 → SDA, D1 → SCL, GND común
+    (alimentar el lector a 12 V, no del pin 3V3). Las entradas digitales
+    DI1/DI2 siguen plenamente operativas.</p>
+  </div>
+
   <div class="status-panel">
     <h3>📊 Estado en Tiempo Real</h3>
     <p>
@@ -4507,6 +4638,25 @@ void handleDigitalInputs() {
 
         diToggle(1);
         diToggle(2);
+
+        // A2v3: selector de ubicación del teclado 2 (0=sin, 1=bornes DI, 2=I2C)
+        if (data.bornes_shared) {
+          var bm = data.bornes_mode || 0;
+          document.getElementById('bornes-card').style.display = 'block';
+          document.getElementById('bornes_mode').value = String(bm);
+          if (bm == 1) {
+            document.getElementById('bornes-aviso').style.display = 'block';
+            ['di1-config', 'di2-config'].forEach(function(id) {
+              var el = document.getElementById(id);
+              el.style.opacity = '0.45';
+              el.querySelectorAll('input,select,button').forEach(function(c) {
+                c.disabled = true;
+              });
+            });
+          } else if (bm == 2) {
+            document.getElementById('bornes-aviso2').style.display = 'block';
+          }
+        }
       })
       .catch(error => console.error('Error:', error));
   </script>
@@ -4563,6 +4713,8 @@ void handleDigitalInputsConfig() {
   doc["di2_type"] = (digitalInputConfig.di2_type == DI_TYPE_DOOR) ? "door" : "button";
   doc["di1_open_level"] = digitalInputConfig.di1_open_level;
   doc["di2_open_level"] = digitalInputConfig.di2_open_level;
+  doc["bornes_mode"] = digitalInputConfig.bornes_mode;   // 0=sin teclado2, 1=bornes DI, 2=conector I2C
+  doc["bornes_shared"] = (bool)WIEGAND2_SHARES_DI;       // true solo en A2v3
   
   String output;
   serializeJson(doc, output);
@@ -4573,9 +4725,30 @@ void handleDigitalInputsConfig() {
 void handleSaveDigitalInput() {
   if (!webAuth()) return;
   
+#if WIEGAND2_SHARES_DI
+  // A2v3: cambio de ubicación del Teclado 2 (0=sin, 1=bornes DI, 2=conector I2C)
+  if (server.hasArg("bornes_mode")) {
+    int v = server.arg("bornes_mode").toInt();
+    uint8_t bm = (v == 1) ? DI_BORNES_WIEGAND2
+               : (v == 2) ? DI_BORNES_TECLADO2_I2C
+                          : DI_BORNES_DIGITAL;
+    if (bm != digitalInputConfig.bornes_mode) {
+      digitalInputConfig.bornes_mode = bm;
+      saveDigitalInputConfig();
+      wiegand2ApplyBornesMode(bm);   // aplicar en caliente
+      // Reset del estado runtime de las DI (vuelven a servicio en modos 0 y 2)
+      di1State = {};
+      di2State = {};
+    }
+    server.sendHeader("Location", "/digital_inputs");
+    server.send(303);
+    return;
+  }
+#endif
+
   int inputNumber = server.arg("input").toInt();
   Serial.printf("📝 [DI] Guardando configuración para entrada %d\n", inputNumber);
-  
+
   if (inputNumber == 1) {
     digitalInputConfig.di1_enabled = server.hasArg("di1_enabled") ? 1 : 0;
     digitalInputConfig.di1_relay = (uint8_t)server.arg("di1_relay").toInt();
@@ -8593,11 +8766,16 @@ void setup() {
    Serial.printf("🔐 Teclado 1 configurado: GPIO%d/%d con interrupciones\n", WIEGAND1_D0, WIEGAND1_D1);
    
    // Configurar teclado Wiegand 2
+#if WIEGAND2_SHARES_DI
+  // A2v3: ubicación del Teclado 2 según configuración (bornes DI / conector I2C)
+  wiegand2ApplyBornesMode(digitalInputConfig.bornes_mode);
+#else
    pinMode(WIEGAND2_D0, INPUT_PULLUP);
    pinMode(WIEGAND2_D1, INPUT_PULLUP);
    attachInterrupt(digitalPinToInterrupt(WIEGAND2_D0), handleWiegand2D0, FALLING);
    attachInterrupt(digitalPinToInterrupt(WIEGAND2_D1), handleWiegand2D1, FALLING);
    Serial.printf("🔐 Teclado 2 configurado: GPIO%d/%d con interrupciones\n", WIEGAND2_D0, WIEGAND2_D1);
+#endif
    
    // Registrar callback de Ethernet
    WiFi.onEvent(WiFiEvent);

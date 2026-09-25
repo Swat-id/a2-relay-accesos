@@ -32,6 +32,19 @@ bool rtcSetFromLocalString(const String& localTime);
 
 String rtcStatusJson();
 
+// Recuperación del bus I2C en CALIENTE (Wire ya inicializado): reinicia el
+// driver, libera un esclavo que retenga SDA y vuelve a inicializar Wire.
+// Para cuando el bus se corrompe en runtime (p.ej. colisión con el Teclado
+// Wiegand 2 compartiendo SDA/SCL, bornes_mode=2). Devuelve true si el bus
+// quedó libre (SDA y SCL en alto).
+bool i2cRuntimeRecover();
+
+// true mientras el bus I2C esté operativo. Si el bus queda retenido (fallo
+// eléctrico, esclavo colgado irrecuperable) se marca muerto: RTC y LCD se
+// desactivan y el RESTO de servicios (accesos, relés, web, MQTT, red) siguen
+// funcionando con total normalidad.
+bool i2cBusOk();
+
 #else
 
 inline void rtcTimeBegin() {}
@@ -40,5 +53,7 @@ inline bool rtcPresent() { return false; }
 inline bool rtcOscStopped() { return false; }
 inline bool rtcSetFromLocalString(const String&) { return false; }
 inline String rtcStatusJson() { return String("{\"present\":false}"); }
+inline bool i2cRuntimeRecover() { return false; }
+inline bool i2cBusOk() { return true; }
 
 #endif  // A2_FEATURE_RTC

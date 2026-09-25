@@ -75,6 +75,9 @@ struct Config {
 #define DI_TYPE_BUTTON 0   // pulsador: dispara relé (comportamiento clásico)
 #define DI_TYPE_DOOR   1   // imán/contacto de puerta: solo supervisión + MQTT
 #define DI_CONFIG_V2_MARKER 0xD2
+#define DI_BORNES_DIGITAL      0  // bornes DI1/DI2 = entradas digitales (default)
+#define DI_BORNES_WIEGAND2     1  // bornes DI1/DI2 = Teclado Wiegand 2 (A2v3; DI fuera de servicio)
+#define DI_BORNES_TECLADO2_I2C 2  // Teclado 2 en conector I2C SDA/SCL (A2v3; DI operativas)
 
 // Empaquetada para evitar problemas de alineamiento.
 // COMPATIBILIDAD: los primeros 24 bytes son el layout v1 intacto — el campo
@@ -99,7 +102,9 @@ struct DigitalInputConfig {
   uint8_t di1_open_level;   // imán: nivel eléctrico que significa ABIERTA (0=LOW, 1=HIGH)
   uint8_t di2_open_level;
   uint8_t v2_marker;        // DI_CONFIG_V2_MARKER cuando el bloque v2 es válido
-  uint8_t v2_reserved;
+  uint8_t bornes_mode;      // A2v3: dónde vive el Teclado 2 — 0=sin teclado 2
+                            // (DI1/DI2 digitales), 1=en bornes DI1/DI2 (chips
+                            // 16/17), 2=en conector I2C SDA/SCL (chips 48/47)
 };
 #pragma pack(pop)
 

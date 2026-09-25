@@ -22,13 +22,24 @@ const int RELE1_PIN = 40;
 const int RELE2_PIN = 39;
 
 // ------------------------- Teclados Wiegand --------------------------------
-// PROVISIONAL (matriz: "a fijar en laboratorio"). GPIOs libres del PCB según
-// tid=7958: 5, 6, 38 y los OneWire 18/8. Se evita GPIO4 (puede ir al DE/RE
-// del MAX485 según revisión de placa).
-#define WIEGAND1_D0 5
-#define WIEGAND1_D1 6
-#define WIEGAND2_D0 38
-#define WIEGAND2_D1 18
+// MAPEADO EN PLACA REAL con sniffer de flancos (v5.0.2, 25-Sep-2026):
+//   borne PCB "GPIO1" → chip GPIO18   (Teclado 1 D0)
+//   borne PCB "GPIO2" → chip GPIO8    (Teclado 1 D1)
+// Verificado tecleando 1111# : 13 flancos D0 / 7 flancos D1 = exacto.
+// (El rotulado del PCB NO coincide con la lista "free gpio" del foro
+// tid=7958; los chips 18/8 son los que MODBUS llamaba OneWire TMP1/TMP2.)
+// Teclado 2 (v5.0.2): pines DEDICADOS, verificados con sniffer de flancos en
+// placa real (25-Sep-2026): conectores PCB "IO4"/"IO5" → chips GPIO4/GPIO5.
+// Tecleando 1111#: 13 flancos en IO4 (D0) / 7 en IO5 (D1) = firma exacta.
+// El conector rotulado "SDA/SCL/GND/3V3" NO está conectado al MCU en esta
+// revisión (verificado con toques a GND sobre 25 GPIOs vigilados): el bus
+// I2C real (48/47) queda íntegro para LCD/RTC/24C02. Libres: IO6 e IO38.
+// Nota: sin pull-up en PCB en IO4/IO5 — el firmware usa INPUT_PULLUP interno.
+#define WIEGAND1_D0 18
+#define WIEGAND1_D1 8
+#define WIEGAND2_D0 4    // conector "IO4"
+#define WIEGAND2_D1 5    // conector "IO5"
+#define WIEGAND2_SHARES_DI 0   // teclado 2 con pines propios (como el A2 clásico)
 
 // ------------------------ RS485 (MAX485 on-board) --------------------------
 #define RS485_RX2 15
@@ -99,6 +110,7 @@ const int DI2_PIN = 39;  // input only, sin pull-up interna
 #define GSM_RX_PIN 34
 #define GSM_UART_NUM 1          // UART1 (la UART2 la ocupa el RS485)
 #define GSM_SWAP_POSSIBLE 0
+#define WIEGAND2_SHARES_DI 0    // A2: teclado 2 tiene bornes propios (4/16)
 
 #endif  // A2_BOARD_A2V3
 

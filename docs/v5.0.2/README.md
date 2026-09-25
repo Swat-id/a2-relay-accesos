@@ -63,3 +63,30 @@ cierre CMUX **CLD** (3GPP TS 27.010) en las rondas 5 y 8.
 **Validado en placa:** módulo atascado en CMUX real → `CLD` en ronda 5 →
 `Módulo detectado` → registro → PPP → `Datos 4G conectados (IP 10.162.138.95)`.
 Cualquier reinicio del ESP con datos 4G activos ahora se auto-recupera en ~10 s.
+
+## Teclado Wiegand 2 en A2v3: pines dedicados IO4/IO5 (25 Sep 2026)
+
+**Resolución definitiva** (tras descartar dos vías): el segundo teclado se
+conecta a los conectores **IO4 (D0)** e **IO5 (D1)** → chips GPIO4/GPIO5,
+verificado con sniffer de flancos (13 D0 / 7 D1 al teclear `1111#`) y validado
+end-to-end: lectura de PIN + petición MQTT `keyboard_id: 2`, `keyboard_pins: "4/5"`.
+
+Hallazgos del camino (ver matriz de hardware v5.0.0 actualizada):
+
+- Los bornes DI1/DI2 quedaron descartados como teclado 2: son necesarios para
+  pulsadores de salida / contactos de puerta. El selector `bornes_mode`
+  desarrollado para ello queda inerte (`WIEGAND2_SHARES_DI 0`) y se sanea a 0.
+- El conector rotulado "SDA/SCL/GND/3V3" **no está conectado al MCU** en esta
+  revisión de PCB (verificado eléctricamente). El modo experimental
+  "teclado 2 en bus I2C" (bornes_mode=2, guardas i2c_guard.h) funcionó a nivel
+  de firmware (cero tramas fantasma con LCD a 1 Hz) pero es inaccesible
+  físicamente; el código queda disponible por si otra revisión expone el bus.
+- Los lectores se alimentan **siempre a 12 V** (nunca del pin 3V3: un cruce
+  destruyó el carril 3,3 V de una placa).
+
+**Robustez I2C añadida** (subproducto valioso, activa en producción): si el
+bus I2C queda retenido o falla, RTC y LCD se desactivan/suspenden con log
+claro y reintento cada 60 s, sin afectar jamás a accesos, relés, teclados,
+DI, web, MQTT ni red. Recuperación de bus en caliente (9 pulsos SCL + STOP)
+con re-detección automática de la pantalla. Estado en `rtcStatusJson()`
+(`"i2c_bus":"ok|error"`).

@@ -6,6 +6,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include "hw_config.h"
+#include "i2c_guard.h"   // coexistencia bus I2C ↔ Teclado Wiegand 2 (bornes_mode=2)
 
 // Offsets legacy del firmware (hw_config.h): hora local = epoch + GMT + DST.
 // El RTC guarda hora local.
@@ -15,6 +16,7 @@
 static bool s_present = false;
 static bool s_osf = false;
 static bool s_seededFromRtc = false;
+static bool s_busDead = false;      // bus retenido/inoperativo: RTC y LCD fuera
 static unsigned long s_lastWriteMs = 0;
 
 #define RTC_WRITE_PERIOD_MS (6UL * 3600UL * 1000UL)  // refresco cada 6 h
@@ -106,11 +108,12 @@ static bool systemLocalTime(struct tm* out) {
 // (DS3231/SSD1306) puede quedarse a mitad de transacción reteniendo SDA en
 // bajo y el bus queda colgado (verificado en placa A2v3). Se generan hasta 9
 // pulsos de SCL y una condición STOP antes de inicializar Wire.
-static void i2cBusRecover(int sda, int scl) {
+// Devuelve true si el bus quedó libre (SDA y SCL en alto).
+static bool i2cBusRecover(int sda, int scl) {
   pinMode(sda, INPUT_PULLUP);
   pinMode(scl, INPUT_PULLUP);
   delayMicroseconds(10);
-  if (digitalRead(sda) == HIGH) return;   // bus libre
+  if (digitalRead(sda) == HIGH && digitalRead(scl) == HIGH) return true;  // bus libre
 
   Serial.println("🕐 [RTC] Bus I2C retenido - ejecutando recuperación");
   pinMode(scl, OUTPUT_OPEN_DRAIN);
@@ -130,11 +133,39 @@ static void i2cBusRecover(int sda, int scl) {
   delayMicroseconds(10);
   pinMode(sda, INPUT_PULLUP);
   pinMode(scl, INPUT_PULLUP);
+  delayMicroseconds(10);
+  return digitalRead(sda) == HIGH && digitalRead(scl) == HIGH;
+}
+
+// Escaneo del bus I2C de placa al arranque: inventario de periféricos
+// (RTC 0x68, OLED 0x3C, 24C02 0x50, posibles extensores de E/S 0x20-0x27…)
+static void i2cScanBus() {
+  Serial.print("🔎 [I2C] Dispositivos en el bus:");
+  int found = 0;
+  for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf(" 0x%02X", addr);
+      found++;
+    }
+  }
+  if (!found) Serial.print(" (ninguno)");
+  Serial.println();
 }
 
 void rtcTimeBegin() {
-  i2cBusRecover(BOARD_I2C_SDA_PIN, BOARD_I2C_SCL_PIN);
+  bool busOk = i2cBusRecover(BOARD_I2C_SDA_PIN, BOARD_I2C_SCL_PIN);
   Wire.begin(BOARD_I2C_SDA_PIN, BOARD_I2C_SCL_PIN);
+  s_busDead = !busOk;
+  if (s_busDead) {
+    // Bus retenido tras el rescate (fallo eléctrico / esclavo irrecuperable):
+    // RTC y LCD quedan fuera; el RESTO del sistema arranca con normalidad y
+    // sin esperas (se omite el escaneo). La pantalla reintenta cada 60 s.
+    Serial.println("🛑 [I2C] Bus no funcional (SDA/SCL retenidos) - RTC y LCD desactivados; el resto de servicios continúa");
+    s_present = false;
+    return;
+  }
+  i2cScanBus();
 
   uint8_t st;
   s_present = rtcReadReg(0x0F, &st);
@@ -162,7 +193,7 @@ void rtcTimeBegin() {
 }
 
 void rtcTimeLoop() {
-  if (!s_present) return;
+  if (s_busDead || !s_present) return;
 
   unsigned long now = millis();
   // Primera escritura ~60 s tras tener hora fiable de red; luego cada 6 h
@@ -172,6 +203,11 @@ void rtcTimeLoop() {
   struct tm lt;
   if (!systemLocalTime(&lt)) return;   // sin hora fiable todavía
 
+  // Teclado Wiegand 2 compartiendo SDA/SCL: no tocar el bus mientras
+  // transmite (se reintenta en la siguiente pasada del loop)
+  if (!i2cQuietForWiegand()) return;
+  i2cSectionBegin();
+
   // Si la hora del sistema vino SOLO del RTC, no reescribir (evita deriva
   // circular); esperar a una fuente externa (SNTP/MQTT)
   if (s_seededFromRtc && s_lastWriteMs == 0) {
@@ -179,7 +215,10 @@ void rtcTimeLoop() {
     struct tm rt;
     if (rtcReadTime(&rt)) {
       time_t a = tmToEpochUtc(&lt), b = tmToEpochUtc(&rt);
-      if (labs((long)(a - b)) < 5) return;   // sigue siendo la hora del RTC
+      if (labs((long)(a - b)) < 5) {   // sigue siendo la hora del RTC
+        i2cSectionEnd();
+        return;
+      }
     }
   }
 
@@ -189,10 +228,30 @@ void rtcTimeLoop() {
                   lt.tm_mday, lt.tm_mon + 1, lt.tm_year + 1900,
                   lt.tm_hour, lt.tm_min, lt.tm_sec);
   }
+  i2cSectionEnd();
 }
 
 bool rtcPresent() { return s_present; }
 bool rtcOscStopped() { return s_osf; }
+
+// Recuperación del bus en CALIENTE: Wire ya inicializado. Reinicia el driver
+// (Wire.end libera los pines del periférico), aplica la secuencia de rescate
+// de esclavo colgado y vuelve a levantar Wire. Envolver la llamada en
+// i2cSectionBegin/End: los pulsos de rescate generan flancos en SDA/SCL.
+bool i2cRuntimeRecover() {
+  Serial.println("🔧 [I2C] Recuperación del bus en caliente");
+  Wire.end();
+  bool ok = i2cBusRecover(BOARD_I2C_SDA_PIN, BOARD_I2C_SCL_PIN);
+  Wire.begin(BOARD_I2C_SDA_PIN, BOARD_I2C_SCL_PIN);
+  // pinMode/Wire.begin resetean la config de interrupción de 48/47: volver a
+  // enganchar los ISRs del Teclado 2 si está en modo I2C
+  wiegand2ReattachIfI2C();
+  s_busDead = !ok;
+  if (!ok) Serial.println("🛑 [I2C] El bus sigue retenido tras la recuperación");
+  return ok;
+}
+
+bool i2cBusOk() { return !s_busDead; }
 
 bool rtcSetFromLocalString(const String& localTime) {
   // "YYYY-MM-DD HH:MM:SS"
@@ -211,7 +270,12 @@ bool rtcSetFromLocalString(const String& localTime) {
   settimeofday(&tv, nullptr);
 
   // RTC
-  bool ok = s_present ? rtcWriteTime(&ti) : false;
+  bool ok = false;
+  if (s_present) {
+    i2cSectionBegin();
+    ok = rtcWriteTime(&ti);
+    i2cSectionEnd();
+  }
   if (ok) s_lastWriteMs = millis();
   Serial.printf("🕐 [RTC] Puesta en hora manual/MQTT: %s (%s)\n",
                 localTime.c_str(), ok ? "RTC actualizado" : "solo sistema");
@@ -225,7 +289,9 @@ String rtcStatusJson() {
   s += s_osf ? "true" : "false";
   s += ",\"seeded\":";
   s += s_seededFromRtc ? "true" : "false";
-  s += "}";
+  s += ",\"i2c_bus\":\"";
+  s += s_busDead ? "error" : "ok";
+  s += "\"}";
   return s;
 }
 

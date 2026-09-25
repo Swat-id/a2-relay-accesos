@@ -88,9 +88,28 @@ Pines de red/GSM alineados con **A2-MODBUS** (`include/config.h`) y foro KinCony
 | Relé 1 / 2 | 40 / 39 (activo HIGH) |
 | DI1 / DI2 | 16 / 17 |
 
-### Conflicto potencial Wiegand
+### Wiegand en A2v3 (RESUELTO en v5.0.2, validado con lector real 25-Sep-2026)
 
-El firmware de accesos en A2 usa Wiegand2 en GPIO **4/16**. En A2v3, **DI2=17** y **DI1=16** — hay que **redefinir pines Wiegand** en el target S3 (matriz a fijar en laboratorio; free GPIOs 4, 5, 6, 38 según MODBUS).
+Mapeo verificado con **sniffer de flancos** en placa real (firma 13 flancos D0
+/ 7 flancos D1 al teclear `1111#`). El rotulado del PCB **no** coincide con la
+lista "free GPIO" del foro tid=7958:
+
+| Teclado | Conector PCB | Chip ESP32-S3 |
+|---------|--------------|----------------|
+| Wiegand 1 D0/D1 | GPIO1 / GPIO2 | **18 / 8** (los "TMP1/TMP2 OneWire" del foro) |
+| Wiegand 2 D0/D1 | IO4 / IO5 | **4 / 5** (libres, sin pull-up en PCB → pull-up interna) |
+
+Quedan libres los conectores **IO6** e **IO38** (chips 6/38).
+
+⚠️ **El conector rotulado "SDA/SCL/GND/3V3" NO está conectado al MCU** en esta
+revisión de PCB (verificado con toques a GND vigilando 25 GPIOs: cero flancos;
+el botón BOOT/GPIO0 sí contaba). El bus I2C real (48/47) solo es accesible en
+los periféricos soldados (SSD1306/DS3231/24C02).
+
+⚠️ **Alimentar los lectores Wiegand SIEMPRE a 12 V** con GND común con la
+placa. Nunca usar el pin 3V3 de ningún conector: un cruce de 12 V con ese pin
+destruyó el carril de 3,3 V de una placa (S3 sin enumerar por USB, LED 12 V
+encendido).
 
 ---
 
