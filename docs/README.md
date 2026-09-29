@@ -6,11 +6,11 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 
 | Campo | Valor |
 |-------|-------|
-| Versión en desarrollo | **5.0.3_bugs** — rama `v5.0.3_bugs` (teclado 1 + latencia red) |
-| Otras ramas v5 | `v5.0.0`…`v5.0.2` |
+| Versión en desarrollo | **5.0.4_bugs_mqtt** — rama `v5.0.4_bugs_mqtt` (MQTT códigos) |
+| Otras ramas v5 | `v5.0.0`…`v5.0.3_bugs` |
 | Versión estable | **4.1.0-BLE** — rama `v4.1.0` |
 | Fecha | Septiembre 2026 |
-| Estado | `v4.1.0` producción · `v5.0.2` base · `v5.0.3_bugs` en curso |
+| Estado | `v4.1.0` producción · `v5.0.4_bugs_mqtt` planificación MQTT códigos |
 
 ## Estructura del repositorio (desarrollo)
 
@@ -27,7 +27,8 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 │   ├── v5.0.0/                  # Dual-target WiFi + 4G
 │   ├── v5.0.1/                  # Verificación SIM / 4G
 │   ├── v5.0.2/                  # Entradas digitales ampliadas
-│   └── v5.0.3_bugs/             # Bugs teclado 1 + latencia cobertura
+│   ├── v5.0.3_bugs/             # Bugs teclado 1 + latencia cobertura
+│   └── v5.0.4_bugs_mqtt/        # MQTT códigos local/remoto
 └── .cursor/rules/
 ```
 
@@ -42,14 +43,15 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 | `v5.0.0` | WiFi (A2) + GSM/4G (A2v3) | `esp32dev*` + `esp32dev_s3*` | [v5.0.0/](v5.0.0/) |
 | `v5.0.1` | Diagnóstico detección SIM / 4G | `esp32dev_4g`, `esp32dev_s3` | [v5.0.1/](v5.0.1/) |
 | `v5.0.2` | DI: pulsador + imán de puerta | `esp32dev`, `esp32dev_ble` | [v5.0.2/](v5.0.2/) |
-| **`v5.0.3_bugs`** | Bugs: teclado 1 no abre · lentitud baja cobertura | mismos que v5.0.2 | [v5.0.3_bugs/](v5.0.3_bugs/) |
+| `v5.0.3_bugs` | Bugs: teclado 1 · lentitud cobertura | mismos que v5.0.2 | [v5.0.3_bugs/](v5.0.3_bugs/) |
+| **`v5.0.4_bugs_mqtt`** | MQTT: listar/CRUD códigos local y remoto | mismos que v5.0.2 | [v5.0.4_bugs_mqtt/](v5.0.4_bugs_mqtt/) |
 
 Diferencias entre entornos v4: **[v4.1.0/ENTORNOS_COMPILACION.md](v4.1.0/ENTORNOS_COMPILACION.md)**  
 Plan dual-target v5: **[v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md](v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md)**  
 Verificación SIM/4G: **[v5.0.1/VERIFICACION-SIM-4G.md](v5.0.1/VERIFICACION-SIM-4G.md)**  
 Plan DI ampliadas: **[v5.0.2/PLAN-ENTRADAS-DIGITALES.md](v5.0.2/PLAN-ENTRADAS-DIGITALES.md)**  
-Bugs v5.0.3: **[v5.0.3_bugs/PLAN-BUGS.md](v5.0.3_bugs/PLAN-BUGS.md)**
-## Documentación de referencia
+Bugs v5.0.3: **[v5.0.3_bugs/PLAN-BUGS.md](v5.0.3_bugs/PLAN-BUGS.md)**  
+MQTT códigos: **[v5.0.4_bugs_mqtt/PLAN-MQTT-CODIGOS.md](v5.0.4_bugs_mqtt/PLAN-MQTT-CODIGOS.md)**## Documentación de referencia
 
 Índice completo: **[00 - docref/README.md](00%20-%20docref/README.md)**
 
@@ -93,5 +95,5 @@ Manual: [MANUAL_COMPILACION.md](00%20-%20docref/referencia/compilacion/MANUAL_CO
 
 ---
 
-**Última actualización**: 28 Septiembre 2026  
-**Versión del documento**: 2.4 (rama `v5.0.3_bugs`)
+**Última actualización**: 29 Septiembre 2026  
+**Versión del documento**: 2.5 (rama `v5.0.4_bugs_mqtt`)
