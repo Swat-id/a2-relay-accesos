@@ -303,8 +303,15 @@ Solo si no complica el parser; MVP = acciones explícitas.
 |------|--------|
 | Rama `v5.0.4_bugs_mqtt` | Creada |
 | Plan | Este documento |
-| `list_remote_codes` | Pendiente |
-| Unificación respuestas / manual | Pendiente |
+| C1 `list_remote_codes` | **Implementado y validado en placa** (29-Sep) |
+| C2 unificación `list_local_codes` | **Implementado y validado** (paginación, `keyboard_id`+legacy) |
+| C3 rechazo `time_slots` en local | **Implementado y validado** |
+| C4 validación completa `add_remote_code` | **Implementado y validado** (tipo/valor/kb/relé/franjas) |
+| C5 respuestas con `data` | **Implementado** (`publishDataResponse`, buffer 4 KB) |
+| C6 paginación | **Implementado** (`offset`/`limit`/`next_offset`) |
+| C7/C8 (update / eventos) | Pendiente (fase 4 opcional) |
+| Matriz de pruebas | Ver [CONTRATO-MQTT-CODIGOS.md](CONTRATO-MQTT-CODIGOS.md) §5 — falta R2 runtime (teclear 6666 en/fuera de franja) y clears |
+| Compilación | 4 entornos OK; flasheado en A2v3 CC64 |
 | Push | Cuando el usuario lo indique |
 
 ---

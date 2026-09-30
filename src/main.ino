@@ -586,7 +586,9 @@ void connectToMqtt() {
   
   mqttClient.setServer(mqtt_broker, mqtt_port);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(2048);
+  // v5.0.4: 4 KB para los listados de códigos (list_local/remote_codes).
+  // El payload útil máximo documentado es ~3,8 KB; los listados se paginan.
+  mqttClient.setBufferSize(4096);
   mqttClient.setSocketTimeout(MQTT_CONNECT_TIMEOUT_SEC);  // Timeout corto
   
   Serial.printf("📡 Conectando a MQTT (timeout: %ds)...", MQTT_CONNECT_TIMEOUT_SEC);
@@ -917,40 +919,93 @@ void connectToMqtt() {
           
           String codeType = doc["message_info"]["code_type"].as<String>();
           String codeValue = doc["message_info"]["code_value"].as<String>();
-          uint8_t keyboardId = doc["message_info"]["keyboard_id"].as<uint8_t>();
-          uint8_t relay = doc["message_info"]["relay"].as<uint8_t>();
-          
-          // Procesar franjas horarias si existen
+          int keyboardId = doc["message_info"]["keyboard_id"].as<int>();
+          int relay = doc["message_info"]["relay"].as<int>();
+
+          // v5.0.4 (C4): validar TODO antes de tocar la caché NVS
+          if (codeType != "PIN" && codeType != "TAG") {
+            publishResponse(1, receivedMessageId, "invalid code_type (must be PIN or TAG)");
+            break;
+          }
+          if (codeValue.length() == 0 || codeValue.length() > 16) {
+            publishResponse(1, receivedMessageId, "invalid code_value (1-16 characters)");
+            break;
+          }
+          if (keyboardId < 0 || keyboardId > 2) {
+            publishResponse(1, receivedMessageId, "invalid keyboard_id (0=both, 1, 2)");
+            break;
+          }
+          if (relay < 1 || relay > 2) {
+            publishResponse(1, receivedMessageId, "invalid relay (1 or 2)");
+            break;
+          }
+
+          // Franjas horarias: ausentes o [] → siempre activo. Con contenido,
+          // cada franja debe venir COMPLETA y válida (antes se ignoraban en
+          // silencio las malformadas: el integrador creía tener restricción
+          // horaria y el código quedaba sin ella).
           TimeSlot timeSlots[4];
           uint8_t timeSlotsCount = 0;
-          
+          bool slotsOk = true;
+          String slotsErr;
+
           if (doc["message_info"].containsKey("time_slots")) {
-            // Iterar sobre el array directamente
-            for (int i = 0; i < 4; i++) {
-              if (doc["message_info"]["time_slots"][i].isNull()) break;
-              
-              if (doc["message_info"]["time_slots"][i].containsKey("start_hour") && 
-                  doc["message_info"]["time_slots"][i].containsKey("start_minute") &&
-                  doc["message_info"]["time_slots"][i].containsKey("end_hour") && 
-                  doc["message_info"]["time_slots"][i].containsKey("end_minute") &&
-                  doc["message_info"]["time_slots"][i].containsKey("days_of_week")) {
-                
-                timeSlots[timeSlotsCount].start_hour = doc["message_info"]["time_slots"][i]["start_hour"].as<uint8_t>();
-                timeSlots[timeSlotsCount].start_minute = doc["message_info"]["time_slots"][i]["start_minute"].as<uint8_t>();
-                timeSlots[timeSlotsCount].end_hour = doc["message_info"]["time_slots"][i]["end_hour"].as<uint8_t>();
-                timeSlots[timeSlotsCount].end_minute = doc["message_info"]["time_slots"][i]["end_minute"].as<uint8_t>();
-                timeSlots[timeSlotsCount].days_of_week = doc["message_info"]["time_slots"][i]["days_of_week"].as<uint8_t>();
+            JsonArrayConst slots = doc["message_info"]["time_slots"].as<JsonArrayConst>();
+            if (slots.size() > 4) {
+              slotsOk = false;
+              slotsErr = "too many time_slots (max 4)";
+            } else {
+              int idx = 0;
+              for (JsonObjectConst s : slots) {
+                if (!s.containsKey("start_hour") || !s.containsKey("start_minute") ||
+                    !s.containsKey("end_hour") || !s.containsKey("end_minute") ||
+                    !s.containsKey("days_of_week")) {
+                  slotsOk = false;
+                  slotsErr = "time_slots[" + String(idx) + "] incomplete (start_hour, start_minute, end_hour, end_minute, days_of_week required)";
+                  break;
+                }
+                timeSlots[timeSlotsCount].start_hour   = s["start_hour"].as<uint8_t>();
+                timeSlots[timeSlotsCount].start_minute = s["start_minute"].as<uint8_t>();
+                timeSlots[timeSlotsCount].end_hour     = s["end_hour"].as<uint8_t>();
+                timeSlots[timeSlotsCount].end_minute   = s["end_minute"].as<uint8_t>();
+                timeSlots[timeSlotsCount].days_of_week = s["days_of_week"].as<uint8_t>();
+                memset(timeSlots[timeSlotsCount].reserved, 0, sizeof(timeSlots[timeSlotsCount].reserved));
+                if (!isTimeSlotValid(timeSlots[timeSlotsCount])) {
+                  slotsOk = false;
+                  slotsErr = "time_slots[" + String(idx) + "] invalid (hours 0-23, minutes 0-59, days_of_week 1-127)";
+                  break;
+                }
                 timeSlotsCount++;
+                idx++;
               }
             }
           }
-          
+
+          if (!slotsOk) {
+            Serial.printf("❌ [MQTT] add_remote_code: %s\n", slotsErr.c_str());
+            publishResponse(1, receivedMessageId, slotsErr);
+            break;
+          }
+
           // Añadir el código remoto
-          bool added = addRemoteCode(codeType.c_str(), codeValue.c_str(), keyboardId, relay, timeSlots, timeSlotsCount);
-          
+          bool added = addRemoteCode(codeType.c_str(), codeValue.c_str(),
+                                     (uint8_t)keyboardId, (uint8_t)relay,
+                                     timeSlots, timeSlotsCount);
+
           if (added) {
-            Serial.printf("✅ [MQTT] Código remoto añadido: %s %s\n", codeType.c_str(), codeValue.c_str());
-            publishResponse(0, receivedMessageId, "remote code added: " + codeType + " " + codeValue);
+            Serial.printf("✅ [MQTT] Código remoto añadido: %s %s (franjas: %d)\n",
+                          codeType.c_str(), codeValue.c_str(), timeSlotsCount);
+            DynamicJsonDocument ack(512);
+            ack["scope"] = "remote";
+            ack["code_type"] = codeType;
+            ack["code_value"] = codeValue;
+            ack["keyboard_id"] = keyboardId;
+            ack["relay"] = relay;
+            ack["always_active"] = (timeSlotsCount == 0);
+            ack["time_slots_count"] = timeSlotsCount;
+            ack["total_codes"] = storedRemoteCodes->count;
+            publishDataResponse(0, receivedMessageId,
+                                "remote code added: " + codeType + " " + codeValue, ack);
           } else {
             Serial.printf("❌ [MQTT] Error añadiendo código remoto: %s %s\n", codeType.c_str(), codeValue.c_str());
             publishResponse(1, receivedMessageId, "failed to add remote code (may already exist or memory full)");
@@ -969,20 +1024,30 @@ void connectToMqtt() {
           String codeValue = doc["message_info"]["code_value"].as<String>();
           
           bool deleted = deleteRemoteCode(codeType.c_str(), codeValue.c_str());
-          
+
           if (deleted) {
             Serial.printf("✅ [MQTT] Código remoto eliminado: %s %s\n", codeType.c_str(), codeValue.c_str());
-            publishResponse(0, receivedMessageId, "remote code removed: " + codeType + " " + codeValue);
+            DynamicJsonDocument ack(256);
+            ack["scope"] = "remote";
+            ack["code_type"] = codeType;
+            ack["code_value"] = codeValue;
+            ack["remaining"] = storedRemoteCodes->count;
+            publishDataResponse(0, receivedMessageId,
+                                "remote code removed: " + codeType + " " + codeValue, ack);
           } else {
             Serial.printf("❌ [MQTT] Código remoto no encontrado: %s %s\n", codeType.c_str(), codeValue.c_str());
             publishResponse(1, receivedMessageId, "remote code not found");
           }
-          
+
         } else if (action == "clear_remote_codes") {
           // Eliminar todos los códigos remotos
+          uint16_t cleared = storedRemoteCodes ? storedRemoteCodes->count : 0;
           deleteAllRemoteCodes();
           Serial.println("✅ [MQTT] Todos los códigos remotos eliminados");
-          publishResponse(0, receivedMessageId, "all remote codes cleared");
+          DynamicJsonDocument ack(128);
+          ack["scope"] = "remote";
+          ack["cleared_count"] = cleared;
+          publishDataResponse(0, receivedMessageId, "all remote codes cleared", ack);
           
         // ===== GESTIÓN DE CÓDIGOS LOCALES =====
         } else if (action == "add_local_code") {
@@ -995,12 +1060,22 @@ void connectToMqtt() {
             break;
           }
           
+          // v5.0.4 (C3): los códigos locales son SIEMPRE activos. Si el
+          // integrador manda franjas, rechazar en vez de ignorarlas (evita
+          // la falsa sensación de restricción horaria).
+          if (doc["message_info"].containsKey("time_slots")) {
+            Serial.println("❌ [MQTT] add_local_code con time_slots - rechazado");
+            publishResponse(1, receivedMessageId,
+                            "local codes do not support time_slots (use add_remote_code)");
+            break;
+          }
+
           String codeType = doc["message_info"]["code_type"].as<String>();
           String codeValue = doc["message_info"]["code_value"].as<String>();
-          int keyboardId = doc["message_info"].containsKey("keyboard_id") ? 
+          int keyboardId = doc["message_info"].containsKey("keyboard_id") ?
                           doc["message_info"]["keyboard_id"].as<int>() : 0;
           int relay = doc["message_info"]["relay"].as<int>();
-          
+
           // Validaciones
           bool isValidType = (codeType == "PIN" || codeType == "TAG");
           bool isValidCode = codeValue.length() > 0 && codeValue.length() <= 16;
@@ -1018,18 +1093,19 @@ void connectToMqtt() {
           } else {
             bool added = addCode(codeType.c_str(), codeValue.c_str(), keyboardId, relay);
             if (added) {
-              Serial.printf("✅ [MQTT] Código local añadido: %s %s -> Teclado %d, Relé %d\n", 
+              Serial.printf("✅ [MQTT] Código local añadido: %s %s -> Teclado %d, Relé %d\n",
                            codeType.c_str(), codeValue.c_str(), keyboardId, relay);
-              
-              DynamicJsonDocument respDoc(256);
-              respDoc["code_type"] = codeType;
-              respDoc["code_value"] = codeValue;
-              respDoc["keyboard_id"] = keyboardId;
-              respDoc["relay"] = relay;
-              respDoc["total_codes"] = storedCodes->count;
-              String respStr;
-              serializeJson(respDoc, respStr);
-              publishResponse(0, receivedMessageId, "local code added: " + respStr);
+
+              DynamicJsonDocument ack(256);
+              ack["scope"] = "local";
+              ack["code_type"] = codeType;
+              ack["code_value"] = codeValue;
+              ack["keyboard_id"] = keyboardId;
+              ack["relay"] = relay;
+              ack["always_active"] = true;
+              ack["total_codes"] = storedCodes->count;
+              publishDataResponse(0, receivedMessageId,
+                                  "local code added: " + codeType + " " + codeValue, ack);
             } else {
               publishResponse(1, receivedMessageId, "failed to add local code (may exist or memory full)");
             }
@@ -1063,50 +1139,137 @@ void connectToMqtt() {
               saveStoredCodes();
               found = true;
               Serial.printf("✅ [MQTT] Código local eliminado: %s %s\n", codeType.c_str(), codeValue.c_str());
-              publishResponse(0, receivedMessageId, "local code removed: " + codeType + " " + codeValue);
+              DynamicJsonDocument ack(256);
+              ack["scope"] = "local";
+              ack["code_type"] = codeType;
+              ack["code_value"] = codeValue;
+              if (keyboardId >= 0) ack["keyboard_id"] = keyboardId;
+              ack["remaining"] = storedCodes->count;
+              publishDataResponse(0, receivedMessageId,
+                                  "local code removed: " + codeType + " " + codeValue, ack);
               break;
             }
           }
-          
+
           if (!found) {
             publishResponse(1, receivedMessageId, "local code not found");
           }
-          
+
         } else if (action == "clear_local_codes") {
           // Eliminar todos los códigos locales
+          uint16_t cleared = storedCodes->count;
           storedCodes->count = 0;
           saveStoredCodes();
           Serial.println("✅ [MQTT] Todos los códigos locales eliminados");
-          publishResponse(0, receivedMessageId, "all local codes cleared");
-          
+          DynamicJsonDocument ack(128);
+          ack["scope"] = "local";
+          ack["cleared_count"] = cleared;
+          publishDataResponse(0, receivedMessageId, "all local codes cleared", ack);
+
         } else if (action == "list_local_codes") {
-          // Listar códigos locales
-          Serial.println("📋 [MQTT] Listando códigos locales...");
-          
-          DynamicJsonDocument listDoc(2048);
+          // v5.0.4 (C2): listado estructurado con paginación offset/limit.
+          // Entrada ~55 B en JSON → una página de 50 (todo el almacén) cabe
+          // holgada en el buffer de 4 KB.
+          int offset = doc["message_info"].containsKey("offset") ?
+                       doc["message_info"]["offset"].as<int>() : 0;
+          int limit = doc["message_info"].containsKey("limit") ?
+                      doc["message_info"]["limit"].as<int>() : MAX_CODES;
+          if (offset < 0) offset = 0;
+          if (limit < 1) limit = 1;
+          if (limit > MAX_CODES) limit = MAX_CODES;
+
+          Serial.printf("📋 [MQTT] Listando códigos locales (offset=%d, limit=%d)...\n", offset, limit);
+
+          DynamicJsonDocument listDoc(3584);
+          listDoc["scope"] = "local";
           listDoc["count"] = storedCodes->count;
           listDoc["max"] = MAX_CODES;
-          listDoc["validation_mode"] = storedCodes->localValidationFirst ? "local_first" : "remote_only";
-          
+          listDoc["offset"] = offset;
+          listDoc["limit"] = limit;
+          listDoc["validation_mode"] = storedCodes->localValidationFirst ? "local_first" : "remote_first";
+          listDoc["always_active"] = true;   // los locales no tienen calendario
+
           JsonArray codesArray = listDoc.createNestedArray("codes");
-          for (int i = 0; i < storedCodes->count && i < 30; i++) {  // Limitar a 30 para no exceder buffer
+          int shown = 0;
+          for (int i = offset; i < storedCodes->count && shown < limit; i++, shown++) {
             JsonObject code = codesArray.createNestedObject();
             code["id"] = i;
             code["type"] = storedCodes->codes[i].type;
             code["value"] = storedCodes->codes[i].value;
-            code["keyboard"] = storedCodes->codes[i].keyboard_id;
+            code["keyboard_id"] = storedCodes->codes[i].keyboard_id;
+            code["keyboard"] = storedCodes->codes[i].keyboard_id;  // legacy (pre-v5.0.4)
             code["relay"] = storedCodes->codes[i].relay;
           }
-          
-          if (storedCodes->count > 30) {
-            listDoc["truncated"] = true;
-            listDoc["showing"] = 30;
-          }
-          
+          bool truncated = (offset + shown) < storedCodes->count;
+          listDoc["showing"] = shown;
+          listDoc["truncated"] = truncated;
+          if (truncated) listDoc["next_offset"] = offset + shown;
+
+          // Compat: los clientes pre-v5.0.4 parsean el JSON del string
+          // response_info; los nuevos usan el objeto data. En páginas grandes
+          // NO se duplica el JSON en el string (excedería el buffer MQTT).
           String listStr;
           serializeJson(listDoc, listStr);
-          publishResponse(0, receivedMessageId, listStr);
-          
+          if (listStr.length() > 1500) {
+            listStr = "local codes: " + String(shown) + "/" + String(storedCodes->count) + " (see data)";
+          }
+          publishDataResponse(0, receivedMessageId, listStr, listDoc);
+
+        } else if (action == "list_remote_codes") {
+          // v5.0.4 (C1): listado de la caché de códigos remotos con franjas.
+          // Entrada con 4 franjas ≈ 320 B → página por defecto de 8 y máximo
+          // 10 para no acercarse al buffer de 4 KB.
+          int offset = doc["message_info"].containsKey("offset") ?
+                       doc["message_info"]["offset"].as<int>() : 0;
+          int limit = doc["message_info"].containsKey("limit") ?
+                      doc["message_info"]["limit"].as<int>() : 8;
+          if (offset < 0) offset = 0;
+          if (limit < 1) limit = 1;
+          if (limit > 10) limit = 10;
+
+          Serial.printf("📋 [MQTT] Listando códigos remotos (offset=%d, limit=%d)...\n", offset, limit);
+
+          DynamicJsonDocument listDoc(3584);
+          listDoc["scope"] = "remote";
+          listDoc["count"] = storedRemoteCodes ? storedRemoteCodes->count : 0;
+          listDoc["max"] = MAX_REMOTE_CODES;
+          listDoc["offset"] = offset;
+          listDoc["limit"] = limit;
+
+          JsonArray codesArray = listDoc.createNestedArray("codes");
+          int shown = 0;
+          if (storedRemoteCodes != nullptr) {
+            for (int i = offset; i < storedRemoteCodes->count && shown < limit; i++, shown++) {
+              const RemoteCodeEntry& rc = storedRemoteCodes->codes[i];
+              JsonObject code = codesArray.createNestedObject();
+              code["id"] = i;
+              code["type"] = rc.type;
+              code["value"] = rc.value;
+              code["keyboard_id"] = rc.keyboard_id;
+              code["relay"] = rc.relay;
+              code["always_active"] = (rc.time_slots_count == 0);
+              code["time_slots_count"] = rc.time_slots_count;
+              JsonArray slots = code.createNestedArray("time_slots");
+              for (int s = 0; s < rc.time_slots_count && s < 4; s++) {
+                JsonObject slot = slots.createNestedObject();
+                slot["start_hour"] = rc.time_slots[s].start_hour;
+                slot["start_minute"] = rc.time_slots[s].start_minute;
+                slot["end_hour"] = rc.time_slots[s].end_hour;
+                slot["end_minute"] = rc.time_slots[s].end_minute;
+                slot["days_of_week"] = rc.time_slots[s].days_of_week;
+                slot["days_string"] = getDaysOfWeekString(rc.time_slots[s].days_of_week);
+              }
+            }
+          }
+          int total = storedRemoteCodes ? storedRemoteCodes->count : 0;
+          bool truncated = (offset + shown) < total;
+          listDoc["showing"] = shown;
+          listDoc["truncated"] = truncated;
+          if (truncated) listDoc["next_offset"] = offset + shown;
+
+          publishDataResponse(0, receivedMessageId,
+                              "remote codes: " + String(shown) + "/" + String(total), listDoc);
+
         } else {
           Serial.printf("❌ Acción desconocida para message_type 5: %s\n", action.c_str());
           publishResponse(1, receivedMessageId, "unknown action: " + action);
@@ -1751,6 +1914,40 @@ void connectToMqtt() {
    }
  }
  
+// v5.0.4: respuesta con objeto "data" estructurado (además del texto legacy
+// en response_info). Mismo topic y envelope que publishResponse; los clientes
+// antiguos siguen leyendo response_info y los nuevos parsean data.
+void publishDataResponse(int responseType, unsigned long originalMessageId,
+                         const String& responseInfo, JsonDocument& dataDoc) {
+  if (!mqttClient.connected()) {
+    Serial.println("⚠️ MQTT desconectado, no se puede publicar respuesta");
+    return;
+  }
+
+  DynamicJsonDocument doc(6144);
+  doc["timestamp"] = getTimestamp();
+  doc["response_id"] = responseId++;
+  doc["message_id"] = originalMessageId;
+  doc["device"] = deviceName;
+  doc["serial"] = fixedSerialNumber;
+  doc["response_type"] = responseType;
+  doc["response_info"] = responseInfo;
+  doc["data"] = dataDoc.as<JsonVariantConst>();
+
+  String message;
+  serializeJson(doc, message);
+  String topic = "swatidhome/response/" + fixedSerialNumber + "/rx";
+
+  bool published = mqttClient.publish(topic.c_str(), message.c_str());
+  if (published) {
+    Serial.printf("📤 Respuesta publicada: tipo %d (%u bytes)\n",
+                  responseType, (unsigned)message.length());
+  } else {
+    Serial.printf("❌ Error publicando respuesta (%u bytes): %s\n",
+                  (unsigned)message.length(), topic.c_str());
+  }
+}
+
  void publishResponse(int responseType, unsigned long originalMessageId, String responseInfo, int relay) {
    if (!mqttClient.connected()) {
      Serial.println("⚠️ MQTT desconectado, no se puede publicar respuesta");
@@ -2530,6 +2727,20 @@ void updateOTAConfiguration(const JsonDocument& doc) {
     maxFailedAttempts = config.maxFailedAttempts;
      strncpy(admin_password, config.webPassword, sizeof(admin_password));
      Serial.println("💾 Configuración cargada desde EEPROM");
+
+    // Migración v5.0.4: los firmware ≤v4.x tenían un test de arranque que
+    // escribía 0x55 ('U') en la dirección 0 de la EEPROM = deviceName[0],
+    // dejando nombres "UWATID_..." en placas que pasaron por ellos. Si el
+    // resto del nombre coincide con el serial fijo, es esa corrupción:
+    // restaurar la 'S' y persistir.
+    if (deviceName[0] == 'U' && fixedSerialNumber.length() > 1 &&
+        fixedSerialNumber[0] == 'S' &&
+        strcmp(deviceName + 1, fixedSerialNumber.c_str() + 1) == 0) {
+      deviceName[0] = 'S';
+      Serial.printf("🔧 Nombre reparado (corrupción EEPROM de firmware antiguo): %s\n",
+                    deviceName);
+      saveConfiguration();
+    }
   } else {
     // Primera ejecución - generar serial fijo
     fixedSerialNumber = generateFixedSerial();
