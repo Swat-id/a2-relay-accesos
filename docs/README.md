@@ -6,11 +6,11 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 
 | Campo | Valor |
 |-------|-------|
-| Versión en desarrollo | **5.0.5_users** — rama `v5.0.5_users` (usuarios / vinculación) |
-| Otras ramas v5 | `v5.0.0`…`v5.0.4_bugs_mqtt` |
+| Versión en desarrollo | **5.0.6_BLE** — rama `v5.0.6_BLE` (config completa por BLE) |
+| Otras ramas v5 | `v5.0.0`…`v5.0.5_users` |
 | Versión estable | **4.1.0-BLE** — rama `v4.1.0` |
 | Fecha | Octubre 2026 |
-| Estado | `v4.1.0` producción · `v5.0.5_users` planificación usuarios |
+| Estado | `v4.1.0` producción · `v5.0.6_BLE` planificación BLE |
 
 ## Estructura del repositorio (desarrollo)
 
@@ -29,7 +29,8 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 │   ├── v5.0.2/                  # Entradas digitales ampliadas
 │   ├── v5.0.3_bugs/             # Bugs teclado 1 + latencia cobertura
 │   ├── v5.0.4_bugs_mqtt/        # MQTT códigos local/remoto
-│   └── v5.0.5_users/            # Usuarios / canal vinculación
+│   ├── v5.0.5_users/            # Usuarios / canal vinculación
+│   └── v5.0.6_BLE/              # Config completa por BLE
 └── .cursor/rules/
 ```
 
@@ -46,7 +47,8 @@ Controlador de acceso KinCony KC868-A2 (ESP32): Wiegand dual, MQTT, web, Etherne
 | `v5.0.2` | DI: pulsador + imán de puerta | `esp32dev`, `esp32dev_ble` | [v5.0.2/](v5.0.2/) |
 | `v5.0.3_bugs` | Bugs: teclado 1 · lentitud cobertura | mismos que v5.0.2 | [v5.0.3_bugs/](v5.0.3_bugs/) |
 | `v5.0.4_bugs_mqtt` | MQTT: listar/CRUD códigos local y remoto | mismos que v5.0.2 | [v5.0.4_bugs_mqtt/](v5.0.4_bugs_mqtt/) |
-| **`v5.0.5_users`** | Usuarios: superadmin / admin placa / autorizados | `esp32dev_ble`, `esp32dev_s3` | [v5.0.5_users/](v5.0.5_users/) |
+| `v5.0.5_users` | Usuarios: superadmin / admin placa / autorizados | `esp32dev_ble`, `esp32dev_s3` | [v5.0.5_users/](v5.0.5_users/) |
+| **`v5.0.6_BLE`** | Config completa App por BLE (WiFi scan, paridad portal) | `esp32dev_ble`, `esp32dev_s3` | [v5.0.6_BLE/](v5.0.6_BLE/) |
 
 Diferencias entre entornos v4: **[v4.1.0/ENTORNOS_COMPILACION.md](v4.1.0/ENTORNOS_COMPILACION.md)**  
 Plan dual-target v5: **[v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md](v5.0.0/PLAN-DUAL-TARGET-WIFI-4G.md)**  
@@ -54,7 +56,8 @@ Verificación SIM/4G: **[v5.0.1/VERIFICACION-SIM-4G.md](v5.0.1/VERIFICACION-SIM-
 Plan DI ampliadas: **[v5.0.2/PLAN-ENTRADAS-DIGITALES.md](v5.0.2/PLAN-ENTRADAS-DIGITALES.md)**  
 Bugs v5.0.3: **[v5.0.3_bugs/PLAN-BUGS.md](v5.0.3_bugs/PLAN-BUGS.md)**  
 MQTT códigos: **[v5.0.4_bugs_mqtt/PLAN-MQTT-CODIGOS.md](v5.0.4_bugs_mqtt/PLAN-MQTT-CODIGOS.md)**  
-Usuarios / vinculación: **[v5.0.5_users/PLAN-USUARIOS-MQTT.md](v5.0.5_users/PLAN-USUARIOS-MQTT.md)**
+Usuarios / vinculación: **[v5.0.5_users/PLAN-USUARIOS-MQTT.md](v5.0.5_users/PLAN-USUARIOS-MQTT.md)**  
+Config BLE completa: **[v5.0.6_BLE/PLAN-BLE-CONFIG.md](v5.0.6_BLE/PLAN-BLE-CONFIG.md)**
 
 ## Documentación de referencia
 
@@ -100,5 +103,5 @@ Manual: [MANUAL_COMPILACION.md](00%20-%20docref/referencia/compilacion/MANUAL_CO
 
 ---
 
-**Última actualización**: 01 Octubre 2026  
-**Versión del documento**: 2.6 (rama `v5.0.5_users`)
+**Última actualización**: 16 Octubre 2026  
+**Versión del documento**: 2.7 (rama `v5.0.6_BLE`)
