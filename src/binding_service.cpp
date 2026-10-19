@@ -77,6 +77,10 @@ static bool saveStore() {
 }
 
 #ifdef ENABLE_BLE
+// Guard anti-eco: cuando el cambio nace en el propio binding (syncToBle →
+// saveBLEAuthConfig → bindingSyncFromBle) no hay nada nuevo que reflejar.
+static bool s_syncingToBle = false;
+
 // Sincroniza las claves hacia la config BLE para que la app siga
 // autenticando con el mismo material (admin = superadmin BLE histórico).
 static void syncToBle() {
@@ -94,7 +98,9 @@ static void syncToBle() {
     strncpy(bleAuthConfig.user_names[i], s_store.user_names[i], 15);
     bleAuthConfig.user_names[i][15] = '\0';
   }
+  s_syncingToBle = true;
   saveBLEAuthConfig();
+  s_syncingToBle = false;
 }
 #endif
 
@@ -191,6 +197,61 @@ bool bindingPlatformSet() { return s_store.platform_set != 0; }
 const uint8_t* bindingPlatformKeyPtr() {
   return s_store.platform_set ? s_store.platform_key : nullptr;
 }
+
+#ifdef ENABLE_BLE
+// BLE → binding: refleja en el almacén de vinculación cualquier mutación
+// hecha por el canal BLE (TOFU del primer FF01, gestión tipo 6). La clave
+// de plataforma NUNCA se toca desde aquí.
+void bindingSyncFromBle() {
+  if (s_syncingToBle) return;   // el cambio nació en el propio binding
+  if (!s_loaded) return;        // arranque: aún sin cargar (la migración
+                                // de bindingServiceBegin cubre ese caso)
+  bool changed = false;
+
+  if (bleAuthConfig.superadmin_registered) {
+    if (!s_store.admin_set ||
+        memcmp(s_store.admin_key, bleAuthConfig.superadmin_key, BINDING_KEY_SIZE) != 0) {
+      memcpy(s_store.admin_key, bleAuthConfig.superadmin_key, BINDING_KEY_SIZE);
+      s_store.admin_set = 1;
+      if (!s_store.admin_name[0])
+        strncpy(s_store.admin_name, "admin", sizeof(s_store.admin_name) - 1);
+      changed = true;
+    }
+  } else if (s_store.admin_set) {
+    memset(s_store.admin_key, 0, BINDING_KEY_SIZE);
+    s_store.admin_set = 0;
+    s_store.admin_name[0] = '\0';
+    changed = true;
+  }
+
+  for (int i = 0; i < BINDING_MAX_USERS; i++) {
+    bool en = bleAuthConfig.user_enabled[i] != 0;
+    if (en != (s_store.user_enabled[i] != 0) ||
+        (en && (memcmp(s_store.user_keys[i], bleAuthConfig.user_keys[i], BINDING_KEY_SIZE) != 0 ||
+                s_store.user_permissions[i] != bleAuthConfig.user_permissions[i] ||
+                strncmp(s_store.user_names[i], bleAuthConfig.user_names[i], 15) != 0))) {
+      memcpy(s_store.user_keys[i], bleAuthConfig.user_keys[i], BINDING_KEY_SIZE);
+      s_store.user_enabled[i] = bleAuthConfig.user_enabled[i];
+      s_store.user_permissions[i] = bleAuthConfig.user_permissions[i];
+      strncpy(s_store.user_names[i], bleAuthConfig.user_names[i], 15);
+      s_store.user_names[i][15] = '\0';
+      if (!en) {
+        memset(s_store.user_keys[i], 0, BINDING_KEY_SIZE);
+        s_store.user_permissions[i] = 0;
+        s_store.user_names[i][0] = '\0';
+      }
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveStore();
+    Serial.println("🔗 [VINCULO] Sincronizado desde BLE (TOFU/gestión tipo 6)");
+  }
+}
+#else
+void bindingSyncFromBle() {}
+#endif
 
 int bindingUsersCount() {
   int n = 0;

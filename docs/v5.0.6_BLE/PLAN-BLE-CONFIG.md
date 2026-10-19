@@ -253,7 +253,9 @@ Mantener **mínimo de UUIDs nuevos**; preferir JSON con `cmd` sobre proliferar c
 | Plan | Este documento |
 | Implementación B1–B4 (Fase 1) | **Hecha** (16-Oct): FF05 JSON unificado (scan/STA/AP/eth_set + legado binario), lock AP↔BLE R1–R5, web 409, restore de política al cerrar sesión, permiso 0x08 corregido en docs — ver [CONTRATO-FF05-RED.md](CONTRATO-FF05-RED.md) |
 | Compilación | 4 entornos OK (BLE: 77,5 % flash) |
-| Validación W1–W6 | Pendiente de placa A2 + App (la placa conectada es A2v3 sin build BLE) |
+| Validación W1–W6 | **W1/W2(parcial)/W3/W5/S1-S3 validadas en placa A2v3** (19-Oct, cliente BLE real desde macOS): TOFU → `OK:SUPERADMIN_REGISTERED`, re-auth challenge-response → `OK:AUTHENTICATED`, FF07/FF05 status, `wifi_scan_start` → **13 redes con el enlace BLE ESTABLE** durante el scan, `exit_config` OK. Clave TOFU-BLE verificada en el almacén de vinculación tras reinicio (`admin=sí`, prefijo de clave coincidente) |
+| Fixes añadidos en la validación | **Sync inversa BLE→binding** (TOFU/tipo 6 → `bindingSyncFromBle` desde `saveBLEAuthConfig`, guard anti-eco) · **Coexistencia radio**: `updateConnParams` (intervalo 30–60 ms, latencia 4, supervision 6 s) al conectar + scan WiFi a 120 ms/canal — sin ellos el scan tiraba el enlace BLE (reproducido y corregido) |
+| Validación A2 clásico | Compila (esp32dev_ble); flasheo+prueba pendiente de conectar la placa |
 | Fases 2–4 (B5–B10) | Pendientes |
 | Push | Cuando el usuario lo indique |
 

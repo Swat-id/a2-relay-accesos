@@ -231,7 +231,9 @@ void wifiScanStart() {
   s_scanning = true;
   s_scanStartedAt = millis();
   applyRadioMode();               // asegura interfaz STA para escanear
-  WiFi.scanNetworks(true /*async*/);
+  // 120 ms por canal (vs ~300 por defecto): acorta el acaparamiento de la
+  // radio para no estrangular un enlace BLE simultáneo (v5.0.6)
+  WiFi.scanNetworks(true /*async*/, false /*hidden*/, false /*passive*/, 120);
   Serial.println("📶 [WIFI] Escaneo de redes iniciado");
 }
 

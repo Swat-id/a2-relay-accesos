@@ -65,3 +65,10 @@ bool bindingClearPlatformKey();
 // challenge-response BLE (SHA256(key ‖ nonce)). nullptr si no provisionada.
 // Mismo dominio de confianza (firmware); la clave nunca sale del equipo.
 const uint8_t* bindingPlatformKeyPtr();
+
+// Sincronización inversa BLE → binding (v5.0.6): las mutaciones hechas por
+// el canal BLE (TOFU del primer FF01, tipo 6 MQTT) escriben BLEAuthConfig;
+// esta función las refleja en el almacén de vinculación para que /vinculo,
+// devinfo y la clave de plataforma vean SIEMPRE el mismo estado. main la
+// invoca desde saveBLEAuthConfig(). No toca la clave de plataforma.
+void bindingSyncFromBle();

@@ -7552,6 +7552,9 @@ void saveBLEAuthConfig() {
     // Actualizar la característica de info del dispositivo (FF08)
     // para que la APP vea los cambios en superadmin_registered y active_users
     updateBLEDeviceInfo();
+    // v5.0.6: reflejar las mutaciones BLE (TOFU/tipo 6) en el almacén de
+    // vinculación para que /vinculo y devinfo vean el mismo estado
+    bindingSyncFromBle();
   } else {
     Serial.println("❌ [BLE] Error al guardar configuración");
   }
@@ -7622,10 +7625,15 @@ int verifyBLEKey(const uint8_t* key) {
 
 // Callback para conexiones BLE (v4.1 con soporte de sesiones seguras)
 class SWATIDServerCallbacks: public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* pServer) {
+  void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
     bleDeviceConnected = true;
     invalidateBLESession();  // Limpiar cualquier sesión anterior
     bleConnectionTime = millis();  // Registrar momento de conexión
+    // v5.0.6: WiFi y BLE comparten la radio. Con el intervalo/timeout que
+    // negocian iOS/macOS por defecto, un escaneo WiFi puede matar el enlace
+    // BLE (supervision timeout). Pedimos parámetros tolerantes: intervalo
+    // 30-60 ms, latencia 4, supervision timeout 6 s.
+    pServer->updateConnParams(desc->conn_handle, 24, 48, 4, 600);
     Serial.println("🔵 [BLE] Dispositivo conectado - Esperando autenticación...");
     Serial.printf("🔵 [BLE] Timeout de autenticación: %d segundos\n", BLE_AUTH_TIMEOUT_MS / 1000);
     Serial.println("🔐 [BLE] v4.1: Usar FF0B para obtener challenge, luego FF01 con SHA256(key+nonce)");
