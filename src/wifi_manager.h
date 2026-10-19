@@ -64,6 +64,16 @@ bool wifiSetApPass(const String& pass);                // >= 8 caracteres
 // --- Escaneo asíncrono ---
 void wifiScanStart();
 
+// --- Modo configuración de red por BLE (v5.0.6, política B1/R1-R4) ---
+// Enter: apaga el SoftAP y bloquea los cambios de red desde el portal web
+// (evita el conflicto AP↔STA al escanear/conectar desde la App).
+// Exit: restaura la política del AP persistida (always_on → se reenciende;
+// boot_window → solo si la STA no está conectada). Lo llama main al cerrar
+// la sesión BLE o al desconectar.
+void wifiBleConfigEnter();
+void wifiBleConfigExit();
+bool wifiConfigLockedByBle();
+
 // --- Estado / integración ---
 String wifiStatusJson();   // para /api/wifi/status y MQTT get_wifi (sin passwords)
 String wifiScanJson();     // {scanning, networks:[{ssid,rssi,enc}]}
@@ -81,5 +91,8 @@ inline int  wifiApRemainingS() { return 0; }
 inline bool wifiStaConnected() { return false; }
 inline String wifiStatusJson() { return String("{}"); }
 inline void wifiRegisterWebRoutes() {}
+inline void wifiBleConfigEnter() {}
+inline void wifiBleConfigExit() {}
+inline bool wifiConfigLockedByBle() { return false; }
 
 #endif  // A2_FEATURE_WIFI_MGMT

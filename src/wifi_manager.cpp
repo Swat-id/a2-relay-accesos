@@ -235,6 +235,37 @@ void wifiScanStart() {
   Serial.println("📶 [WIFI] Escaneo de redes iniciado");
 }
 
+// ---------------------------------------------------------------------------
+// Modo configuración de red por BLE (v5.0.6 — política B1)
+//   R1: al entrar se apaga el SoftAP (el radio queda libre para STA/scan)
+//   R2/R4: el portal web rechaza cambios de red mientras dura (409)
+//   R3: al salir se restaura la política del AP persistida en NVS
+// ---------------------------------------------------------------------------
+static bool s_bleConfigMode = false;
+
+void wifiBleConfigEnter() {
+  if (s_bleConfigMode) return;
+  s_bleConfigMode = true;
+  Serial.println("📶 [WIFI] Config de red por BLE: AP apagado, portal de red bloqueado");
+  wifiApStopNow();
+}
+
+void wifiBleConfigExit() {
+  if (!s_bleConfigMode) return;
+  s_bleConfigMode = false;
+  // Restaurar política del AP: always_on vuelve siempre; boot_window se
+  // rearma solo si la STA no quedó conectada (si el instalador acaba de
+  // configurar WiFi con éxito, no reabrimos el AP innecesariamente)
+  if (s_apMode == WIFI_AP_MODE_ALWAYS_ON) {
+    wifiApStartNow(0);
+  } else if (s_apMode == WIFI_AP_MODE_BOOT_WINDOW && !s_staConnected) {
+    wifiApStartNow(0);
+  }
+  Serial.println("📶 [WIFI] Config de red por BLE finalizada: política AP restaurada");
+}
+
+bool wifiConfigLockedByBle() { return s_bleConfigMode; }
+
 // Serializa los resultados del escaneo y los cachea (los resultados en el
 // driver pueden perderse al reajustar el modo radio)
 static void cacheScanResults() {
@@ -364,6 +395,12 @@ static void handleWifiScanApi() {
 
 static void handleWifiPost() {
   if (!webAuth()) return;
+  // R2/R4 (v5.0.6): un solo propietario de la config de red a la vez
+  if (wifiConfigLockedByBle()) {
+    server.send(409, "text/plain",
+                "Configuracion de red en curso por BLE (App). Reintentar al terminar.");
+    return;
+  }
   String action = server.arg("action");
   String msg = "ok";
 

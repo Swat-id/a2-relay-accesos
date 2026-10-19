@@ -57,6 +57,7 @@
 #include "rtc_time.h"          // RTC DS3231 (A2v3): hora propia mantenida
 #include "status_display.h"    // Pantalla OLED de estado (A2v3)
 #include "i2c_guard.h"         // Coexistencia bus I2C ↔ Teclado 2 (A2v3)
+#include "binding_service.h"   // Gestión de usuarios / canal vinculo (v5.0.5)
 #if A2_BOARD_A2V3
 #include <SPI.h>               // Bus del W5500
 #endif
@@ -105,15 +106,17 @@
 #define FIRMWARE_VERSION_MAJOR 5
 #define FIRMWARE_VERSION_MINOR 0
 #define FIRMWARE_VERSION_PATCH 2
-const char* firmwareVersion = "v5.0.2";
-#if defined(ENABLE_BLE)
-const char* firmwareFullVersion = "v5.0.2-BLE";
+const char* firmwareVersion = "v5.0.6";
+#if defined(ENABLE_BLE) && A2_BOARD_A2V3
+const char* firmwareFullVersion = "v5.0.6-S3-BLE";
+#elif defined(ENABLE_BLE)
+const char* firmwareFullVersion = "v5.0.6-BLE";
 #elif A2_BOARD_A2V3
-const char* firmwareFullVersion = "v5.0.2-S3";
+const char* firmwareFullVersion = "v5.0.6-S3";
 #elif A2_FEATURE_GSM_MODEM
-const char* firmwareFullVersion = "v5.0.2-4G";
+const char* firmwareFullVersion = "v5.0.6-4G";
 #else
-const char* firmwareFullVersion = "v5.0.2";
+const char* firmwareFullVersion = "v5.0.6";
 #endif
 #define FIRMWARE_VERSION_BUILD __DATE__ " " __TIME__
 const char* firmwareBuild = FIRMWARE_VERSION_BUILD;
@@ -638,17 +641,35 @@ void connectToMqtt() {
   }
 }
  
+ // v5.0.5: eventos BINDING_* del servicio de vinculación
+void publishBindingEvent(const String& json) {
+  if (!mqttClient.connected()) return;
+  String topic = "swatidhome/events/" + fixedSerialNumber + "/ble";
+  mqttClient.publish(topic.c_str(), json.c_str());
+}
+
  // =================== CALLBACK MQTT ===================
  void mqttCallback(char* topic, byte* payload, unsigned int length) {
    Serial.print("📨 [MQTT] Mensaje recibido [");
    Serial.print(topic);
    Serial.print("]: ");
- 
+
    String message;
    for (unsigned int i = 0; i < length; i++) {
      message += (char)payload[i];
    }
    Serial.println(message);
+
+  // v5.0.5: canal de vinculación (gestión de usuarios, alineado X1).
+  // Se rutea ANTES del parseo genérico: el servicio parsea su propio JSON
+  // (el sobre HMAC necesita el payload como string exacto).
+  if (String(topic).endsWith("/vinculo")) {
+    String resp = bindingHandleMessage(message);
+    String respTopic = "swatidhome/" + fixedSerialNumber + "/vinculo";
+    mqttClient.publish(respTopic.c_str(), resp.c_str());
+    Serial.printf("🔗 [VINCULO] → %s\n", resp.c_str());
+    return;
+  }
 
    // 2048 = mismo tamaño que el buffer de PubSubClient; con 1024 un sync de
    // códigos remotos con franjas horarias podía descartarse en silencio
@@ -5941,6 +5962,8 @@ void handleBLEStatus() {
  // =================== SERVIDOR WEB ===================
  void setupWebServer() {
    server.on("/", handleRoot);
+   server.on("/binding", handleBinding);
+   server.on("/binding_action", HTTP_POST, handleBindingAction);
    server.on("/save", HTTP_POST, handleSave);
    server.on("/rele", handleRele);
    server.on("/reboot", handleReboot);
@@ -7016,6 +7039,85 @@ void handleCodes() {
  }
  
  
+// =================== WEB: VINCULACIÓN DE USUARIOS (v5.0.5) ===================
+// Ventana remota TOFU + provisión de la clave de superadmin de plataforma
+// (procedimiento de fábrica: requiere la contraseña web del equipo).
+void handleBinding() {
+  if (!webAuth()) return;
+
+  String html = webPageBegin("Vinculación de Usuarios - SWAT ID");
+  html += "<h1>🔗 Vinculación de usuarios</h1>";
+
+  html += "<div class='status-panel'><h3>📊 Estado</h3><ul>";
+  html += "<li>Superadmin de plataforma: <strong>";
+  html += bindingPlatformSet() ? "PROVISIONADO" : "no provisionado";
+  html += "</strong></li><li>Admin de placa (slot 0): <strong>";
+  html += bindingAdminSet() ? "VINCULADO" : "libre (TOFU disponible)";
+  html += "</strong></li><li>Usuarios: <strong>" + String(bindingUsersCount()) + "/5</strong></li>";
+  html += "<li>Ventana remota: <strong>";
+  if (bindingWindowOpen()) {
+    html += "ABIERTA (" + String(bindingWindowRemainingS()) + " s)";
+  } else {
+    html += "cerrada";
+  }
+  html += "</strong></li></ul></div>";
+
+  html += "<div class='input-config'><h3>🪟 Ventana de vinculación remota</h3>"
+          "<p style='color:#666'>Con la ventana abierta y sin admin previo, el "
+          "backend puede vincular al admin de placa por MQTT "
+          "(<code>command/&lt;serial&gt;/vinculo</code>, comando <code>link</code>).</p>"
+          "<form action='/binding_action' method='POST' style='display:inline'>"
+          "<input type='hidden' name='action' value='open_window'>"
+          "<button type='submit'>🪟 Abrir 10 min</button></form> "
+          "<form action='/binding_action' method='POST' style='display:inline'>"
+          "<input type='hidden' name='action' value='close_window'>"
+          "<button type='submit'>❌ Cerrar</button></form></div>";
+
+  html += "<div class='input-config'><h3>🏭 Superadmin de plataforma (fábrica)</h3>"
+          "<p style='color:#b36b00'>Clave de servicio SWATID: acceso siempre "
+          "garantizado; no la borra ningún unlink de admin o usuarios.</p>"
+          "<form action='/binding_action' method='POST'>"
+          "<input type='hidden' name='action' value='set_platform'>"
+          "<div class='form-group'><label>Clave (128 caracteres hex):</label>"
+          "<input type='text' name='key' minlength='128' maxlength='128' "
+          "pattern='[0-9a-fA-F]{128}' required style='width:100%'></div>"
+          "<button type='submit'>💾 Provisionar / rotar</button></form>";
+  if (bindingPlatformSet()) {
+    html += "<form action='/binding_action' method='POST' "
+            "onsubmit='return confirm(\"¿Eliminar la clave de plataforma?\")'>"
+            "<input type='hidden' name='action' value='clear_platform'>"
+            "<button type='submit' style='background:#c0392b'>🗑️ Eliminar clave de plataforma</button></form>";
+  }
+  html += "</div>";
+
+  html += "<div style='text-align:center;margin-top:20px'>"
+          "<a href='/'><button type='button'>🏠 Volver</button></a></div>";
+  html += WEB_PAGE_END;
+  server.send(200, "text/html", html);
+}
+
+void handleBindingAction() {
+  if (!webAuth()) return;
+  String action = server.arg("action");
+  if (action == "open_window") {
+    bindingOpenWindow(600);
+  } else if (action == "close_window") {
+    bindingCloseWindow();
+  } else if (action == "set_platform") {
+    if (!bindingSetPlatformKeyHex(server.arg("key"))) {
+      server.send(200, "text/html",
+        "<html><head><meta charset='UTF-8'></head><body>"
+        "<h1>❌ Clave inválida</h1><p>Debe tener 128 caracteres hexadecimales.</p>"
+        "<a href='/binding'>Volver</a></body></html>");
+      return;
+    }
+  } else if (action == "clear_platform") {
+    bindingClearPlatformKey();
+  }
+  server.sendHeader("Location", "/binding");
+  server.send(303);
+}
+
  void handleNotFound() {
    server.send(404, "text/html", 
      "<html><body><h1>❌ Página no encontrada</h1>"
@@ -7113,8 +7215,19 @@ int verifyBLEChallengeResponse(const uint8_t* response) {
   }
   
   uint8_t expected[32];
-  
-  // Verificar contra superadmin
+
+  // v5.0.5 (U5): superadmin de PLATAFORMA — siempre accede, también por BLE
+  const uint8_t* platformKey = bindingPlatformKeyPtr();
+  if (platformKey != nullptr) {
+    calculateSHA256Response(platformKey, bleSessionNonce, expected);
+    if (memcmp(response, expected, 32) == 0) {
+      Serial.println("🔐 [BLE] ✓ Response válido - SUPERADMIN PLATAFORMA");
+      bleChallengeReady = false;
+      return 100;
+    }
+  }
+
+  // Verificar contra superadmin (admin de placa)
   if (bleAuthConfig.superadmin_registered) {
     calculateSHA256Response(bleAuthConfig.superadmin_key, bleSessionNonce, expected);
     if (memcmp(response, expected, 32) == 0) {
@@ -7181,6 +7294,9 @@ void invalidateBLESession() {
   bleConnectedUser = "";
   memset(bleSessionToken, 0, 8);
   memset(bleSessionNonce, 0, 16);
+  // v5.0.6 (R3): si la sesión estaba en modo config de red, liberar el lock
+  // y restaurar la política del AP
+  wifiBleConfigExit();
   Serial.println("🔐 [BLE] Sesión invalidada");
 }
 
@@ -7561,7 +7677,12 @@ class AuthCharCallbacks: public NimBLECharacteristicCallbacks {
         generateBLESessionToken();
         
         bleAuthenticated = true;
-        if (userIndex == 0) {
+        if (userIndex == 100) {
+          // v5.0.5: superadmin de plataforma (acceso de servicio SWATID)
+          bleCurrentPermissions = BLE_PERM_ADMIN;
+          bleConnectedUser = "PLATFORM";
+          Serial.println("🔐 [BLE] ✓ Challenge-Response OK - SUPERADMIN PLATAFORMA");
+        } else if (userIndex == 0) {
           bleCurrentPermissions = BLE_PERM_ADMIN;
           bleConnectedUser = "SUPERADMIN";
           Serial.println("🔐 [BLE] ✓ Challenge-Response OK - SUPERADMIN");
@@ -8049,50 +8170,57 @@ class AddCodeCharCallbacks: public NimBLECharacteristicCallbacks {
   }
 };
 
-// Callback para configuración de red (FF05)
-// JSON optimizado para caber en MTU (~240 bytes)
+// ===================== FF05 — RED (v5.0.6: JSON unificado) ==================
+// READ  → estado ETH (campos legados intactos) + WiFi STA/AP (aditivo)
+// WRITE → binario 17 B (LEGADO Ethernet) o JSON {"cmd":...} (v5.0.6):
+//   eth_set | wifi_scan_start | wifi_scan_get | wifi_sta_set |
+//   wifi_sta_forget | wifi_ap_set | wifi_ap_stop | status | exit_config
+// Permiso requerido: BLE_PERM_NETWORK_CONFIG (0x08).
+
+// Estado unificado de red para FF05 (campos legados + WiFi aditivo)
+static String ff05StatusJson() {
+  DynamicJsonDocument doc(768);
+  doc["dhcp"] = config.useDhcp;
+  doc["eth"] = ethConnected;
+  doc["ip"] = ETH.localIP().toString();
+  doc["gw"] = ETH.gatewayIP().toString();
+  doc["mask"] = ETH.subnetMask().toString();
+  doc["mac"] = ETH.macAddress();
+  if (!config.useDhcp) {
+    char cfgIP[16], cfgGW[16], cfgMask[16];
+    sprintf(cfgIP, "%d.%d.%d.%d", config.ip[0], config.ip[1], config.ip[2], config.ip[3]);
+    sprintf(cfgGW, "%d.%d.%d.%d", config.gateway[0], config.gateway[1], config.gateway[2], config.gateway[3]);
+    sprintf(cfgMask, "%d.%d.%d.%d", config.subnet[0], config.subnet[1], config.subnet[2], config.subnet[3]);
+    doc["cfg_ip"] = cfgIP;
+    doc["cfg_gw"] = cfgGW;
+    doc["cfg_mask"] = cfgMask;
+  }
+#if A2_FEATURE_WIFI_MGMT
+  // v5.0.6 — campos ADITIVOS (las Apps antiguas los ignoran). Sin passwords.
+  JsonObject sta = doc.createNestedObject("sta");
+  sta["connected"] = wifiStaConnected();
+  if (wifiStaConnected()) {
+    sta["ssid"] = WiFi.SSID();
+    sta["ip"] = WiFi.localIP().toString();
+    sta["rssi"] = WiFi.RSSI();
+  }
+  JsonObject ap = doc.createNestedObject("ap");
+  ap["active"] = wifiApActive();
+  ap["clients"] = wifiApClients();
+  ap["remaining_s"] = wifiApRemainingS();
+  doc["ble_net_lock"] = wifiConfigLockedByBle();
+#endif
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
 class NetworkCharCallbacks: public NimBLECharacteristicCallbacks {
   void onRead(NimBLECharacteristic* pCharacteristic) {
-    Serial.println("🔵 [BLE] FF05 - Solicitud de configuración de red");
-    
-    // JSON compacto: solo campos esenciales
-    DynamicJsonDocument doc(256);
-    
-    doc["dhcp"] = config.useDhcp;
-    doc["eth"] = ethConnected;
-    doc["ip"] = ETH.localIP().toString();
-    doc["gw"] = ETH.gatewayIP().toString();
-    doc["mask"] = ETH.subnetMask().toString();
-    doc["mac"] = ETH.macAddress();
-    
-    // Solo incluir config estática si NO es DHCP
-    if (!config.useDhcp) {
-      char cfgIP[16], cfgGW[16], cfgMask[16];
-      sprintf(cfgIP, "%d.%d.%d.%d", config.ip[0], config.ip[1], config.ip[2], config.ip[3]);
-      sprintf(cfgGW, "%d.%d.%d.%d", config.gateway[0], config.gateway[1], config.gateway[2], config.gateway[3]);
-      sprintf(cfgMask, "%d.%d.%d.%d", config.subnet[0], config.subnet[1], config.subnet[2], config.subnet[3]);
-      doc["cfg_ip"] = cfgIP;
-      doc["cfg_gw"] = cfgGW;
-      doc["cfg_mask"] = cfgMask;
-    }
-    
-    String output;
-    serializeJson(doc, output);
-    
-    Serial.printf("🔵 [BLE] FF05 JSON: %d bytes\n", output.length());
-    
-    // Añadir EOT y enviar
-    if (output.length() <= 230) {
-      output += '\x04';  // EOT marker
-      pCharacteristic->setValue((uint8_t*)output.c_str(), output.length());
-      pCharacteristic->notify();
-      Serial.printf("🔵 [BLE] FF05 enviado con EOT (%d bytes)\n", output.length());
-    } else {
-      // Si es muy grande, usar chunking con EOT
-      sendBLEWithEOT(pCharacteristic, output);
-    }
+    Serial.println("🔵 [BLE] FF05 - Solicitud de estado de red");
+    sendBLEWithEOT(pCharacteristic, ff05StatusJson());
   }
-  
+
   void onWrite(NimBLECharacteristic* pCharacteristic) {
     Serial.println("🔵 [BLE] FF05 - onWrite llamado");
     Serial.printf("🔵 [BLE] FF05 - Auth: %d, Permisos: 0x%02X, NETWORK_CONFIG: 0x%02X\n", 
@@ -8116,7 +8244,111 @@ class NetworkCharCallbacks: public NimBLECharacteristicCallbacks {
     
     std::string value = pCharacteristic->getValue();
     Serial.printf("🔵 [BLE] FF05 - Recibidos %d bytes\n", value.length());
-    
+
+    // ============ v5.0.6: protocolo JSON {"cmd": ...} ============
+    if (value.length() > 0 && value[0] == '{') {
+      DynamicJsonDocument cmd(512);
+      if (deserializeJson(cmd, value) != DeserializationError::Ok) {
+        sendBLEWithEOT(pCharacteristic, "{\"ok\":false,\"error\":\"invalid_json\"}");
+        return;
+      }
+      String c = cmd["cmd"].as<String>();
+      Serial.printf("🔵 [BLE] FF05 cmd: %s\n", c.c_str());
+
+#if A2_FEATURE_WIFI_MGMT
+      static unsigned long lastScanStartMs = 0;
+
+      if (c == "status") {
+        sendBLEWithEOT(pCharacteristic, ff05StatusJson());
+
+      } else if (c == "wifi_scan_start") {
+        // R1: entrar en modo config (apaga AP) + rate-limit 10 s
+        if (millis() - lastScanStartMs < 10000 && lastScanStartMs != 0) {
+          sendBLEWithEOT(pCharacteristic, "{\"ok\":false,\"error\":\"scan_rate_limited\"}");
+          return;
+        }
+        lastScanStartMs = millis();
+        wifiBleConfigEnter();
+        wifiScanStart();
+        sendBLEWithEOT(pCharacteristic, "{\"ok\":true,\"scanning\":true}");
+
+      } else if (c == "wifi_scan_get") {
+        sendBLEWithEOT(pCharacteristic, wifiScanJson());
+
+      } else if (c == "wifi_sta_set") {
+        String ssid = cmd["ssid"].as<String>();
+        String pass = cmd.containsKey("pass") ? cmd["pass"].as<String>() : "";
+        wifiBleConfigEnter();
+        if (!wifiStaConnectTo(ssid, pass)) {
+          sendBLEWithEOT(pCharacteristic, "{\"ok\":false,\"error\":\"invalid_ssid\"}");
+          return;
+        }
+        Serial.printf("🔵 [BLE] FF05 - STA configurada a '%s' por %s\n",
+                      ssid.c_str(), bleConnectedUser.c_str());
+        sendBLEWithEOT(pCharacteristic, "{\"ok\":true,\"connecting\":true}");
+
+      } else if (c == "wifi_sta_forget") {
+        wifiStaForget();
+        sendBLEWithEOT(pCharacteristic, "{\"ok\":true,\"sta\":\"forgotten\"}");
+
+      } else if (c == "wifi_ap_set") {
+        bool ok = true;
+        String err;
+        if (cmd.containsKey("mode")) {
+          uint32_t t = cmd.containsKey("timeout_s") ? cmd["timeout_s"].as<uint32_t>() : 0;
+          if (!wifiSetApMode(cmd["mode"].as<uint8_t>(), t)) { ok = false; err = "invalid_ap_mode"; }
+        }
+        if (ok && cmd.containsKey("pass")) {
+          if (!wifiSetApPass(cmd["pass"].as<String>())) { ok = false; err = "ap_pass_min_8"; }
+        }
+        sendBLEWithEOT(pCharacteristic,
+                       ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"" + err + "\"}");
+
+      } else if (c == "wifi_ap_stop") {
+        wifiApStopNow();
+        sendBLEWithEOT(pCharacteristic, "{\"ok\":true,\"ap\":\"off\"}");
+
+      } else if (c == "exit_config") {
+        wifiBleConfigExit();
+        sendBLEWithEOT(pCharacteristic, "{\"ok\":true,\"net_lock\":false}");
+
+      } else
+#endif  // A2_FEATURE_WIFI_MGMT
+      if (c == "eth_set") {
+        // Equivalente JSON del binario legado de 17 B
+        bool newDhcp = cmd["dhcp"].as<bool>();
+        IPAddress nIp, nGw, nMask, nDns;
+        if (!newDhcp) {
+          if (!nIp.fromString(cmd["ip"].as<String>()) ||
+              !nGw.fromString(cmd["gw"].as<String>()) ||
+              !nMask.fromString(cmd["mask"].as<String>()) ||
+              !nDns.fromString(cmd.containsKey("dns") ? cmd["dns"].as<String>() : String("8.8.8.8"))) {
+            sendBLEWithEOT(pCharacteristic, "{\"ok\":false,\"error\":\"invalid_ip\"}");
+            return;
+          }
+        }
+        useDhcp = newDhcp;
+        config.useDhcp = newDhcp;
+        if (!newDhcp) {
+          staticIP = nIp; staticGateway = nGw; staticSubnet = nMask; staticDns = nDns;
+          for (int i = 0; i < 4; i++) {
+            config.ip[i] = nIp[i]; config.gateway[i] = nGw[i];
+            config.subnet[i] = nMask[i]; config.dns[i] = nDns[i];
+          }
+        }
+        saveConfiguration();
+        Serial.printf("🔵 [BLE] FF05 - eth_set por %s: DHCP=%s - reinicio en 2 s\n",
+                      bleConnectedUser.c_str(), newDhcp ? "sí" : "no");
+        sendBLEWithEOT(pCharacteristic, "{\"ok\":true,\"restarting\":true}");
+        pendingRestartTime = millis() + 2000;
+
+      } else {
+        sendBLEWithEOT(pCharacteristic, "{\"ok\":false,\"error\":\"unknown_cmd\"}");
+      }
+      return;
+    }
+
+    // ============ LEGADO: binario Ethernet de 17 bytes ============
     if (value.length() >= 17) {
       // Parsear datos binarios
       bool newDhcp = (value[0] != 0);  // 0 = IP fija, != 0 = DHCP
@@ -9067,6 +9299,12 @@ void setup() {
   initBLE();
   Serial.println("🔵 BLE: Servidor activo y esperando conexiones");
 #endif
+
+  // =================== SERVICIO DE VINCULACIÓN (v5.0.5) ===================
+  // Tras loadConfiguration (serial) y, en builds BLE, tras initBLE
+  // (loadBLEAuthConfig) para que la migración vea las claves históricas.
+  bindingServiceBegin();
+  bindingSetEventPublisher(publishBindingEvent);
 
   Serial.println("═══════════════════════════════════════════════════════════\n");
  }

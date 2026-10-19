@@ -251,7 +251,10 @@ Mantener **mínimo de UUIDs nuevos**; preferir JSON con `cmd` sobre proliferar c
 |------|--------|
 | Rama `v5.0.6_BLE` | Creada |
 | Plan | Este documento |
-| Implementación B1–B4 | Pendiente |
+| Implementación B1–B4 (Fase 1) | **Hecha** (16-Oct): FF05 JSON unificado (scan/STA/AP/eth_set + legado binario), lock AP↔BLE R1–R5, web 409, restore de política al cerrar sesión, permiso 0x08 corregido en docs — ver [CONTRATO-FF05-RED.md](CONTRATO-FF05-RED.md) |
+| Compilación | 4 entornos OK (BLE: 77,5 % flash) |
+| Validación W1–W6 | Pendiente de placa A2 + App (la placa conectada es A2v3 sin build BLE) |
+| Fases 2–4 (B5–B10) | Pendientes |
 | Push | Cuando el usuario lo indique |
 
 ---
