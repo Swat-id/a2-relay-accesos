@@ -106,17 +106,17 @@
 #define FIRMWARE_VERSION_MAJOR 5
 #define FIRMWARE_VERSION_MINOR 0
 #define FIRMWARE_VERSION_PATCH 2
-const char* firmwareVersion = "v5.0.6";
+const char* firmwareVersion = "v5.0.7";
 #if defined(ENABLE_BLE) && A2_BOARD_A2V3
-const char* firmwareFullVersion = "v5.0.6-S3-BLE";
+const char* firmwareFullVersion = "v5.0.7-S3-BLE";
 #elif defined(ENABLE_BLE)
-const char* firmwareFullVersion = "v5.0.6-BLE";
+const char* firmwareFullVersion = "v5.0.7-BLE";
 #elif A2_BOARD_A2V3
-const char* firmwareFullVersion = "v5.0.6-S3";
+const char* firmwareFullVersion = "v5.0.7-S3";
 #elif A2_FEATURE_GSM_MODEM
-const char* firmwareFullVersion = "v5.0.6-4G";
+const char* firmwareFullVersion = "v5.0.7-4G";
 #else
-const char* firmwareFullVersion = "v5.0.6";
+const char* firmwareFullVersion = "v5.0.7";
 #endif
 #define FIRMWARE_VERSION_BUILD __DATE__ " " __TIME__
 const char* firmwareBuild = FIRMWARE_VERSION_BUILD;
@@ -218,6 +218,10 @@ bool bleAuthenticated = false;
 uint8_t bleCurrentPermissions = 0;
 String bleConnectedUser = "";
 unsigned long bleConnectionTime = 0;        // Momento de conexión BLE
+// v5.0.7 (EQ-02): actualización de parámetros de conexión DIFERIDA (aplicar
+// en loop ~2 s tras conectar; hacerlo en onConnect corta algunas pilas Android)
+volatile uint16_t bleConnHandle = 0xFFFF;
+volatile unsigned long bleConnParamsDueAt = 0;   // 0 = nada pendiente
 #define BLE_AUTH_TIMEOUT_MS 30000           // 30 segundos para autenticarse
 
 // =================== SEGURIDAD BLE v4.1 - Challenge-Response ===================
@@ -7629,11 +7633,15 @@ class SWATIDServerCallbacks: public NimBLEServerCallbacks {
     bleDeviceConnected = true;
     invalidateBLESession();  // Limpiar cualquier sesión anterior
     bleConnectionTime = millis();  // Registrar momento de conexión
-    // v5.0.6: WiFi y BLE comparten la radio. Con el intervalo/timeout que
-    // negocian iOS/macOS por defecto, un escaneo WiFi puede matar el enlace
-    // BLE (supervision timeout). Pedimos parámetros tolerantes: intervalo
-    // 30-60 ms, latencia 4, supervision timeout 6 s.
-    pServer->updateConnParams(desc->conn_handle, 24, 48, 4, 600);
+    // v5.0.7 (EQ-02): la actualización de parámetros de conexión se DIFIERE
+    // 2 s (se aplica en loop). Pedirla inmediatamente al conectar, en plena
+    // negociación MTU/descubrimiento, desconecta a algunas pilas Android
+    // (patrón observado por la App: MTU OK + discovery OK + corte antes de
+    // la primera lectura). Los parámetros tolerantes (intervalo 30-60 ms,
+    // latencia 4, supervision 6 s) siguen siendo necesarios para que un
+    // escaneo WiFi no mate el enlace (radio compartida, v5.0.6).
+    bleConnHandle = desc->conn_handle;
+    bleConnParamsDueAt = millis() + 2000;
     Serial.println("🔵 [BLE] Dispositivo conectado - Esperando autenticación...");
     Serial.printf("🔵 [BLE] Timeout de autenticación: %d segundos\n", BLE_AUTH_TIMEOUT_MS / 1000);
     Serial.println("🔐 [BLE] v4.1: Usar FF0B para obtener challenge, luego FF01 con SHA256(key+nonce)");
@@ -7641,6 +7649,7 @@ class SWATIDServerCallbacks: public NimBLEServerCallbacks {
 
   void onDisconnect(NimBLEServer* pServer) {
     bleDeviceConnected = false;
+    bleConnParamsDueAt = 0;   // cancelar actualización diferida pendiente
     invalidateBLESession();  // Invalidar sesión al desconectar
     bleConnectionTime = 0;
     Serial.println("🔵 [BLE] Dispositivo desconectado - Sesión invalidada");
@@ -8981,13 +8990,38 @@ void initBLE() {
   // Iniciar servicio
   pService->start();
   
-  // Configurar advertising
+  // Configurar advertising (v5.0.7, presupuesto EXPLÍCITO de 31 B por paquete)
+  //   ADV principal  : flags (3 B) + nombre completo SWATID_… (21 B) = 24 B
+  //                    → el nombre SIEMPRE visible, también en escaneo pasivo
+  //   Scan response  : UUID FF00 128 bits (18 B) + manufacturer data con el
+  //                    MODELO (8 B: 0xFFFF + "A2V3"/"A2") = 26 B
+  // Sin el reparto explícito, NimBLE recortaba el paquete al exceder 31 B y
+  // el nombre podía desaparecer del aire (EQ-02: la App no listaba el equipo).
   NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
+  {
+    std::string mfg;
+    mfg += (char)0xFF;
+    mfg += (char)0xFF;
+#if A2_BOARD_A2V3
+    mfg += "A2V3";
+#else
+    mfg += "A2";
+#endif
+    NimBLEAdvertisementData advData;
+    advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+    advData.setName(bleName.c_str());
+    pAdvertising->setAdvertisementData(advData);
+
+    NimBLEAdvertisementData scanResp;
+    scanResp.setCompleteServices(NimBLEUUID(SERVICE_UUID));
+    scanResp.setManufacturerData(mfg);
+    pAdvertising->setScanResponseData(scanResp);
+  }
   pAdvertising->setMinPreferred(0x06);
   pAdvertising->setMaxPreferred(0x12);
-  pAdvertising->start();
+  if (!pAdvertising->start()) {
+    Serial.println("❌ [BLE] Advertising NO arrancó (payload) - el watchdog reintentará");
+  }
   
   Serial.printf("🔵 [BLE] Servidor iniciado: %s\n", bleName.c_str());
   Serial.println("🔵 [BLE] Esperando conexiones...");
@@ -9447,6 +9481,27 @@ void setup() {
   checkRelayTimeout();
   
 #ifdef ENABLE_BLE
+  // ========== PARÁMETROS DE CONEXIÓN BLE DIFERIDOS (v5.0.7, EQ-02) ==========
+  if (bleConnParamsDueAt != 0 && currentTime >= bleConnParamsDueAt) {
+    bleConnParamsDueAt = 0;
+    if (bleDeviceConnected && pServer != nullptr) {
+      pServer->updateConnParams(bleConnHandle, 24, 48, 4, 600);
+      Serial.println("🔵 [BLE] Parámetros de conexión tolerantes aplicados (diferidos 2 s)");
+    }
+  }
+
+  // ========== WATCHDOG DE ADVERTISING (v5.0.7, EQ-02 hip. 6) ==========
+  // Si no hay conexión y el anuncio se quedó parado (reinicio de pila,
+  // desconexión abrupta), relanzarlo: el equipo debe ser SIEMPRE visible.
+  static unsigned long lastAdvCheck = 0;
+  if (currentTime - lastAdvCheck > 5000) {
+    lastAdvCheck = currentTime;
+    if (!bleDeviceConnected && !NimBLEDevice::getAdvertising()->isAdvertising()) {
+      NimBLEDevice::startAdvertising();
+      Serial.println("🔵 [BLE] Advertising relanzado por watchdog");
+    }
+  }
+
   // ========== ACTUALIZACIÓN DE ESTADO BLE ==========
   static unsigned long lastBLEStatusUpdate = 0;
   if (currentTime - lastBLEStatusUpdate > 1000) { // Cada segundo
