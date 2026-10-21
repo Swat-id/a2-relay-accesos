@@ -61,6 +61,11 @@ String bindingStatusJson();
 bool bindingSetPlatformKeyHex(const String& hex128);
 bool bindingClearPlatformKey();
 
+// Restablecimiento de vínculos desde la web (fábrica/banco): borra admin de
+// placa y usuarios (la plataforma queda INTACTA), sincroniza con BLE y abre
+// la ventana TOFU para que la App pueda vincularse de inmediato.
+bool bindingResetOwner();
+
 // U5 (BLE): acceso de solo lectura a la clave de plataforma para el
 // challenge-response BLE (SHA256(key ‖ nonce)). nullptr si no provisionada.
 // Mismo dominio de confianza (firmware); la clave nunca sale del equipo.

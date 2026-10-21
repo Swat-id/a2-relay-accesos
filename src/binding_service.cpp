@@ -271,6 +271,26 @@ bool bindingSetPlatformKeyHex(const String& hex128) {
   return true;
 }
 
+bool bindingResetOwner() {
+  memset(s_store.admin_key, 0, BINDING_KEY_SIZE);
+  s_store.admin_set = 0;
+  s_store.admin_name[0] = '\0';
+  for (int i = 0; i < BINDING_MAX_USERS; i++) {
+    memset(s_store.user_keys[i], 0, BINDING_KEY_SIZE);
+    s_store.user_enabled[i] = 0;
+    s_store.user_permissions[i] = 0;
+    s_store.user_names[i][0] = '\0';
+  }
+  if (!saveStore()) return false;
+#ifdef ENABLE_BLE
+  syncToBle();
+#endif
+  publishEvent("BINDING_CLEARED", 0, "admin", "");
+  bindingOpenWindow(BINDING_WINDOW_BOOT_S);
+  Serial.println("🔗 [VINCULO] Vínculos restablecidos desde web (plataforma intacta) - ventana TOFU abierta");
+  return true;
+}
+
 bool bindingClearPlatformKey() {
   memset(s_store.platform_key, 0, BINDING_KEY_SIZE);
   s_store.platform_set = 0;

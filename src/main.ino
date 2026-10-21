@@ -248,8 +248,18 @@ bool bleChallengeReady = false;             // Si hay un challenge pendiente de 
 #define CHAR_CODES_UUID     "0000FF0A-0000-1000-8000-00805F9B34FB"
 #define CHAR_CHALLENGE_UUID "0000FF0B-0000-1000-8000-00805F9B34FB"  // Challenge para auth seguro
 
-// Tipo de dispositivo para provisión automática BLE
-#define DEVICE_TYPE         "SWATID-A2"
+// Identificación del dispositivo para la App (v5.0.7, EQ-02):
+//   device_type  = MODELO concreto (lo que debe mostrar la App)
+//   DEVICE_FAMILY= familia de producto (compatibilidad con validaciones "A2")
+//   FIRMWARE_VARIANT = variante de build
+#if A2_BOARD_A2V3
+#define DEVICE_TYPE      "SWATID-A2V3"
+#define FIRMWARE_VARIANT "S3-BLE"
+#else
+#define DEVICE_TYPE      "SWATID-A2"
+#define FIRMWARE_VARIANT "BLE"
+#endif
+#define DEVICE_FAMILY    "SWATID-A2"
 #define PROTOCOL_VERSION    1
 
 // Punteros BLE
@@ -7094,6 +7104,15 @@ void handleBinding() {
   }
   html += "</div>";
 
+  html += "<div class='input-config'><h3>♻️ Restablecer vínculos</h3>"
+          "<p style='color:#666'>Borra el admin de placa y los usuarios (la "
+          "clave de plataforma NO se toca), sincroniza con BLE y abre la "
+          "ventana TOFU 10 min para vincular la App de inmediato.</p>"
+          "<form action='/binding_action' method='POST' "
+          "onsubmit='return confirm(\"¿Borrar admin y usuarios vinculados?\")'>"
+          "<input type='hidden' name='action' value='reset_owner'>"
+          "<button type='submit' style='background:#c0392b'>♻️ Restablecer vínculos (admin + usuarios)</button></form></div>";
+
   html += "<div style='text-align:center;margin-top:20px'>"
           "<a href='/'><button type='button'>🏠 Volver</button></a></div>";
   html += WEB_PAGE_END;
@@ -7117,6 +7136,8 @@ void handleBindingAction() {
     }
   } else if (action == "clear_platform") {
     bindingClearPlatformKey();
+  } else if (action == "reset_owner") {
+    bindingResetOwner();
   }
   server.sendHeader("Location", "/binding");
   server.send(303);
@@ -8432,9 +8453,10 @@ class DevInfoCharCallbacks: public NimBLECharacteristicCallbacks {
     // Crear JSON usando ArduinoJson para evitar problemas de formato
     DynamicJsonDocument doc(512);
     doc["device_type"] = DEVICE_TYPE;
+    doc["device_family"] = DEVICE_FAMILY;
     doc["serial"] = fixedSerialNumber;
     doc["firmware_version"] = firmwareVersion;
-    doc["firmware_variant"] = "BLE";
+    doc["firmware_variant"] = FIRMWARE_VARIANT;
     doc["protocol_version"] = PROTOCOL_VERSION;
     
     JsonObject caps = doc.createNestedObject("capabilities");
@@ -8933,9 +8955,10 @@ void initBLE() {
 
   String devInfo = String("{") +
     "\"device_type\":\"" + DEVICE_TYPE + "\"," +
+    "\"device_family\":\"" + DEVICE_FAMILY + "\"," +
     "\"serial\":\"" + fixedSerialNumber + "\"," +
     "\"firmware_version\":\"" + firmwareVersion + "\"," +
-    "\"firmware_variant\":\"BLE\"," +
+    "\"firmware_variant\":\"" + FIRMWARE_VARIANT + "\"," +
     "\"protocol_version\":" + PROTOCOL_VERSION + "," +
     "\"capabilities\":{" +
       "\"relays\":2," +
@@ -9061,9 +9084,10 @@ void updateBLEDeviceInfo() {
     
     DynamicJsonDocument doc(512);
     doc["device_type"] = DEVICE_TYPE;
+    doc["device_family"] = DEVICE_FAMILY;
     doc["serial"] = fixedSerialNumber;
     doc["firmware_version"] = firmwareVersion;
-    doc["firmware_variant"] = "BLE";
+    doc["firmware_variant"] = FIRMWARE_VARIANT;
     doc["protocol_version"] = PROTOCOL_VERSION;
     
     JsonObject caps = doc.createNestedObject("capabilities");
